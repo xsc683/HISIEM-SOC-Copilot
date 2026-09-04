@@ -10,11 +10,19 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from .durable import (
+    CommandReceiptStore,
+    EventLedger,
+    OrchestrationBindingStore,
+    ToolInvocationStore,
+)
 from .repositories import (
     EvidenceRepository,
     FindingRepository,
+    HypothesisAssessmentRepository,
     HypothesisRepository,
     InvestigationRepository,
+    PlanRevisionRepository,
     ResultRepository,
 )
 
@@ -24,13 +32,23 @@ class UnitOfWork(Protocol):
 
     Repositories are typed with the Protocol (not the concrete implementation) so
     any structural implementation satisfies the port.
+
+    The durable stores (events/outbox-receipt/binding/tool audit) are bound to the
+    SAME transaction: rows they append commit atomically with the domain rows
+    (persistence-schema.md §31).
     """
 
     investigations: InvestigationRepository
     evidence: EvidenceRepository
     findings: FindingRepository
     hypotheses: HypothesisRepository
+    hypothesis_assessments: HypothesisAssessmentRepository
+    plan_revisions: PlanRevisionRepository
     results: ResultRepository
+    events: EventLedger
+    command_receipts: CommandReceiptStore
+    bindings: OrchestrationBindingStore
+    tool_invocations: ToolInvocationStore
 
     async def commit(self) -> None: ...
 

@@ -9,18 +9,34 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from ...application.ports.durable import (
+    CommandReceiptStore,
+    EventLedger,
+    OrchestrationBindingStore,
+    ToolInvocationStore,
+)
 from ...application.ports.repositories import (
     EvidenceRepository,
     FindingRepository,
+    HypothesisAssessmentRepository,
     HypothesisRepository,
     InvestigationRepository,
+    PlanRevisionRepository,
     ResultRepository,
 )
 from .repositories.child import (
     SqlAlchemyEvidenceRepository,
     SqlAlchemyFindingRepository,
+    SqlAlchemyHypothesisAssessmentRepository,
     SqlAlchemyHypothesisRepository,
+    SqlAlchemyPlanRevisionRepository,
     SqlAlchemyResultRepository,
+)
+from .repositories.durable import (
+    SqlAlchemyCommandReceiptStore,
+    SqlAlchemyEventLedger,
+    SqlAlchemyOrchestrationBindingStore,
+    SqlAlchemyToolInvocationStore,
 )
 from .repositories.investigation import SqlAlchemyInvestigationRepository
 
@@ -45,7 +61,24 @@ class SqlAlchemyUnitOfWork:
         self.hypotheses: HypothesisRepository = SqlAlchemyHypothesisRepository(
             self._session
         )
+        self.hypothesis_assessments: HypothesisAssessmentRepository = (
+            SqlAlchemyHypothesisAssessmentRepository(self._session)
+        )
+        self.plan_revisions: PlanRevisionRepository = SqlAlchemyPlanRevisionRepository(
+            self._session
+        )
         self.results: ResultRepository = SqlAlchemyResultRepository(self._session)
+        # Durable stores bound to the SAME session/transaction as the domain rows.
+        self.events: EventLedger = SqlAlchemyEventLedger(self._session)
+        self.command_receipts: CommandReceiptStore = SqlAlchemyCommandReceiptStore(
+            self._session
+        )
+        self.bindings: OrchestrationBindingStore = (
+            SqlAlchemyOrchestrationBindingStore(self._session)
+        )
+        self.tool_invocations: ToolInvocationStore = SqlAlchemyToolInvocationStore(
+            self._session
+        )
 
     async def __aenter__(self) -> SqlAlchemyUnitOfWork:
         return self

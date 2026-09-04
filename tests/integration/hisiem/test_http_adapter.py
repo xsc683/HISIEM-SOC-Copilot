@@ -27,27 +27,46 @@ def _adapter(
     return HisiemHttpAdapter(settings=settings or _settings(), client=client)
 
 
-async def test_get_alert_maps_payload() -> None:
+async def test_get_alert_maps_flat_alert_payload() -> None:
+    """The real HISIEM alert payload flattens fields under ``alert.*`` + ``_id``."""
+
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Tenant-ID"] == "tenant-a"
         return httpx.Response(
             200,
             json={
-                "id": "alert-99",
-                "tenant_id": "tenant-a",
-                "title": "SSH brute force",
-                "severity": "high",
-                "status": "open",
-                "rule_name": "ssh_bruteforce",
+                "_id": "es_alert_sha1",
+                "alert": {
+                    "id": "alert-uuid-1",
+                    "rule_id": "rule-100",
+                    "rule_name": "ssh_bruteforce",
+                    "type": "bruteforce",
+                    "severity": "high",
+                    "description": "SSH brute force",
+                    "status": "open",
+                    "created_at": "2026-09-01T10:00:00Z",
+                    "risk_score": 85,
+                },
+                "rule": {"tags": ["brute-force", "ssh"]},
+                "source.ip": "203.0.113.9",
+                "user.name": "root",
+                "host.name": "web-01",
             },
         )
 
     adapter = _adapter(handler)
-    alert = await adapter.get_alert(tenant_id="tenant-a", alert_id="alert-99")
+    alert = await adapter.get_alert(tenant_id="tenant-a", alert_id="es_alert_sha1")
     assert alert is not None
-    assert alert.alert_id == "alert-99"
-    assert alert.tenant_id == "tenant-a"
-    assert alert.title == "SSH brute force"
+    assert alert.alert_id == "es_alert_sha1"
+    assert alert.rule_id == "rule-100"
+    assert alert.rule_name == "ssh_bruteforce"
+    assert alert.rule_type == "bruteforce"
+    assert alert.severity == "high"
+    assert alert.description == "SSH brute force"
+    assert alert.risk_score == 85
+    assert alert.source_ip == "203.0.113.9"
+    assert alert.user_name == "root"
+    assert alert.rule_tags == ["brute-force", "ssh"]
     assert alert.raw is not None
     await adapter.close()
 
@@ -71,17 +90,80 @@ async def test_get_alert_5xx_raises_external_service_error() -> None:
     await adapter.close()
 
 
-async def test_search_events_passes_tenant_and_returns_list() -> None:
+async def test_search_events_posts_bounded_log_search() -> None:
+    import json as _json
+
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Tenant-ID"] == "tenant-a"
-        assert "query" in (request.content.decode() if request.content else "")
-        return httpx.Response(200, json=[{"_id": "evt-1"}, {"_id": "evt-2"}])
+        body = _json.loads(request.content or b"{}")
+        assert body["logic"] == "AND"
+        assert body["conditions"] == [
+            {"field": "user.name", "operator": "is", "value": "root"}
+        ]
+        assert body["size"] == 100
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "_id": "evt-1",
+                        "_index": "siem-events-2026.09.01",
+                        "@timestamp": "2026-09-01T10:00:01Z",
+                        "event": {"action": "authentication_success"},
+                        "user.name": "root",
+                        "source.ip": "203.0.113.9",
+                    }
+                ],
+                "page": 0,
+                "size": 100,
+                "total": 1,
+                "tookMs": 12,
+                "from": "2026-09-01T09:00:00Z",
+                "to": "2026-09-01T10:00:00Z",
+            },
+        )
 
     adapter = _adapter(handler)
-    events = await adapter.search_events(
-        tenant_id="tenant-a", query="source.ip:1.2.3.4", size=50
+    result = await adapter.search_events(
+        tenant_id="tenant-a",
+        from_="2026-09-01T09:00:00Z",
+        to="2026-09-01T10:00:00Z",
+        conditions=[{"field": "user.name", "operator": "is", "value": "root"}],
+        limit=100,
     )
-    assert len(events) == 2
+    assert len(result.items) == 1
+    assert result.total == 1
+    assert result.items[0].document_id == "evt-1"
+    assert result.items[0].source_ip == "203.0.113.9"
+    await adapter.close()
+
+
+async def test_get_detection_rule_maps_yaml_map() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Tenant-ID"] == "tenant-a"
+        return httpx.Response(
+            200,
+            json={
+                "id": "rule-100",
+                "name": "SSH Brute Force",
+                "category": "credential-access",
+                "type": "threshold",
+                "severity": "high",
+                "enabled": True,
+                "version": "1.0",
+                "tags": ["ssh", "brute-force"],
+                "condition": {"field": "event.action", "value": "failed-login"},
+            },
+        )
+
+    adapter = _adapter(handler)
+    rule = await adapter.get_detection_rule(tenant_id="tenant-a", rule_id="rule-100")
+    assert rule is not None
+    assert rule.rule_id == "rule-100"
+    assert rule.name == "SSH Brute Force"
+    assert rule.category == "credential-access"
+    assert rule.enabled is True
+    assert rule.logic_summary is not None
     await adapter.close()
 
 

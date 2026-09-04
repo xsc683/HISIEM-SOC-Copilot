@@ -6,7 +6,8 @@ method → persist via UnitOfWork. No SQL, no ORM, no infrastructure imports her
 
 from __future__ import annotations
 
-from uuid import uuid4
+from typing import TypeVar
+from uuid import UUID, uuid4
 
 from ...domain.investigation.aggregate import Investigation
 from ...domain.investigation.enums import InvestigationStatus
@@ -20,8 +21,13 @@ from ..commands.investigation import (
     CancelInvestigation,
     StartAlertInvestigation,
 )
+from ..errors import NotFoundError
+from ..ports.durable import DurableCommand
 from ..ports.hisiem import HisiemPort
 from ..ports.unit_of_work import UnitOfWork
+from .durable_support import _audit_only_key, flush_events
+
+_C = TypeVar("_C", StartAlertInvestigation, CancelInvestigation)
 
 
 class InvestigationCommandHandler:
@@ -41,11 +47,16 @@ class InvestigationCommandHandler:
     async def start_alert_investigation(
         self, command: StartAlertInvestigation
     ) -> Investigation:
-        """Start (or return the existing active) investigation for one alert.
+        """Create (or return the existing active) investigation for one alert.
 
         Two-step concurrency guard (persistence-schema.md §6):
         1. application pre-check returns the existing active investigation;
         2. the PostgreSQL partial unique index converges the race.
+
+        A successful create commits the aggregate + ``InvestigationCreated``
+        domain_event + outbox row + command_receipt atomically, then returns
+        quickly. The durable dispatcher picks up the outbox row and starts the
+        graph asynchronously (HTTP never waits for the agent).
         """
         try:
             return await self._start(command)
@@ -72,8 +83,6 @@ class InvestigationCommandHandler:
             tenant_id=command.tenant_id, alert_id=command.source_alert_id
         )
         if alert is None:
-            from ..errors import NotFoundError
-
             raise NotFoundError(
                 "alert not found or not accessible",
                 resource_type="alert",
@@ -95,6 +104,8 @@ class InvestigationCommandHandler:
             now=utc_now(),
         )
         await self._uow.investigations.add(investigation)
+        await flush_events(self._uow, investigation)
+        await self._record_receipt(command, investigation.id)
         await self._uow.commit()
         return investigation
 
@@ -110,8 +121,6 @@ class InvestigationCommandHandler:
             investigation_id=command.investigation_id,
         )
         if investigation is None:
-            from ..errors import NotFoundError
-
             raise NotFoundError(
                 "investigation not found",
                 resource_type="investigation",
@@ -128,5 +137,25 @@ class InvestigationCommandHandler:
             )
             investigation.cancel(actor=actor)
             await self._uow.investigations.update(investigation)
+            await flush_events(self._uow, investigation)
+            await self._record_receipt(command, investigation.id)
             await self._uow.commit()
         return investigation
+
+    async def _record_receipt(self, command: _C, investigation_id: UUID) -> None:
+        key = command.idempotency_key or _audit_only_key(
+            investigation_id=investigation_id,
+            command_type=type(command).__name__,
+            command_id=command.command_id,
+        )
+        await self._uow.command_receipts.record(
+            DurableCommand(
+                command_id=command.command_id,
+                command_type=type(command).__name__,
+                idempotency_key=key,
+                tenant_id=command.tenant_id,
+                aggregate_type="investigation",
+                aggregate_id=investigation_id,
+                correlation_id=command.correlation_id,
+            )
+        )

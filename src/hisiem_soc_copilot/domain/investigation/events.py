@@ -97,3 +97,146 @@ def investigation_terminated(
         payload={"status": status.value, "reason": str(reason)},
         **_ctx(**ctx),
     )
+
+
+# ---------------------------------------------------------------------------
+# Investigation workflow events (application-commands...md §10 catalog).
+# Factories are pure and append to the aggregate's ``_pending_events`` exactly
+# like the lifecycle events above; their ``domain_event``/``outbox_message``
+# persistence is a future outbox/dispatcher round.
+# ---------------------------------------------------------------------------
+
+
+def investigation_plan_revised(
+    *,
+    aggregate_id: UUID,
+    plan_revision_id: UUID,
+    revision: int,
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="investigation_plan_revised",
+        aggregate_id=aggregate_id,
+        payload={"plan_revision_id": str(plan_revision_id), "revision": revision},
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def hypothesis_registered(
+    *,
+    aggregate_id: UUID,
+    hypothesis_id: UUID,
+    statement: str,
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="hypothesis_registered",
+        aggregate_id=aggregate_id,
+        payload={"hypothesis_id": str(hypothesis_id), "statement": statement},
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def evidence_recorded(
+    *,
+    aggregate_id: UUID,
+    evidence_ids: list[UUID],
+    source_provider: str,
+    source_operation: str,
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="evidence_recorded",
+        aggregate_id=aggregate_id,
+        payload={
+            "evidence_ids": [str(e) for e in evidence_ids],
+            "source_provider": source_provider,
+            "source_operation": source_operation,
+        },
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def hypothesis_assessed(
+    *,
+    aggregate_id: UUID,
+    hypothesis_id: UUID,
+    assessment_id: UUID,
+    revision: int,
+    status: str,
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="hypothesis_assessed",
+        aggregate_id=aggregate_id,
+        payload={
+            "hypothesis_id": str(hypothesis_id),
+            "assessment_id": str(assessment_id),
+            "revision": revision,
+            "status": status,
+        },
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def finding_recorded(
+    *,
+    aggregate_id: UUID,
+    finding_id: UUID,
+    statement: str,
+    evidence_ids: list[UUID],
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="finding_recorded",
+        aggregate_id=aggregate_id,
+        payload={
+            "finding_id": str(finding_id),
+            "statement": statement,
+            "evidence_ids": [str(e) for e in evidence_ids],
+        },
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def investigation_result_finalized(
+    *,
+    aggregate_id: UUID,
+    result_id: UUID,
+    verdict_disposition: str,
+    confidence: float,
+    finding_ids: list[UUID],
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="investigation_result_finalized",
+        aggregate_id=aggregate_id,
+        payload={
+            "result_id": str(result_id),
+            "verdict_disposition": verdict_disposition,
+            "confidence": confidence,
+            "finding_ids": [str(f) for f in finding_ids],
+        },
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )
+
+
+def investigation_completed(
+    *,
+    aggregate_id: UUID,
+    reason: TerminationReason | str,
+    tenant_id: str | None = None,
+    **ctx: Any,
+) -> InvestigationEvent:
+    return InvestigationEvent(
+        event_type="investigation_completed",
+        aggregate_id=aggregate_id,
+        payload={"reason": str(reason)},
+        **_ctx(**{**ctx, "tenant_id": tenant_id}),
+    )

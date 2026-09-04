@@ -79,6 +79,7 @@ class HypothesisAssessment:
 
     id: UUID
     hypothesis_id: UUID
+    investigation_id: UUID
     revision: int
     status: HypothesisStatus
     evidence_relations: list[HypothesisAssessmentEvidence]

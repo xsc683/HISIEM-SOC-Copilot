@@ -50,6 +50,10 @@ class InvestigationGraphState(TypedDict, total=False):
     iteration: int
     budget_remaining_steps: int
 
+    # Runtime routing signals (system-set, never model-authoritative).
+    next_action: str | None  # "CALL_TOOL" | "ASSESS"
+    assessment: str | None  # "CONTINUE" | "FINALIZE"
+
     pending_tool_request: PendingToolRequest | None
     last_tool_invocation_id: str | None
     last_tool_error: str | None

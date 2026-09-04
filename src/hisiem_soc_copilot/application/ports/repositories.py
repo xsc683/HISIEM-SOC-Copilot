@@ -15,6 +15,7 @@ from ...domain.investigation.entities import (
     Evidence,
     Finding,
     Hypothesis,
+    HypothesisAssessment,
     InvestigationResult,
     PlanRevision,
 )
@@ -55,6 +56,14 @@ class EvidenceRepository(Protocol):
         self, *, tenant_id: str, investigation_id: UUID
     ) -> list[Evidence]: ...
 
+    async def find_existing_dedup_keys(
+        self, *, investigation_id: UUID, dedup_keys: list[str]
+    ) -> set[str]: ...
+
+    async def find_by_ids(
+        self, *, tenant_id: str, investigation_id: UUID, evidence_ids: list[UUID]
+    ) -> list[Evidence]: ...
+
 
 class FindingRepository(Protocol):
     async def add(self, finding: Finding) -> None: ...
@@ -70,6 +79,28 @@ class HypothesisRepository(Protocol):
     async def list_by_investigation(
         self, *, tenant_id: str, investigation_id: UUID
     ) -> list[Hypothesis]: ...
+
+    async def get(
+        self, *, tenant_id: str, investigation_id: UUID, hypothesis_id: UUID
+    ) -> Hypothesis | None: ...
+
+
+class HypothesisAssessmentRepository(Protocol):
+    """Append-only assessment revisions; hypothesis status moves with the latest."""
+
+    async def add(self, assessment: HypothesisAssessment) -> None: ...
+
+    async def add_evidence_links(
+        self, assessment_id: UUID, evidence_relations: list[tuple[UUID, str]]
+    ) -> None: ...
+
+    async def update_hypothesis_status(
+        self, *, hypothesis_id: UUID, status: str, assessment_revision: int
+    ) -> None: ...
+
+    async def list_by_investigation(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> list[HypothesisAssessment]: ...
 
 
 class ResultRepository(Protocol):

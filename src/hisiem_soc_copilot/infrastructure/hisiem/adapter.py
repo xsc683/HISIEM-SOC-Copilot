@@ -1,19 +1,31 @@
 """HISIEM HTTP adapter implementing the HisiemPort.
 
-Transport-only over HISIEM's control API (``GET /api/alerts/{id}`` and the
-X-Tenant-ID convention). Errors map to ExternalServiceError; upstream bodies never
-leak. Real HISIEM response shape discovered from the SIEM control-api module:
-the detail endpoint returns a JSON object with string ids and optional fields.
+Transport-only over HISIEM's control API. Endpoints follow the real HISIEM
+contract (verified against the reference SIEM repo):
+``GET /api/alerts/{id}``, ``POST /api/log-search``, ``GET /api/detection-rules/{id}``
+and the X-Tenant-ID convention. Errors map to ExternalServiceError; upstream
+bodies never leak.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from ...application.errors import ExternalServiceError
-from ...application.ports.hisiem import HisiemAlertData, HisiemPort
+from ...application.ports.hisiem import (
+    DetectionRuleContext,
+    EventSearchResult,
+    HisiemAlertData,
+    HisiemPort,
+)
 from ...config import HisiemSettings
-from .mapper import map_alert_detail
+from .mapper import (
+    map_alert_detail,
+    map_detection_rule,
+    map_log_search_response,
+)
 
 
 class HisiemHttpAdapter(HisiemPort):
@@ -49,30 +61,59 @@ class HisiemHttpAdapter(HisiemPort):
         )
         if payload is None:
             return None
-        return map_alert_detail(payload)
+        return map_alert_detail(payload, tenant_id=tenant_id)
 
     async def search_events(
         self,
         *,
         tenant_id: str,
-        query: str,
-        time_range_minutes: int = 60,
-        size: int = 100,
-    ) -> list[dict[str, object]]:
+        from_: str,
+        to: str,
+        conditions: list[dict[str, object]],
+        limit: int = 100,
+        sort: str = "desc",
+    ) -> EventSearchResult:
         payload = await self._request(
             "POST",
-            "/api/events/search",
+            "/api/log-search",
             tenant_id=tenant_id,
             json={
-                "query": query,
-                "time_range_minutes": time_range_minutes,
-                "size": size,
+                "from": from_,
+                "to": to,
+                "logic": "AND",
+                "conditions": conditions,
+                "page": 0,
+                "size": limit,
+                "sort": sort,
             },
         )
         if payload is None:
-            return []
-        items = payload if isinstance(payload, list) else []
-        return [item for item in items if isinstance(item, dict)]
+            return EventSearchResult(
+                items=[], total=0, returned=0, from_=from_, to=to, truncated=False
+            )
+        items = map_log_search_response(payload)
+        total = _int(payload.get("total")) if isinstance(payload, dict) else 0
+        return EventSearchResult(
+            items=items,
+            total=total or len(items),
+            returned=len(items),
+            from_=from_,
+            to=to,
+            took_ms=_int(payload.get("tookMs")) if isinstance(payload, dict) else None,
+            truncated=(total or len(items)) > len(items),
+        )
+
+    async def get_detection_rule(
+        self, *, tenant_id: str, rule_id: str
+    ) -> DetectionRuleContext | None:
+        payload = await self._request(
+            "GET",
+            f"/api/detection-rules/{rule_id}",
+            tenant_id=tenant_id,
+        )
+        if payload is None:
+            return None
+        return map_detection_rule(payload, rule_id=rule_id)
 
     async def _request(
         self,
@@ -80,8 +121,8 @@ class HisiemHttpAdapter(HisiemPort):
         url: str,
         *,
         tenant_id: str,
-        json: dict[str, object] | None = None,
-    ) -> object | None:
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         try:
             response = await self._client.request(
                 method,
@@ -104,10 +145,26 @@ class HisiemHttpAdapter(HisiemPort):
                 code=f"HTTP_{response.status_code}",
             )
         try:
-            return response.json()  # type: ignore[no-any-return]
+            body = response.json()
         except ValueError as exc:
             raise ExternalServiceError(
                 "HISIEM returned a non-JSON body",
                 service="hisiem",
                 code="INVALID_RESPONSE",
             ) from exc
+        if not isinstance(body, dict):
+            raise ExternalServiceError(
+                "HISIEM returned a non-object JSON body",
+                service="hisiem",
+                code="INVALID_RESPONSE",
+            )
+        return body
+
+
+def _int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None

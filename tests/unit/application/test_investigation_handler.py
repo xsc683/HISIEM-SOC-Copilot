@@ -24,7 +24,9 @@ from tests.fixtures.fakes import FakeUnitOfWork
 
 class FakeHisiem:
     def __init__(self, *, alerts: dict[str, object] | None = None) -> None:
-        self._alerts = alerts or {"alert-1": {"id": "alert-1", "title": "SSH brute force"}}
+        self._alerts = alerts or {
+            "alert-1": {"_id": "alert-1", "alert": {"rule_name": "SSH brute force"}}
+        }
         self.calls: list[tuple[str, str]] = []
 
     async def get_alert(self, *, tenant_id: str, alert_id: str) -> object | None:
@@ -33,6 +35,9 @@ class FakeHisiem:
 
     async def search_events(self, **kwargs: object) -> list[dict[str, object]]:
         return []
+
+    async def get_detection_rule(self, *, tenant_id: str, rule_id: str) -> object | None:
+        return None
 
 
 def _handler(uow: FakeUnitOfWork | None = None, hisiem: FakeHisiem | None = None):
@@ -61,8 +66,9 @@ async def test_start_creates_investigation_and_hydrates_authoritative_alert() ->
     assert inv.initiated_by.subject_id == "analyst@corp"
     assert hisiem.calls == [("tenant-a", "alert-1")]
     assert uow.commits == 1
-    # created event emitted once
-    assert [e.event_type for e in inv.pending_events].count("investigation_created") == 1
+    # created event emitted once and durably flushed to the event ledger.
+    assert [e.event_type for e in inv.pending_events].count("investigation_created") == 0
+    assert [e.event_type for e in uow.events.events].count("investigation_created") == 1
 
 
 async def test_start_returns_existing_active_investigation() -> None:

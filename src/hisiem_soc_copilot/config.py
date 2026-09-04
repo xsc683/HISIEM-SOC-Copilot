@@ -119,6 +119,9 @@ class ApplicationSettings(BaseSettings):
     # Start command still validates tenant/alert against authoritative HISIEM.
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    # Run the durable outbox dispatcher worker in-process. Disabled by default so
+    # tests never start a rogue background worker; a deployment enables it.
+    enable_dispatcher: bool = False
 
 
 class AuthSettings(BaseSettings):

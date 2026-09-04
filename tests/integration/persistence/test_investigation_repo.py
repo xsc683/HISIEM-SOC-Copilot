@@ -146,7 +146,13 @@ async def test_only_one_active_investigation_per_alert(
     from sqlalchemy import text as _text
 
     async def attempt(alert_id: str) -> bool:
-        # each attempt runs its own transaction with a fresh investigation id
+        """App-level two-step convergence: pre-check, insert, retry on race.
+
+        Under a real race exactly one INSERT wins; a loser hits the partial unique
+        index, rolls back, re-queries and finds the winner — mirroring the
+        StartAlertInvestigation handler's ``find_active_by_alert``-then-insert
+        pattern (persistence-schema.md §6).
+        """
         uow = SqlAlchemyUnitOfWork(session_factory)
         inv = _inv(tenant_id="tenant-a", alert_id=alert_id)
         try:
@@ -162,9 +168,20 @@ async def test_only_one_active_investigation_per_alert(
             await uow.close()
             return True
         except Exception:
+            # A concurrent winner committed first and the partial unique index
+            # rejected this insert. Roll back, re-query, and confirm an active
+            # investigation now exists (convergence, not failure).
             await uow.rollback()
             await uow.close()
-            return False
+            uow2 = SqlAlchemyUnitOfWork(session_factory)
+            try:
+                winner = await uow2.investigations.find_active_by_alert(
+                    tenant_id="tenant-a",
+                    source_alert_ref=inv.source_alert_ref,
+                )
+                return winner is not None
+            finally:
+                await uow2.close()
 
     alert_id = "concurrent-alert-1"
     results = await asyncio.gather(

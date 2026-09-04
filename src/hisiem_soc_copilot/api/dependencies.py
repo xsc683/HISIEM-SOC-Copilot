@@ -62,7 +62,18 @@ def read_service(request: Request) -> InvestigationReadService:
     return _container(request).investigation_read_service()
 
 
+def dispatcher(request: Request) -> object:
+    """Expose the durable outbox dispatcher (used by tests to drive async work).
+
+    Returns None when the container has no dispatcher (not enabled); transport
+    routes never start graph work inline — they may only hand the dispatcher out
+    for test-driven ``drain_once()`` calls.
+    """
+    return getattr(_container(request), "dispatcher", None)
+
+
 # Depends() markers: FastAPI must resolve these as dependencies, not treat the
 # service classes as request/response fields.
 CommandHandlerDep = Annotated[InvestigationCommandHandler, Depends(command_handler)]
 ReadServiceDep = Annotated[InvestigationReadService, Depends(read_service)]
+DispatcherDep = Annotated[object | None, Depends(dispatcher)]
