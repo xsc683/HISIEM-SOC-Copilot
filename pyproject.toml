@@ -1,0 +1,78 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hisiem-soc-copilot"
+version = "0.1.0"
+description = "HISIEM SOC Copilot — AI security investigation & response collaboration agent"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.14",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-postgres>=2.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "asgi-lifespan>=2.1",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hisiem_soc_copilot"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+# Project root on sys.path so `tests.fixtures.*` helpers resolve (declarative;
+# no conftest sys.path manipulation). `hisiem_soc_copilot` resolves via the
+# editable install (`pip install -e .`), not via src/ path insertion.
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+extend-exclude = ["alembic/"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "W"]
+ignore = [
+    "B008",  # function-call in default argument (FastAPI Depends)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+mypy_path = "src"
+explicit_package_bases = true
+exclude = ["alembic/"]
+plugins = ["pydantic.mypy"]
+[[tool.mypy.overrides]]
+module = [
+    "langgraph.*",
+    "langchain_core.*",
+    "pydantic.*",
+    "pydantic_settings.*",
+    "psycopg.*",
+    "psycopg_pool.*",
+]
+ignore_missing_imports = true

@@ -1,0 +1,1 @@
+"""LLM structured-output contracts."""
