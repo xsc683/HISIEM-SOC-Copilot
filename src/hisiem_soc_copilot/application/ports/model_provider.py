@@ -19,6 +19,7 @@ from ...contracts.llm.types import (
     NextStep,
     VerdictCandidate,
 )
+from ...contracts.tools.types import ModelToolSpec
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,9 @@ class DecideNextRequest:
     evidence_summary: list[str]
     tool_names: list[str]
     previous_tool_outcome: PreviousToolOutcome | None = None
+    # Provider-neutral tool specs (name/description/arguments_schema) for the real,
+    # selectable tools — lets the model build arguments the parser will accept.
+    tool_specs: list[ModelToolSpec] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

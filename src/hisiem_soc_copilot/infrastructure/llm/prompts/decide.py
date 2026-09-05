@@ -10,8 +10,30 @@ loop.
 from __future__ import annotations
 
 from ....application.ports.model_provider import DecideNextRequest
+from ....contracts.tools.types import ModelToolSpec
 from ..schemas import NEXT_STEP_JSON_SCHEMA
-from .common import bounded, system_message, tool_names_block, user_message
+from .common import bounded, system_message, user_message
+
+
+def _tool_specs_block(specs: list[ModelToolSpec]) -> str:
+    """Render each selectable tool's name + description + argument schema.
+
+    Only the real, currently-executable tools are listed. The argument schema is a
+    bounded description the model uses to build well-formed ``arguments``; the
+    deterministic parser stays the authority.
+    """
+    if not specs:
+        return ""
+    lines = ["Selectable tools (use ONLY these; every argument must match its schema):"]
+    for spec in specs:
+        lines.append(f"- {spec.name}: {spec.description}")
+        for arg in spec.arguments_schema:
+            required = " (required)" if arg.get("required") == "true" else ""
+            lines.append(
+                f"    - {arg.get('name')}: {arg.get('type')}{required} — "
+                f"{arg.get('description') or ''}"
+            )
+    return "\n".join(lines)
 
 
 def _outcome_block(request: DecideNextRequest) -> str:
@@ -37,6 +59,15 @@ def build_messages(
         if evidence_lines
         else "(no evidence gathered yet)"
     )
+    specs = _tool_specs_block(request.tool_specs)
+    # If no specs were supplied, fall back to the bare name list so the model still
+    # sees the selectable set (candidate only; never an execution path).
+    names_block = ""
+    if not specs and request.tool_names:
+        names_block = (
+            "Selectable tools (use ONLY these):\n"
+            + "\n".join(f"- {n}" for n in request.tool_names)
+        )
     task = f"""Your task is to decide the next single investigative action.
 
 Investigation id: {request.investigation_id}
@@ -47,13 +78,15 @@ Plan goal: {bounded(request.plan_goal, limit=500) or "(no goal)"}
 Evidence gathered so far (bounded, ids only):
 {evidence_text}
 
-{tool_names_block(request.tool_names)}
+{specs}
+{names_block}
 {_outcome_block(request)}
 
 Decide the next action. Return EXACTLY one of:
 - CONTINUE: propose the next read. tool_name MUST be one of the selectable tools
-  above; arguments are the bounded tool arguments for that read; reason is a short
-  justification.
+  above; arguments MUST match that tool's argument schema (correct field names,
+  ISO-8601 UTC from/to, allowlisted condition field/operator, limit within range);
+  reason is a short justification.
 - FINALIZE: evidence is sufficient (or no useful further read is possible) and the
   investigation should converge to assessment/verdict.
 

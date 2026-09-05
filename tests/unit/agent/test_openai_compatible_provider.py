@@ -100,11 +100,25 @@ class _FakeClient:
         return self.chat.completions
 
 
-def _response(content: str, *, request_id: str | None = None) -> object:
+def _response(
+    content: str,
+    *,
+    request_id: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None,
+) -> object:
     message = SimpleNamespace(content=content)
     choice = SimpleNamespace(message=message)
+    usage = SimpleNamespace(
+        prompt_tokens=input_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
     return SimpleNamespace(
-        choices=[choice], id=request_id or f"req-{uuid4()}"
+        choices=[choice],
+        id=request_id or f"req-{uuid4()}",
+        usage=usage,
     )
 
 
@@ -318,15 +332,48 @@ async def test_json_object_unavailable_falls_back_to_json_only_prompt() -> None:
     async def handler(kwargs: dict[str, Any]) -> object:
         rf = kwargs.get("response_format") or {}
         if rf.get("type") == "json_schema":
-            raise _BadRequestError("json_schema unsupported")
+            raise _BadRequestError("response_format json_schema is not supported")
         if rf.get("type") == "json_object":
-            raise _BadRequestError("json_object unsupported")
-        # JSON-only: prompt says "Return ONLY JSON" and we honor it.
+            raise _BadRequestError("response_format json_object is not supported")
+        # JSON-only: no response_format; honor the prompt.
         return _response('{"goal": "g", "steps": []}')
 
     provider = _provider(_FakeClient(handler))
     plan = await provider.plan(_plan_request())
     assert plan.goal == "g"
+
+
+async def test_json_only_mode_rebuilds_messages_with_only_json_instruction() -> None:
+    """Fix: json_only must NOT reuse the json_only=False messages — it rebuilds them
+    via the prompt builder with json_only=True, so the final request carries no
+    response_format and the messages contain an explicit ONLY-JSON instruction."""
+    class _BadRequestError(Exception):
+        status_code = 400
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        rf = kwargs.get("response_format") or {}
+        if rf.get("type") == "json_schema":
+            raise _BadRequestError("response_format json_schema is not supported")
+        if rf.get("type") == "json_object":
+            raise _BadRequestError("response_format json_object is not supported")
+        # json_only: no response_format key at all.
+        assert "response_format" not in kwargs
+        return _response('{"goal": "g", "steps": []}')
+
+    fake = _FakeClient(handler)
+    provider = _provider(fake)
+    plan = await provider.plan(_plan_request())
+    assert plan.goal == "g"
+    final_kwargs = fake.recorded_kwargs[-1]
+    assert "response_format" not in final_kwargs
+    # The json_only=True user message was rebuilt (not the json_only=False one) and
+    # carries the explicit ONLY-JSON instruction.
+    last_content = final_kwargs["messages"][-1]["content"]
+    assert "only a single valid json object" in last_content.lower()
+    assert any(
+        "only a single valid json object" in m["content"].lower()
+        for m in final_kwargs["messages"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +492,7 @@ async def test_server_error_exhausted_raises_model_unavailable() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12-13: auth/config → no retry; refusal → typed
+# 12-13: auth/config → ModelConfigurationError, never retried; refusal → typed
 # ---------------------------------------------------------------------------
 
 
@@ -453,7 +500,17 @@ class _AuthError(Exception):
     status_code = 401
 
 
-async def test_auth_error_is_not_retried() -> None:
+class _ForbiddenError(Exception):
+    status_code = 403
+
+
+class _ContentRefusalError(Exception):
+    status_code = 400
+
+
+async def test_auth_error_is_configuration_and_not_retried() -> None:
+    """401 → ModelConfigurationError (a deployment bug), never retried, never
+    silently downgraded (docs/model-provider-contract.md §14)."""
     calls = {"n": 0}
 
     async def handler(kwargs: dict[str, Any]) -> object:
@@ -461,9 +518,24 @@ async def test_auth_error_is_not_retried() -> None:
         raise _AuthError()
 
     provider = _provider(_FakeClient(handler))
-    with pytest.raises(ModelRefusalError):
+    with pytest.raises(ModelConfigurationError):
         await provider.plan(_plan_request())
     assert calls["n"] == 1  # never retried
+    assert provider.usage[-1].error_category == "MODEL_CONFIGURATION"
+
+
+async def test_forbidden_error_is_configuration_and_not_retried() -> None:
+    """403 → ModelConfigurationError (auth/authorization boundary)."""
+    calls = {"n": 0}
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        calls["n"] += 1
+        raise _ForbiddenError()
+
+    provider = _provider(_FakeClient(handler))
+    with pytest.raises(ModelConfigurationError):
+        await provider.plan(_plan_request())
+    assert calls["n"] == 1
 
 
 async def test_missing_key_raises_configuration_error() -> None:
@@ -485,15 +557,34 @@ async def test_unknown_structured_mode_raises_configuration_error() -> None:
         )
 
 
-async def test_refusal_is_typed_and_not_retried() -> None:
+async def test_content_refusal_is_typed_and_not_retried() -> None:
+    """A genuine 400 content refusal (not naming a format) → ModelRefusalError
+    (no retry) — NOT a config error."""
     calls = {"n": 0}
 
     async def handler(kwargs: dict[str, Any]) -> object:
         calls["n"] += 1
-        raise _AuthError()  # 401 → ModelRefusalError, no retry
+        raise _ContentRefusalError("this content is not allowed")
 
     provider = _provider(_FakeClient(handler))
     with pytest.raises(ModelRefusalError):
+        await provider.plan(_plan_request())
+    assert calls["n"] == 1  # never retried
+
+
+async def test_unknown_model_is_configuration_error() -> None:
+    """A 400 naming an unknown model → ModelConfigurationError (no retry)."""
+    calls = {"n": 0}
+
+    class _ModelNotFound(Exception):
+        status_code = 400
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        calls["n"] += 1
+        raise _ModelNotFound("The model `deepseek/bogus` does not exist")
+
+    provider = _provider(_FakeClient(handler))
+    with pytest.raises(ModelConfigurationError):
         await provider.plan(_plan_request())
     assert calls["n"] == 1
 
@@ -517,6 +608,66 @@ async def test_api_key_never_in_messages_or_usage() -> None:
         assert "test-key" not in json.dumps(record.as_dict())
     # The client was given the key but never via a request kwarg.
     assert all("api_key" not in k for k in fake.recorded_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 18: real usage + request id are collected from the provider response
+# ---------------------------------------------------------------------------
+
+
+async def test_success_records_real_usage_and_request_id() -> None:
+    async def handler(kwargs: dict[str, Any]) -> object:
+        return _response(
+            '{"goal": "g", "steps": []}',
+            request_id="chatcmpl-REAL-123",
+            input_tokens=11,
+            output_tokens=4,
+            total_tokens=15,
+        )
+
+    provider = _provider(_FakeClient(handler))
+    await provider.plan(_plan_request())
+    assert len(provider.usage) == 1
+    record = provider.usage[0]
+    assert record.outcome == "ok"
+    assert record.provider_request_id == "chatcmpl-REAL-123"
+    assert record.input_tokens == 11
+    assert record.output_tokens == 4
+    assert record.total_tokens == 15
+    assert record.operation == "plan"
+    assert record.model == "deepseek/deepseek-v4-flash"
+    assert record.attempt_count == 1
+
+
+async def test_usage_is_none_when_provider_reports_none() -> None:
+    async def handler(kwargs: dict[str, Any]) -> object:
+        # No id / no usage on the fake response → the adapter must store None, never
+        # guess zeros.
+        message = SimpleNamespace(content='{"goal": "g", "steps": []}')
+        choice = SimpleNamespace(message=message)
+        return SimpleNamespace(choices=[choice], id=None, usage=None)
+
+    provider = _provider(_FakeClient(handler))
+    await provider.plan(_plan_request())
+    record = provider.usage[0]
+    assert record.outcome == "ok"
+    assert record.provider_request_id is None
+    assert record.input_tokens is None
+    assert record.output_tokens is None
+    assert record.total_tokens is None
+
+
+async def test_usage_buffer_is_bounded() -> None:
+    from hisiem_soc_copilot.infrastructure.llm.openai_compatible import _USAGE_MAXLEN
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        return _response('{"goal": "g", "steps": []}')
+
+    provider = _provider(_FakeClient(handler))
+    # Drive more calls than the buffer cap; the oldest records are dropped.
+    for _ in range(_USAGE_MAXLEN + 25):
+        await provider.plan(_plan_request())
+    assert len(provider.usage) == _USAGE_MAXLEN
 
 
 # ---------------------------------------------------------------------------

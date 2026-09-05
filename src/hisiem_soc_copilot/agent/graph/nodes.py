@@ -443,6 +443,7 @@ async def decide_next(
                 evidence_summary=evidence_ids,
                 tool_names=runtime.registry.model_selectable_names,
                 previous_tool_outcome=outcome,
+                tool_specs=runtime.registry.model_tool_specs(),
             )
         )
     )
@@ -992,6 +993,25 @@ async def finalize_result(
     budget = RuntimeBudget.from_state(state)
     verdict_candidate = None
     consult_failed = False
+
+    # Read the grounded Findings + bounded evidence summaries BEFORE the verdict
+    # consult so the model receives the real persisted findings (never an empty list,
+    # never raw ToolResults/Events/full evidence payloads).
+    uow = runtime.new_unit_of_work()
+    try:
+        findings = await uow.findings.list_by_investigation(
+            tenant_id=runtime.tenant_id, investigation_id=inv_id
+        )
+        evidence = await uow.evidence.list_by_investigation(
+            tenant_id=runtime.tenant_id, investigation_id=inv_id
+        )
+    finally:
+        await uow.close()
+    finding_statements = [f.statement for f in findings]
+    evidence_summaries = [
+        f"{e.source.operation}: {_evidence_line(e)}" for e in evidence
+    ]
+
     # The verdict consult never begins without a remaining LLM slot or once the
     # wall-clock deadline has passed: the graph deterministically finalizes the
     # available grounded facts as INCONCLUSIVE (COMPLETED, never FAILED) even when a
@@ -1004,8 +1024,8 @@ async def finalize_result(
             runtime.model.verdict(
                 AssessRequest(
                     investigation_id=_inv_str(state),
-                    evidence_summary=state.get("new_evidence_ids") or [],
-                    finding_candidates=[],
+                    evidence_summary=evidence_summaries,
+                    finding_candidates=finding_statements,
                 )
             )
         )
@@ -1018,13 +1038,6 @@ async def finalize_result(
             phase=InvestigationPhase.FINALIZING,
         )
     )
-    uow = runtime.new_unit_of_work()
-    try:
-        findings = await uow.findings.list_by_investigation(
-            tenant_id=runtime.tenant_id, investigation_id=inv_id
-        )
-    finally:
-        await uow.close()
 
     if verdict_candidate is not None:
         disposition = VerdictDisposition(verdict_candidate.disposition)

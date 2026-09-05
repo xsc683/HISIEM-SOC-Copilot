@@ -16,6 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from ...contracts.tools.types import (
+    ModelToolSpec,
+    model_tool_specs_by_name,
+)
+
 ToolCapability = Literal["READ_ONLY"]
 
 SYSTEM_CONTROLLED_TOOL = "hisiem.get_alert_context"
@@ -119,3 +124,16 @@ class ToolRegistry:
             for spec in self._tools.values()
             if spec.model_selectable
         )
+
+    def model_tool_specs(self) -> list[ModelToolSpec]:
+        """Provider-neutral specs (name/description/arguments_schema) for the exact
+        model-selectable set — never the system-controlled tool or catalog-only
+        tools. Mirrors model_selectable_names so the catalog the prompt lists and the
+        registry allowlist stay the SAME surface.
+        """
+        by_name = model_tool_specs_by_name()
+        return [
+            by_name[name]
+            for name in self.model_selectable_names
+            if name in by_name
+        ]

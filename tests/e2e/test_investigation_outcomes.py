@@ -369,3 +369,82 @@ async def test_single_tool_unavailable_does_not_fail_investigation() -> None:
     assert completed is not None
     assert completed.status == InvestigationStatus.COMPLETED  # not FAILED
     assert final["stop_reason"].startswith("COMPLETED_WITHOUT_RESPONSE")
+
+
+class _VerdictSpyModel(_OutcomeGroundedModel):
+    """Records the AssessRequest given to ``verdict`` (fix: real grounded findings)."""
+
+    def __init__(self, *, script: dict[str, Any]) -> None:
+        super().__init__(script=script, marker="authentication_success")
+        self.verdict_request: Any = None
+
+    async def verdict(self, request: Any) -> Any:
+        self.verdict_request = request
+        return await super().verdict(request)
+
+
+async def test_verdict_receives_grounded_findings() -> None:
+    """Fix: the verdict consult must receive the Investigation's real persisted
+    grounded Findings (statements), never an empty list, and bounded evidence
+    summaries — never raw ToolResults/Events."""
+    script = {
+        "plan_steps": {"search": "Search for a successful login"},
+        "decide": [
+            {
+                "tool_name": "hisiem.search_events",
+                "arguments": {
+                    "from": "2026-09-01T09:55:00Z",
+                    "to": "2026-09-01T10:05:00Z",
+                    "conditions": [
+                        {
+                            "field": "event.action",
+                            "operator": "is",
+                            "value": "authentication_success",
+                        }
+                    ],
+                },
+            },
+            {"decision": "FINALIZE"},
+        ],
+        "findings": ["A successful SSH authentication followed the brute force"],
+        "verdict": {
+            "disposition": "MALICIOUS",
+            "summary": "compromise confirmed",
+            "confidence": 0.9,
+        },
+    }
+    spy = _VerdictSpyModel(script=script)
+    _completed, result = await _run(script, model=spy)
+    assert spy.verdict_request is not None
+    # The grounded Finding statement reached the verdict consult.
+    assert any(
+        "successful SSH authentication" in f for f in spy.verdict_request.finding_candidates
+    ), spy.verdict_request.finding_candidates
+    # Evidence summaries (bounded) were provided, not just ids.
+    assert len(spy.verdict_request.evidence_summary) >= 1
+    assert result is not None
+    assert result.verdict.disposition.value == "MALICIOUS"
+
+
+async def test_verdict_no_finding_yields_empty_candidates_and_grounding_holds() -> None:
+    """Fix: with NO grounded Finding the verdict request carries an empty candidate
+    list and the deterministic grounding rule stays active (a firm disposition with
+    no Finding is bounded to INCONCLUSIVE)."""
+    script = {
+        "plan_steps": {"search": "Search for a successful login"},
+        "decide": [{"decision": "FINALIZE", "reason": "no reads"}],
+        "findings": [],
+        "verdict": {
+            "disposition": "MALICIOUS",
+            "summary": "unsupported claim",
+            "confidence": 0.9,
+        },
+    }
+    spy = _VerdictSpyModel(script=script)
+    _completed, result = await _run(script, model=spy)
+    assert spy.verdict_request is not None
+    assert spy.verdict_request.finding_candidates == []
+    # Grounding: a firm verdict with no grounded Finding is deterministically
+    # bounded to INCONCLUSIVE (never FAILED).
+    assert result is not None
+    assert result.verdict.disposition.value == "INCONCLUSIVE"
