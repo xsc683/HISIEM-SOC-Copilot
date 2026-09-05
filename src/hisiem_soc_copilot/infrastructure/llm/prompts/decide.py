@@ -9,10 +9,44 @@ loop.
 
 from __future__ import annotations
 
-from ....application.ports.model_provider import DecideNextRequest
+from ....application.ports.model_provider import DecideAlertContext, DecideNextRequest
 from ....contracts.tools.types import ModelToolSpec
 from ..schemas import NEXT_STEP_JSON_SCHEMA
 from .common import bounded, system_message, user_message
+
+_ALERT_FIELDS = (
+    ("rule_id", "the detection rule id (use verbatim for get_detection_rule)"),
+    ("detected_at", "alert detection time (anchor search windows around this)"),
+    ("source_ip", "source entity (if present)"),
+    ("user_name", "user entity (if present)"),
+    ("host_name", "host entity (if present)"),
+    ("event_category", "event category (if present)"),
+    ("event_action", "event action (if present)"),
+    ("severity", "alert severity (if present)"),
+)
+
+
+def _alert_context_block(context: DecideAlertContext | None) -> str:
+    if context is None:
+        return "(no alert context supplied)"
+    lines = ["Alert context (use these REAL values verbatim — never guess them):"]
+    for field, hint in _ALERT_FIELDS:
+        value = getattr(context, field, None)
+        if value:
+            lines.append(f"- {field}: {bounded(value, limit=120)} ({hint})")
+    return "\n".join(lines)
+
+
+def _evidence_block(evidence: list[dict[str, object]]) -> str:
+    if not evidence:
+        return "(no evidence gathered yet)"
+    lines = ["Evidence gathered (bounded, from THIS investigation only):"]
+    for entry in evidence:
+        eid = bounded(entry.get("evidence_id"), limit=80)
+        operation = bounded(entry.get("operation"), limit=40)
+        summary = bounded(entry.get("summary"), limit=250)
+        lines.append(f"- evidence_id: {eid}\n    operation: {operation}\n    summary: {summary}")
+    return "\n".join(lines)
 
 
 def _tool_specs_block(specs: list[ModelToolSpec]) -> str:
@@ -53,12 +87,6 @@ def _outcome_block(request: DecideNextRequest) -> str:
 def build_messages(
     request: DecideNextRequest, *, json_only: bool = False
 ) -> list[dict[str, str]]:
-    evidence_lines = request.evidence_summary or []
-    evidence_text = (
-        "\n".join(f"- {bounded(e, limit=200)}" for e in evidence_lines)
-        if evidence_lines
-        else "(no evidence gathered yet)"
-    )
     specs = _tool_specs_block(request.tool_specs)
     # If no specs were supplied, fall back to the bare name list so the model still
     # sees the selectable set (candidate only; never an execution path).
@@ -75,27 +103,48 @@ Iteration: {request.iteration}
 
 Plan goal: {bounded(request.plan_goal, limit=500) or "(no goal)"}
 
-Evidence gathered so far (bounded, ids only):
-{evidence_text}
+{_alert_context_block(request.alert_context)}
+
+{_evidence_block(request.evidence)}
 
 {specs}
 {names_block}
 {_outcome_block(request)}
 
-Decide the next action. Return EXACTLY one of:
+Return JSON EXACTLY in this shape (no extra keys, no renames):
+
+CONTINUE:
+{{"decision": "CONTINUE",
+  "tool_name": "<one selectable tool>",
+  "arguments": {{...matching that tool's argument schema...}},
+  "reason": "<short justification>"}}
+
+FINALIZE:
+{{"decision": "FINALIZE",
+  "tool_name": null,
+  "arguments": {{}},
+  "reason": "<short justification>"}}
+
+Decide the next action:
 - CONTINUE: propose the next read. tool_name MUST be one of the selectable tools
-  above; arguments MUST match that tool's argument schema (correct field names,
-  ISO-8601 UTC from/to, allowlisted condition field/operator, limit within range);
+  above; arguments MUST match that tool's argument schema AND use ONLY the real
+  identifiers/values supplied in the Alert context and Evidence above:
+    * get_detection_rule(rule_id) → rule_id MUST be the supplied alert.rule_id.
+    * search_events(from, to, conditions, ...) → build the window AROUND the
+      supplied alert.detected_at / evidence timestamps; condition fields/operators
+      must be from the allowed lists; never invent a rule_id, entity, or timestamp.
   reason is a short justification.
 - FINALIZE: evidence is sufficient (or no useful further read is possible) and the
   investigation should converge to assessment/verdict.
 
-Never propose a write, side-effect, shell, SQL, HTTP, SOAR action, a new tool, or a
-tool outside the selectable set. If the evidence is insufficient or a read keeps
-failing, prefer FINALIZE."""
+Never invent evidence, resource identifiers, entities, or tools. Never propose a
+write, side-effect, shell, SQL, HTTP, SOAR action, a new tool, or a tool outside the
+selectable set. If the evidence is insufficient or a read keeps failing, prefer
+FINALIZE."""
     return [system_message(), user_message(task, json_only=json_only)]
 
 
 def strict_schema() -> dict[str, object]:
     """The strict-json_schema for the decide candidate (provider wire shape)."""
     return NEXT_STEP_JSON_SCHEMA
+

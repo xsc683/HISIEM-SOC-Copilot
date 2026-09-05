@@ -36,17 +36,6 @@ def _evidence_lines(evidence: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
-def _relation_block() -> str:
-    return (
-        "relation ∈ SUPPORTS | CONTRADICTS | CONTEXT:\n"
-        "- SUPPORTS: this evidence directly supports the hypothesis.\n"
-        "- CONTRADICTS: this evidence directly contradicts the hypothesis.\n"
-        "- CONTEXT: related context only (rule metadata, background) — never on its "
-        "own enough to support or contradict.\n"
-        "You must cite ONLY evidence ids from the supplied evidence list."
-    )
-
-
 def build_messages(
     request: AssessRequest, *, json_only: bool = False
 ) -> list[dict[str, str]]:
@@ -60,18 +49,33 @@ Hypotheses:
 Evidence:
 {_evidence_lines(request.evidence)}
 
-For EACH supplied hypothesis produce:
-- hypothesis_id: the supplied id (never invent one).
-- status: SUPPORTED | CONTRADICTED | UNRESOLVED.
-- reason_summary: a short bounded justification.
-- evidence_relations: the semantic relation of each relevant supplied evidence to
-  this hypothesis. {_relation_block()}
-  A SUPPORTED/CONTRADICTED verdict REQUIRES at least one SUPPORTS/CONTRADICTS
-  relation; otherwise the hypothesis is UNRESOLVED.
-- findings (optional): short evidence-grounded findings. Each finding's
-  evidence_citations MUST be real supplied evidence ids.
+Return JSON EXACTLY in this shape (no extra keys, no renames):
 
-Prefer UNRESOLVED over guessing when evidence is insufficient."""
+{{"assessments": [
+    {{"hypothesis_id": "<a supplied hypothesis id>",
+      "status": "SUPPORTED | CONTRADICTED | UNRESOLVED",
+      "reason_summary": "<short bounded justification>",
+      "evidence_relations": [
+        {{"evidence_id": "<supplied id>",
+          "relation": "SUPPORTS | CONTRADICTS | CONTEXT"}}
+      ]}}
+  ],
+  "findings": [
+    {{"statement": "<short evidence-grounded finding>",
+      "evidence_citations": ["<supplied evidence id>"]}}
+  ]}}
+
+Rules:
+- "assessments" is an ARRAY; include one entry per supplied hypothesis (use the
+  supplied hypothesis_id verbatim; never invent one).
+- A SUPPORTED/CONTRADICTED verdict REQUIRES at least one SUPPORTS/CONTRADICTS
+  relation to a supplied evidence id; otherwise the hypothesis is UNRESOLVED.
+- "evidence_relations" cites ONLY supplied evidence ids.
+- "findings" is an ARRAY of objects that each use the EXACT keys "statement" and
+  "evidence_citations" (never "finding", "summary", or any other name). Each
+  evidence_citations MUST be a real supplied evidence id. Emit an empty array when
+  there are no grounded findings.
+- Prefer UNRESOLVED over guessing when evidence is insufficient."""
     return [system_message(), user_message(task, json_only=json_only)]
 
 

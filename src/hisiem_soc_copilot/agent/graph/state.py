@@ -16,7 +16,13 @@ SCHEMA_VERSION = 1
 
 
 class AlertContext(TypedDict):
-    """Bounded authoritative alert snapshot hydrated from HISIEM (read model)."""
+    """Bounded authoritative alert snapshot hydrated from HISIEM (read model).
+
+    Only investigation-decision fields are carried; tenant_id is bound by the
+    orchestrator scope and is NOT model-visible. All fields are optional so a
+    degraded/partial hydrate never crashes the graph; the decide node reads the ones
+    a real tool call needs (rule_id, detected_at, entity).
+    """
 
     alert_id: str
     tenant_id: str
@@ -24,7 +30,13 @@ class AlertContext(TypedDict):
     severity: NotRequired[str | None]
     status: NotRequired[str | None]
     rule_name: NotRequired[str | None]
+    rule_id: NotRequired[str | None]
     detected_at: NotRequired[str | None]
+    source_ip: NotRequired[str | None]
+    user_name: NotRequired[str | None]
+    host_name: NotRequired[str | None]
+    event_category: NotRequired[str | None]
+    event_action: NotRequired[str | None]
 
 
 class PendingToolRequest(TypedDict):

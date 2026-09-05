@@ -21,12 +21,15 @@ Alert summary:
 
 {tool_names_block(request.tool_names)}
 
-Produce a structured plan for this investigation:
-- goal: a single concise statement of the investigation objective.
-- steps: a short ordered list of bounded investigative steps. Each step is one
-  concrete read or reasoning action. Steps may reference ONLY the selectable tools.
-  You may propose no write, side-effect, shell, SQL, HTTP, or SOAR action, and no
-  new tool definition."""
+Return JSON EXACTLY in this shape (no extra keys, no renames):
+
+{{"goal": "<single concise investigation objective>",
+  "steps": [{{"step_id": "<stable short id>", "objective": "<one bounded step>"}}]}}
+
+Each step is one concrete read or reasoning action referencing ONLY the selectable
+tools. You may propose no write, side-effect, shell, SQL, HTTP, or SOAR action, and
+no new tool definition. Every step object MUST use the keys "step_id" and
+"objective" — never "step", "action", or any other name."""
     return [system_message(), user_message(task, json_only=json_only)]
 
 

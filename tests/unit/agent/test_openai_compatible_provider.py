@@ -447,6 +447,11 @@ async def _retry_then_succeed(first: Exception) -> None:
     plan = await provider.plan(_plan_request())
     assert plan.goal == "g"
     assert calls["n"] == 2  # one retry happened
+    # The SUCCESS telemetry must reflect the REAL total attempt count (2), never a
+    # fresh attempt_count=1 for the retried-but-successful call.
+    success_records = [r for r in provider.usage if r.outcome == "ok"]
+    assert len(success_records) == 1
+    assert success_records[0].attempt_count == 2
 
 
 async def test_timeout_is_retried_then_succeeds() -> None:
@@ -587,6 +592,60 @@ async def test_unknown_model_is_configuration_error() -> None:
     with pytest.raises(ModelConfigurationError):
         await provider.plan(_plan_request())
     assert calls["n"] == 1
+
+
+async def test_404_unknown_model_is_configuration_error() -> None:
+    """A 404 naming an unknown model → ModelConfigurationError (no retry)."""
+    calls = {"n": 0}
+
+    class _ModelNotFound404(Exception):
+        status_code = 404
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        calls["n"] += 1
+        raise _ModelNotFound404("model not found: deepseek/bogus")
+
+    provider = _provider(_FakeClient(handler))
+    with pytest.raises(ModelConfigurationError):
+        await provider.plan(_plan_request())
+    assert calls["n"] == 1  # never retried
+
+
+async def test_404_invalid_route_is_configuration_error() -> None:
+    """A 404 naming an invalid route/endpoint → ModelConfigurationError."""
+    calls = {"n": 0}
+
+    class _RouteNotFound(Exception):
+        status_code = 404
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        calls["n"] += 1
+        raise _RouteNotFound("route not found: /provider/v1/chat/completions")
+
+    provider = _provider(_FakeClient(handler))
+    with pytest.raises(ModelConfigurationError):
+        await provider.plan(_plan_request())
+    assert calls["n"] == 1
+
+
+async def test_404_plain_is_not_config_and_not_retried_as_refusal() -> None:
+    """A 404 WITHOUT a config signal is NOT a model refusal — it surfaces as an
+    unavailable (transient) failure, not a silent refusal and not a config bug."""
+    calls = {"n": 0}
+
+    class _Plain404(Exception):
+        status_code = 404
+
+    async def handler(kwargs: dict[str, Any]) -> object:
+        calls["n"] += 1
+        raise _Plain404("not found")
+
+    provider = _provider(_FakeClient(handler), max_retries=1)
+    # ModelUnavailableError is retryable; after exhausting retries it surfaces as
+    # ModelUnavailableError — never ModelRefusalError.
+    with pytest.raises(ModelUnavailableError):
+        await provider.plan(_plan_request())
+    assert calls["n"] == 2  # retried (transient), then exhausted
 
 
 # ---------------------------------------------------------------------------
@@ -763,3 +822,57 @@ async def test_provider_unavailable_yields_completed_inconclusive() -> None:
     assert any(
         "model provider" in (u.description or "") for u in result.uncertainties
     )
+
+
+# ---------------------------------------------------------------------------
+# decide context: alert + evidence reach the prompt builder
+# ---------------------------------------------------------------------------
+
+
+def test_decide_prompt_contains_alert_rule_id_and_detected_at() -> None:
+    from hisiem_soc_copilot.application.ports.model_provider import DecideAlertContext
+    from hisiem_soc_copilot.infrastructure.llm.prompts.decide import build_messages
+
+    request = DecideNextRequest(
+        investigation_id="inv-1",
+        iteration=0,
+        plan_goal="Investigate",
+        evidence_summary=[],
+        tool_names=["hisiem.search_events", "hisiem.get_detection_rule"],
+        alert_context=DecideAlertContext(
+            rule_id="rule-123",
+            detected_at="2026-09-01T10:00:00Z",
+            source_ip="203.0.113.9",
+            user_name="root",
+            host_name="web-01",
+            severity="high",
+        ),
+    )
+    text = "\n".join(m["content"] for m in build_messages(request))
+    assert "rule-123" in text
+    assert "2026-09-01T10:00:00Z" in text
+    assert "203.0.113.9" in text
+    assert "root" in text
+
+
+def test_decide_prompt_contains_persisted_evidence_bounded_summary() -> None:
+    from hisiem_soc_copilot.infrastructure.llm.prompts.decide import build_messages
+
+    request = DecideNextRequest(
+        investigation_id="inv-1",
+        iteration=0,
+        plan_goal="Investigate",
+        evidence_summary=["evt-1"],
+        tool_names=["hisiem.search_events", "hisiem.get_detection_rule"],
+        evidence=[
+            {
+                "evidence_id": "evt-1",
+                "operation": "authentication_success",
+                "summary": "successful SSH login after repeated failures",
+            }
+        ],
+    )
+    text = "\n".join(m["content"] for m in build_messages(request))
+    assert "evt-1" in text
+    assert "authentication_success" in text
+    assert "successful SSH login after repeated failures" in text

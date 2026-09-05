@@ -38,12 +38,12 @@ Evidence gathered (bounded):
 Grounded findings:
 {_finding_lines(request.finding_candidates)}
 
-Return:
-- disposition: MALICIOUS | BENIGN | INCONCLUSIVE.
-- summary: a short bounded reason summary.
-- confidence: a number in [0.0, 1.0] expressing your bounded confidence.
-- uncertainty: a short description of what remains uncertain/insufficient, or null
-  when none.
+Return JSON EXACTLY in this shape (no extra keys, no renames):
+
+{{"disposition": "MALICIOUS | BENIGN | INCONCLUSIVE",
+  "summary": "<short bounded reason summary>",
+  "confidence": <number in [0.0, 1.0]>,
+  "uncertainty": "<what remains uncertain/insufficient> or null}}
 
 Rules:
 - Insufficient evidence → INCONCLUSIVE.

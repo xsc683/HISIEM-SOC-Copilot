@@ -288,7 +288,7 @@ class OpenAICompatibleModelProvider:
                 # Deterministic: never retried. The runtime applies its fallback.
                 self._record_failure(operation, exc, attempt, latency_ms=latency_ms)
                 raise
-            self._record_success(operation, completion, latency_ms=latency_ms)
+            self._record_success(operation, completion, attempt, latency_ms=latency_ms)
             return wire
 
     async def _request_structured(
@@ -389,6 +389,7 @@ class OpenAICompatibleModelProvider:
         self,
         operation: str,
         completion: ProviderCompletion,
+        attempt: int,
         *,
         latency_ms: int | None,
     ) -> None:
@@ -398,6 +399,7 @@ class OpenAICompatibleModelProvider:
                 operation=operation,
                 provider_request_id=completion.provider_request_id,
                 latency_ms=latency_ms,
+                attempt_count=attempt,
                 input_tokens=completion.input_tokens,
                 output_tokens=completion.output_tokens,
                 total_tokens=completion.total_tokens,
@@ -557,6 +559,19 @@ def _map_sdk_error(exc: Exception) -> ModelProviderError:
         if _mentions_format(detail + _bounded_exc_text(exc)):
             return _FormatRejectedError(detail)
         return ModelRefusalError(detail)
+    if status == 404:
+        # A 404 is NOT a model refusal by default. Only configuration-shaped 404s
+        # (unknown model / invalid endpoint / route not found) are deterministic
+        # deployment failures; anything else (e.g. a 404 on a resource the provider
+        # legitimately cannot find) is treated as unavailable (transient-ish) rather
+        # than a silent refusal. Config 404 → ModelConfigurationError: no retry, no
+        # graceful INCONCLUSIVE fallback.
+        if _mentions_config(detail + _bounded_exc_text(exc)):
+            return ModelConfigurationError(
+                "model provider configuration error (unknown model or invalid "
+                "configured endpoint/route)"
+            )
+        return ModelUnavailableError("model provider returned HTTP 404")
     if "auth" in name or "authentication" in message.lower():
         return ModelConfigurationError(
             "model provider authentication/configuration error"
@@ -586,6 +601,7 @@ def _mentions_config(text: str) -> bool:
         for m in (
             "unknown model",
             "model_not_found",
+            "model not found",
             "invalid model",
             "no such model",
             "model does not exist",
@@ -595,6 +611,10 @@ def _mentions_config(text: str) -> bool:
             "invalid credentials",
             "invalid endpoint",
             "incorrect api key",
+            "endpoint not found",
+            "route not found",
+            "no route",
+            "invalid base_url",
         )
     )
 

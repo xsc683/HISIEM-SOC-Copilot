@@ -45,6 +45,38 @@ class PreviousToolOutcome:
 
 
 @dataclass(frozen=True)
+class DecideAlertContext:
+    """Bounded authoritative alert context the decide consult needs.
+
+    Only investigation-decision fields. NEVER tenant/auth/authorization data,
+    provider secrets, credentials, or raw alert bodies. Values are bounded strings
+    (None when the source did not supply them) — the model must use the REAL values,
+    never guess.
+    """
+
+    rule_id: str | None = None
+    detected_at: str | None = None
+    source_ip: str | None = None
+    user_name: str | None = None
+    host_name: str | None = None
+    event_category: str | None = None
+    event_action: str | None = None
+    severity: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "rule_id": self.rule_id,
+            "detected_at": self.detected_at,
+            "source_ip": self.source_ip,
+            "user_name": self.user_name,
+            "host_name": self.host_name,
+            "event_category": self.event_category,
+            "event_action": self.event_action,
+            "severity": self.severity,
+        }
+
+
+@dataclass(frozen=True)
 class DecideNextRequest:
     investigation_id: str
     iteration: int
@@ -55,6 +87,11 @@ class DecideNextRequest:
     # Provider-neutral tool specs (name/description/arguments_schema) for the real,
     # selectable tools — lets the model build arguments the parser will accept.
     tool_specs: list[ModelToolSpec] = field(default_factory=list)
+    # Bounded authoritative alert context (real rule_id/detected_at/entity values).
+    alert_context: DecideAlertContext | None = None
+    # Bounded persisted evidence of THIS investigation: {evidence_id, operation,
+    # summary} — never raw ToolResults/Events/full event.original/credentials.
+    evidence: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

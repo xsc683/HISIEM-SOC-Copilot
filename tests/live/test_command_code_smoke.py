@@ -91,13 +91,32 @@ def _plan_request() -> PlanRequest:
 
 
 def _decide_request() -> DecideNextRequest:
+    from hisiem_soc_copilot.application.ports.model_provider import DecideAlertContext
+
     return DecideNextRequest(
         investigation_id="live-inv-1",
         iteration=0,
         plan_goal="Investigate whether the alert indicates account compromise",
-        evidence_summary=[],
+        evidence_summary=["evt-succ-1"],
         tool_names=["hisiem.search_events", "hisiem.get_detection_rule"],
         tool_specs=model_tool_specs(),
+        alert_context=DecideAlertContext(
+            rule_id="ssh_brute_force",
+            detected_at="2026-09-01T10:00:00Z",
+            source_ip="203.0.113.9",
+            user_name="root",
+            host_name="web-01",
+            event_category="authentication",
+            event_action="login_failure",
+            severity="high",
+        ),
+        evidence=[
+            {
+                "evidence_id": "evt-succ-1",
+                "operation": "authentication_success",
+                "summary": "Successful SSH login after repeated failures",
+            }
+        ],
     )
 
 
@@ -171,3 +190,37 @@ async def test_live_json_only_fallback(
     plan = await json_only_provider.plan(_plan_request())
     assert plan.goal
     print("\n[LIVE] json_only request succeeded")
+
+
+async def test_live_decide_candidate_passes_deterministic_parser(
+    live_provider: OpenAICompatibleModelProvider,
+) -> None:
+    """If the real model returns CONTINUE, its ToolCandidate must pass the existing
+    deterministic argument parser/policy unchanged (no relaxation). If it legally
+    chooses FINALIZE that is acceptable; the parser is validated independently by the
+    unit suite — but a CONTINUE candidate is never accepted raw."""
+    from hisiem_soc_copilot.agent.tools.args import (
+        parse_detection_rule,
+        parse_search_events,
+    )
+    from hisiem_soc_copilot.agent.tools.policy import validate_search_span
+
+    step = await live_provider.decide_next(_decide_request())
+    print(f"\n[LIVE] decide returned decision={step.decision} tool={step.tool_name}")
+    if step.decision != "CONTINUE" or not step.tool_name:
+        print("[LIVE] model chose FINALIZE — parser-valid CONTINUE covered by unit tests")
+        assert step.decision == "FINALIZE"
+        return
+    args = dict(step.arguments or {})
+    if step.tool_name == "hisiem.get_detection_rule":
+        parsed = parse_detection_rule(args)
+        print(f"[LIVE] get_detection_rule parsed rule_id={parsed.rule_id!r}")
+    elif step.tool_name == "hisiem.search_events":
+        parsed = parse_search_events(args)
+        validate_search_span(parsed)
+        print(
+            f"[LIVE] search_events parsed from={parsed.from_} to={parsed.to} "
+            f"conditions={len(parsed.conditions)} limit={parsed.limit}"
+        )
+    else:
+        raise AssertionError(f"model selected a non-selectable tool: {step.tool_name!r}")

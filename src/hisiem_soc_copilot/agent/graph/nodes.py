@@ -51,6 +51,7 @@ from ...application.commands.investigation import (
 )
 from ...application.ports.model_provider import (
     AssessRequest,
+    DecideAlertContext,
     DecideNextRequest,
     PlanRequest,
     PreviousToolOutcome,
@@ -430,8 +431,34 @@ async def decide_next(
         return {"next_action": CONVERGE, "assessment": "FINALIZE"}
     # Consume one LLM call for this model consult through the single authority.
     budget = budget.consume_llm_call()
-    evidence_ids = state.get("new_evidence_ids") or []
     outcome = _previous_outcome_of(state)
+
+    # Build the bounded working context from authoritative sources — a SHORT read
+    # transaction that is CLOSED before the model consult (no DB transaction spans
+    # the provider HTTP call). The model receives only bounded fields: real
+    # rule_id/detected_at/entity from the alert snapshot + persisted Evidence
+    # (evidence_id + operation + bounded summary) of THIS investigation — never raw
+    # ToolResults/Events, tenant/authorization data, or secrets.
+    evidence_ids: list[str] = []
+    evidence_context: list[dict[str, object]] = []
+    uow = runtime.new_unit_of_work()
+    try:
+        evidence_rows = await uow.evidence.list_by_investigation(
+            tenant_id=runtime.tenant_id, investigation_id=_inv_id(state)
+        )
+    finally:
+        await uow.close()
+    for ev in evidence_rows:
+        evidence_ids.append(str(ev.id))
+        evidence_context.append(
+            {
+                "evidence_id": str(ev.id),
+                "operation": ev.source.operation,
+                "summary": _evidence_line(ev),
+            }
+        )
+    alert_context = _decide_alert_context(dict(state.get("alert_context") or {}))
+
     # A provider outage/refusal degrades to a bounded finalize (converge) — never a
     # FAILED investigation just because the model was unavailable.
     next_step = await _model_consult(
@@ -444,6 +471,8 @@ async def decide_next(
                 tool_names=runtime.registry.model_selectable_names,
                 previous_tool_outcome=outcome,
                 tool_specs=runtime.registry.model_tool_specs(),
+                alert_context=alert_context,
+                evidence=evidence_context,
             )
         )
     )
@@ -1129,4 +1158,32 @@ async def complete(
 def _evidence_line(evidence: Evidence) -> str:
     line = evidence.summary or str(evidence.observation)
     return str(line)[:200]
+
+
+def _decide_alert_context(alert: dict[str, Any]) -> DecideAlertContext | None:
+    """Map the bounded alert snapshot to the decide request's alert context.
+
+    Only the investigation-decision fields a real tool call needs are exposed; the
+    model must use the REAL values (never guess rule_id / entity), and tenant /
+    authorization / secrets are never included.
+    """
+    if not alert:
+        return None
+    return DecideAlertContext(
+        rule_id=_opt_str(alert.get("rule_id")),
+        detected_at=_opt_str(alert.get("detected_at")),
+        source_ip=_opt_str(alert.get("source_ip")),
+        user_name=_opt_str(alert.get("user_name")),
+        host_name=_opt_str(alert.get("host_name")),
+        event_category=_opt_str(alert.get("event_category")),
+        event_action=_opt_str(alert.get("event_action")),
+        severity=_opt_str(alert.get("severity")),
+    )
+
+
+def _opt_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
