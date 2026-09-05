@@ -120,6 +120,11 @@ def _rfc3339_utc(value: str, where: str) -> str:
     return rendered.replace("+00:00", "Z")
 
 
+def _now_utc_rfc3339() -> str:
+    """The current instant as canonical RFC3339 UTC — the default ``sealed_at``."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 def _verify_finite(value: Any, where: str) -> None:
     """Reject NaN/Infinity at any depth of the payload (E1-B.4 §15)."""
     if isinstance(value, float):
@@ -152,6 +157,7 @@ class ManifestBuilder:
         *,
         scenario_source_file_sha256: str,
         scenario_semantic_sha256: str,
+        sealed_at: str | None = None,
     ) -> SealedManifest:
         """Build the sealed manifest for ``verified``.
 
@@ -160,7 +166,12 @@ class ManifestBuilder:
         evidence. Semantic events are F1..F5,S1 in committed order; W1 is isolated
         into ``control_events``. ``integrity.manifest_sha256`` digests the
         canonical payload with itself omitted (E1-B.4 §16).
-        """
+
+        ``sealed_at`` is the SEALING instant (when this builder runs) and is
+        deliberately decoupled from ``verified.materialized_at`` (the instant the
+        DatasetVerifier produced the VerifiedDataset). It defaults to now-UTC;
+        callers may inject a fixed value for deterministic byte-identical output
+        given identical explicit inputs (E1-B.4 correctness round)."""
         _validate_inputs(
             verified,
             oracle,
@@ -180,7 +191,7 @@ class ManifestBuilder:
             oracle=oracle,
             code=code,
             integrity={"canonicalization": CANONICALIZATION_ID},
-            sealed_at=verified.materialized_at,
+            sealed_at=sealed_at or _now_utc_rfc3339(),
             materialized_at=verified.materialized_at,
         )
         digest = compute_manifest_sha256(manifest)
@@ -245,6 +256,7 @@ def _validate_inputs(
     code: CodeRevision,
     scenario_source_file_sha256: str,
     scenario_semantic_sha256: str,
+    sealed_at: str | None = None,
 ) -> None:
     if not isinstance(verified, VerifiedDataset):
         raise ManifestNotVerifiedError(
@@ -273,6 +285,8 @@ def _validate_inputs(
             f"scenario {verified.scenario.id} control role "
             f"{verified.scenario.control_role!r} appears in oracle.required_evidence_roles",
         )
+    if sealed_at is not None:
+        _rfc3339_utc(sealed_at, "sealed_at")  # must be a canonical RFC3339 UTC instant
 
 
 def build_manifest(
@@ -282,6 +296,7 @@ def build_manifest(
     *,
     scenario_source_file_sha256: str,
     scenario_semantic_sha256: str,
+    sealed_at: str | None = None,
 ) -> SealedManifest:
     """Module-level convenience for E1-B.4 §22 ``build_manifest``."""
     return ManifestBuilder().build(
@@ -290,6 +305,7 @@ def build_manifest(
         code,
         scenario_source_file_sha256=scenario_source_file_sha256,
         scenario_semantic_sha256=scenario_semantic_sha256,
+        sealed_at=sealed_at,
     )
 
 

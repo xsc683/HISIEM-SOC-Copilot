@@ -159,6 +159,19 @@ async def _materialize_run(
         await reader.close()
 
 
+def _resume_injection_state(state: str) -> bool:
+    """E1-B.3 §12 resume dispatch: only a genuine PRE-injection window may call
+    inject_events(). Every post-injection state and the TERMINAL INDETERMINATE/
+    FAILED states are excluded — an ambiguous or completed window is never
+    re-injected from (zero writes) and must instead be abandoned for a NEW run_id
+    when it cannot be reconciled."""
+    return state in (
+        "NEW",
+        "PREFLIGHTED",
+        "EVENTS_RENDERED",
+    )
+
+
 async def _resume_run(
     settings: EvaluationSettings,
     hisiem: HisiemSettings,
@@ -196,7 +209,12 @@ async def _resume_run(
             reader=reader,
             draft=draft,
         )
-        if materializer.draft.state in ("NEW", "PREFLIGHTED", "EVENTS_RENDERED"):
+        # §12: an INDETERMINATE/FAILED injection window is NEVER re-injected from.
+        # The dispatch below mirrors the state machine's legal-from rules so resume
+        # calls inject_events() ONLY for a fresh/partial pre-injection window; all
+        # other states (INDETERMINATE/FAILED and EVENTS_INJECTED and later) are
+        # reconciled/resolved with ZERO new injection attempts.
+        if _resume_injection_state(materializer.draft.state):
             await materializer.inject_events()
             _checkpoint(ledger_path, materializer)
         deadline = datetime.now(UTC) + timedelta(seconds=settings.resolve_deadline_seconds)
@@ -226,6 +244,13 @@ def _seal(dataset: VerifiedDataset, run_dir: Path) -> None:
         scenario_source_file_sha256=source_file_sha256(),
         scenario_semantic_sha256=semantic_sha256(dataset.scenario),
     )
+    # E1-B.4 §17: a dirty worktree means this record is not reproducible from a
+    # clean committed revision — flag it NON_AUTHORITATIVE (not a hard block).
+    if dirty:
+        print(
+            "NON_AUTHORITATIVE: worktree has uncommitted changes; this sealed "
+            "manifest is not reproducible from a clean git revision"
+        )
     manifest_path = _manifest_path(run_dir)
     seal_manifest(manifest, manifest_path)
     verified = verify_sealed_manifest(manifest_path)
@@ -323,6 +348,11 @@ def _load_verified_from_draft(
         raise RuntimeError(f"run {run_id} ledger is incomplete; cannot seal")
     from .verifier import DatasetVerifier
 
+    # Recover the ORIGINAL verification instant from the frozen draft.verified_at
+    # (set when the DatasetVerifier produced the VerifiedDataset) — NEVER from
+    # draft.updated_at, which later ledger checkpoints rewrite, and NEVER a fresh
+    # materialization time at seal (E1-B.4 correctness round).
+    verified_at = draft.verified_at or draft.updated_at
     return DatasetVerifier(
         scenario=scenario,
         run=draft.identity,
@@ -331,7 +361,7 @@ def _load_verified_from_draft(
     ).verify(
         resolved_events=draft.resolved_events,
         source_alert=draft.resolved_alert,
-        materialized_at=draft.updated_at,
+        materialized_at=verified_at,
     )
 
 

@@ -11,6 +11,16 @@ newly computed bytes for idempotent success; any difference is a
 :class:`ManifestSealConflict`. Writes are atomic (E1-B.4 §20): temp file in the
 same directory → flush + fsync → ``os.replace``. Pure filesystem work — no
 network, provider, or model I/O.
+
+Publication is CROSS-PROCESS first-writer-wins. When the final target is absent,
+it is claimed by an exclusive ``os.open(..., O_CREAT | O_EXCL)`` whose owning
+descriptor is the file's writer: exactly one concurrent process wins the claim and
+writes through that descriptor (flush + fsync) before closing it. Every loser
+re-reads the winning bytes and resolves idempotent-success (identical bytes) vs
+:class:`ManifestSealConflict` (different bytes) — a different immutable record is
+never overwritten, and no torn/partial JSON is ever observable at the final path
+(E1-B.4 §20). ``os.replace`` remains only for the legacy path where an atomic
+single-process temp-file write is preferred.
 """
 
 from __future__ import annotations
@@ -54,6 +64,20 @@ _TMP_SUFFIX: Final = ".seal.tmp"
 # violated by the rebuild.
 _WATERMARK_NOT_SEALED: Final = "watermark-not-sealed"
 
+
+class _SealClaimedError(Exception):
+    """Internal: the exclusive-create claim on a seal target was lost.
+
+    Signifies another process created ``path`` between the absence check and the
+    O_EXCL claim (or claimed it first). Callers fall back to re-reading the
+    existing bytes to decide idempotent-success vs :class:`ManifestSealConflict`.
+    Not part of the public error taxonomy.
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"seal target was concurrently created: {path}")
+        self.path = path
+
 __all__ = [
     "ManifestSealer",
     "seal_manifest",
@@ -68,6 +92,12 @@ def _write_atomic(target: Path, data: bytes) -> None:
     Temp file in target's directory → write → flush → fsync → os.replace, so the
     final path is never observed as a partially written JSON document. Directory
     fsync is attempted best-effort where supported.
+
+    ``os.replace`` overwrites an existing destination, so this helper is only
+    invoked when no concurrent first-writer-wins claim is in play (it is not used
+    by :func:`seal_manifest`, which claims the final inode with ``O_EXCL`` and
+    writes through that descriptor; retained here as the documented atomic
+    single-process write primitive).
     """
     tmp = target.with_name(target.name + _TMP_SUFFIX)
     try:
@@ -82,14 +112,87 @@ def _write_atomic(target: Path, data: bytes) -> None:
         raise ManifestPersistenceError(
             f"failed to atomically seal manifest to {target}: {exc}",
         ) from exc
+    _fsync_directory(target.parent)
+
+
+def _claim_and_write(target: Path, data: bytes) -> None:
+    """Atomically create ``target`` and write ``data`` through the owning fd.
+
+    The final path itself is opened with ``os.O_CREAT | os.O_EXCL | os.O_WRONLY``
+    (+ ``os.O_BINARY`` on Windows), so the kernel's exclusive-create is the
+    cross-process first-writer-wins gate: exactly one process claims the inode and
+    every concurrent claimant receives ``FileExistsError``. Bytes are flushed and
+    fsynced through that descriptor before it closes, so the final path is never
+    observed as a torn/partial JSON document (E1-B.4 §20).
+
+    No temp file or rename is involved — O_EXCL creation IS the atomic claim. The
+    claim can never clobber a different existing manifest because the open fails
+    (``FileExistsError``) if the path already exists; the caller decides
+    idempotent-success vs :class:`ManifestSealConflict` from the existing bytes.
+    """
     try:
-        dir_fd = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        fd = os.open(target, flags)
+    except FileExistsError as exc:
+        raise _SealClaimedError(str(target)) from exc
+    except OSError as exc:
+        raise ManifestPersistenceError(
+            f"failed to claim seal target {target}: {exc}",
+        ) from exc
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+            target.unlink(missing_ok=True)  # never leave a torn claimed inode
+        raise ManifestPersistenceError(
+            f"failed to write sealed manifest to {target}: {exc}",
+        ) from exc
+    os.close(fd)
+    _fsync_directory(target.parent)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write ``data`` to ``fd`` in full (os.write may return a short count)."""
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort directory fsync (unsupported on some platforms, e.g. Windows)."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
     except OSError:
-        pass  # directory fsync unsupported on some platforms (e.g. Windows)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _compare_with_target(target: Path, data: bytes) -> None:
+    """Resolve a claimed/observed existing target against ``data``.
+
+    Reads the current bytes of ``target`` (which may now belong to a concurrent
+    winner) and decides idempotent-success (identical bytes) vs
+    :class:`ManifestSealConflict` (different bytes). Never overwrites.
+    """
+    try:
+        existing = target.read_bytes()
+    except OSError as exc:
+        raise ManifestPersistenceError(
+            f"failed to read existing sealed manifest {target}: {exc}",
+        ) from exc
+    if existing != data:
+        raise ManifestSealConflict(
+            f"target {target} already holds a DIFFERENT sealed manifest "
+            "(byte mismatch); refusing to overwrite an immutable evaluation record",
+        )
 
 
 class ManifestSealer:
@@ -109,12 +212,19 @@ class ManifestSealer:
 
 
 def seal_manifest(manifest: SealedManifest, path: str | Path) -> SealedManifest:
-    """Seal ``manifest`` to ``path`` immutably and atomically.
+    """Seal ``manifest`` to ``path`` immutably, atomically, cross-process.
 
-    - ``path`` absent → atomic temp-file + fsync + rename write.
-    - ``path`` exists with IDENTICAL bytes → idempotent success.
-    - ``path`` exists with DIFFERENT bytes → :class:`ManifestSealConflict`
-      (a different immutable record is never silently overwritten, E1-B.4 §21).
+    Publication is first-writer-wins (E1-B.4 §20, §21):
+
+    - ``path`` absent → the final inode is CLAIMED with an exclusive
+      ``O_CREAT | O_EXCL`` open and the bytes are written + fsynced through that
+      descriptor; a concurrent sealer that loses the claim re-reads the winner's
+      bytes instead of overwriting.
+    - ``path`` exists with IDENTICAL bytes → idempotent success, whether it was
+      present before this call or claimed by a concurrent winner.
+    - ``path`` exists with DIFFERENT bytes (present before, or claimed by a
+      concurrent sealer of another manifest) → :class:`ManifestSealConflict`;
+      a different immutable record is never silently overwritten.
 
     Returns the sealed ``manifest``.
     """
@@ -130,20 +240,15 @@ def seal_manifest(manifest: SealedManifest, path: str | Path) -> SealedManifest:
         raise ManifestPersistenceError(
             f"seal target directory does not exist: {target.parent}",
         )
-    if target.exists():
-        try:
-            existing = target.read_bytes()
-        except OSError as exc:
-            raise ManifestPersistenceError(
-                f"failed to read existing sealed manifest {target}: {exc}",
-            ) from exc
-        if existing != data:
-            raise ManifestSealConflict(
-                f"target {target} already holds a DIFFERENT sealed manifest "
-                "(byte mismatch); refusing to overwrite an immutable evaluation record",
-            )
-        return manifest  # idempotent success
-    _write_atomic(target, data)
+    try:
+        if target.exists():
+            _compare_with_target(target, data)
+            return manifest  # idempotent success
+        # Absent just now: race to claim the final inode exclusively. The winner
+        # writes the bytes; the loser re-reads the winner's bytes below.
+        _claim_and_write(target, data)
+    except _SealClaimedError:
+        _compare_with_target(target, data)  # decides idempotent vs conflict
     return manifest
 
 
