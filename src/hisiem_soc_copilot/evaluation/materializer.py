@@ -20,6 +20,8 @@ from typing import Protocol
 from uuid import uuid4
 
 from .contracts import (
+    EVENT_PLAN_CROSSES_YEAR_BOUNDARY,
+    GP01_FAILURE_ROLES,
     GP01_LOGICAL_DATASET,
     GP01_RULE_CONDITION,
     GP01_RULE_ID,
@@ -31,6 +33,7 @@ from .contracts import (
     EventInjectionError,
     EventTimePlan,
     InjectionOutcomeIndeterminate,
+    InvalidMaterializationTransition,
     LogicalEvent,
     MaterializationDraft,
     MaterializationState,
@@ -38,16 +41,14 @@ from .contracts import (
     RenderedEvent,
     RuleContractMismatch,
     RunIdentity,
+    RunIdentityCollision,
     ScenarioSpec,
     VerifiedDataset,
 )
 from .hisiem_reader import HisiemEvaluationReader, RuleContract
 from .identity import derive_event_process_id, derive_run_identity
 from .injector import WRITE_STATUS_CONNECTION_ERROR, WRITE_STATUS_INDETERMINATE, EventInjector
-from .time_plan import EventPlanCrossesYearBoundary, build_event_time_plan
-
-_FIVE_MIN = timedelta(minutes=5)
-_YEAR_BOUNDARY_CODE = "EVENT_PLAN_CROSSES_YEAR_BOUNDARY"
+from .time_plan import build_event_time_plan
 
 # Event-time isolation for resolution. F1..F5 are spaced 10 s apart (and S1 20 s
 # after F5) and the parser sets @timestamp to the rendered wall-clock second, so a
@@ -72,6 +73,17 @@ def _now_utc() -> datetime:
 
 def _utc_dt(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _require_state(current: str, *allowed: MaterializationState) -> None:
+    """Transition gate (E1-B.3 §9): raise ``InvalidMaterializationTransition``
+    unless the draft's current state string is one of the legal-from states."""
+    if current not in {state.value for state in allowed}:
+        expected = ", ".join(state.value for state in allowed)
+        raise InvalidMaterializationTransition(
+            f"illegal materialization transition from state {current!r}; "
+            f"expected one of: {expected}"
+        )
 
 
 class Gp01Materializer:
@@ -128,6 +140,7 @@ class Gp01Materializer:
         reachable: bool = True,
     ) -> None:
         """Validate the environment + rule contract BEFORE any write occurs."""
+        _require_state(self._draft.state, MaterializationState.NEW)
         if not reachable:
             raise PreflightError("HISIEM control surface is not reachable")
         if rule is None:
@@ -152,17 +165,118 @@ class Gp01Materializer:
             raise RuleContractMismatch(
                 f"rule condition {rule.condition_action!r} != expected {GP01_RULE_CONDITION}"
             )
-        # Year boundary is checked by the pure time-plan builder at bind time; a
-        # plan that crossed a year could never have been built, so this is a
-        # defensive confirmation the plan is bound in the past (E1-B.3 §6).
-        try:
-            build_event_time_plan(now=_now_utc())  # may raise EventPlanCrossesYearBoundary
-        except EventPlanCrossesYearBoundary:
-            raise PreflightError(_YEAR_BOUNDARY_CODE) from None
-        # Run collision: GP-01 only ever resolves one alert per attack source; the
-        # reader's wait_for_alert raises AmbiguousSourceAlertError if two runs
-        # collide on the same source/rule. Identity is run-scoped (E1-B.3 §5).
+        # E1-B.3 §10.5: validate the plan this run is ACTUALLY bound to (never
+        # build a second, unrelated plan).
+        self._validate_time_plan()
+        # E1-B.3 §10.4: an already-materialized run with this exact identity is a
+        # reconciliation/resume (allowed); a DIFFERENT run on the same identity is
+        # a typed collision. Both checks run before any state transition/write.
+        await self._check_run_collision()
         self._set_state(MaterializationState.PREFLIGHTED)
+
+    def _validate_time_plan(self) -> None:
+        """E1-B.3 §10.5: validate the bound plan's past/detection-window/year
+        invariants directly — no plan regeneration."""
+        if self._time_plan is None:
+            raise PreflightError(
+                "no bound time plan; cannot validate a run that was not time-planned"
+            )
+        wall = self._time_plan.wall_clock
+        events = self._time_plan.events
+        missing = [role for role in GP01_LOGICAL_DATASET if role.role not in wall]
+        if missing:
+            raise PreflightError(
+                f"bound time plan is missing wall-clock entries for: "
+                f"{[logical.role for logical in missing]}"
+            )
+        now = _now_utc()
+        if max(wall.values()) >= now:
+            raise PreflightError("bound time plan is not fully in the past when injection starts")
+        # The SSH syslog form carries no year; the parser auto-completes it, so all
+        # roles must share ONE local wall-clock year (E1-B.3 §6, §10.5).
+        roles = [
+            logical.role
+            for logical in GP01_LOGICAL_DATASET
+            if logical.classification != "WATERMARK_CONTROL"
+        ]
+        years = {wall[role].year for role in roles}
+        years.add(wall["W1"].year)  # W1 is the window-advance control; must agree too
+        if len(years) != 1:
+            raise PreflightError(
+                "bound time plan crosses a natural calendar-year boundary",
+                code=EVENT_PLAN_CROSSES_YEAR_BOUNDARY,
+            )
+        f1 = events["F1"]
+        max_failure = max(events[role] for role in GP01_FAILURE_ROLES)
+        if (max_failure - f1) > timedelta(minutes=GP01_RULE_WINDOW_MINUTES):
+            raise PreflightError(
+                "bound time plan spreads F1..F5 beyond the configured detection "
+                f"window ({GP01_RULE_WINDOW_MINUTES} minutes)"
+            )
+        if events["S1"] <= max_failure:
+            raise PreflightError("bound time plan has S1 not strictly after the last failure")
+        # W1 advances detection past the window-close boundary (E1-B.3 §6).
+        window_close = f1 + timedelta(minutes=GP01_RULE_WINDOW_MINUTES)
+        if events["W1"] <= window_close:
+            raise PreflightError(
+                "bound time plan has W1 before the detection-window close boundary"
+            )
+
+    async def _check_run_collision(self) -> None:
+        """E1-B.3 §10.4: search HISIEM's bounded current-run scope for existing
+        events matching this run's correlation identity (source.ip + user.name +
+        host.name + event.action over the plan's bounded window).
+
+        HISIEM does not persist ``run_id``, so correlation is on identity + bounded
+        time only — NEVER a test-only HISIEM field. The plan's committed F1..F5
+        instants are what distinguish the SAME run from a DIFFERENT run that
+        reused/derived the same attack source:
+
+        - no matching events            -> fresh run, proceed;
+        - matching events aligned to    -> the SAME run (a reconciliation/resume),
+          this run's F1..F5 instants       proceed WITHOUT re-injecting;
+        - matching events NOT aligned   -> a DIFFERENT run on the same identity ->
+          to this run's F1..F5 instants    raise ``RunIdentityCollision``.
+        """
+        f1 = self._time_plan.events["F1"]
+        w1 = self._time_plan.events["W1"]
+        scope_from = f1 - timedelta(minutes=1)
+        scope_to = w1 + timedelta(minutes=1)
+        conditions: list[dict[str, object]] = [
+            {"field": "source.ip", "operator": "is", "value": self._identity.attack_source_ip},
+            {"field": "user.name", "operator": "is", "value": self._identity.user_name},
+            {"field": "host.name", "operator": "is", "value": self._identity.host_name},
+            {"field": "event.action", "operator": "is", "value": GP01_RULE_CONDITION},
+        ]
+        existing = await self._reader.search_events(
+            from_=scope_from, to=scope_to, conditions=conditions, size=50
+        )
+        if not existing:
+            return  # fresh run — proceed
+        # The detection window is [F1, F1 + windowMinutes]; events inside it are
+        # ambiguous as to which run they belong to, so the collision decision is
+        # made on the rendered-instant signature, not raw window membership.
+        committed = [self._time_plan.events[role] for role in GP01_FAILURE_ROLES]
+        aligned = 0
+        for hit in existing:
+            if hit.timestamp is None:
+                continue
+            ts = _utc_dt(hit.timestamp)
+            for instant in committed:
+                if abs((ts - instant).total_seconds()) <= _RESOLVE_WINDOW_SECONDS:
+                    aligned += 1
+                    break
+        if aligned > 0:
+            return  # the SAME run already injected — the CLI's inject gating avoids a re-inject
+        # Matching events that align to NONE of this run's committed F1..F5
+        # instants: a different run that reused/derived this exact attack identity.
+        raise RunIdentityCollision(
+            f"preflight found {len(existing)} existing authentication_failure events "
+            f"for source={self._identity.attack_source_ip!r} user={self._identity.user_name!r} "
+            f"host={self._identity.host_name!r} that align to none of this run's "
+            "committed F1..F5 instants — a different run appears to reuse this "
+            "identity; refusing to write"
+        )
 
     # -- render + inject ---------------------------------------------------
 
@@ -170,9 +284,15 @@ class Gp01Materializer:
         return list(GP01_LOGICAL_DATASET)
 
     def render_events(self) -> list[RenderedEvent]:
-        """Bind every logical event to a rendered syslog line (E1-B.3 §11)."""
+        """Bind every logical event to a rendered syslog line (E1-B.3 §11).
+
+        Legal-from: PREFLIGHTED (a NEW draft must preflight first). Idempotent
+        resume exception: if the draft already carries rendered events (state
+        EVENTS_RENDERED or later) the existing lines are returned WITHOUT
+        re-rendering or re-transitioning, preserving the resume path."""
         if self._draft.rendered:
             return list(self._draft.rendered)  # resume: never re-render
+        _require_state(self._draft.state, MaterializationState.PREFLIGHTED)
         rendered: list[RenderedEvent] = []
         for logical in self._logical():
             wall = self._time_plan.wall_clock[logical.role]
@@ -217,7 +337,37 @@ class Gp01Materializer:
 
     async def inject_events(self) -> None:
         """Inject in the FIXED order F1..F5,S1,W1 (E1-B.3 §11) — the caller may
-        not reorder. Never re-injects an already-attempted role on resume."""
+        not reorder.
+
+        §12 resume-safety: a draft in INDETERMINATE/FAILED can NEVER be injected
+        from again (zero writes — the ambiguous server-side outcome must be
+        reconciled, not resent). A draft already in EVENTS_INJECTED (or later) is
+        a completed injection window and is a no-op returning ``None``. Only a
+        fresh/partial window (NEW/PREFLIGHTED/EVENTS_RENDERED with an incomplete
+        ``injected`` record) actually sends; an already-attempted role is never
+        blindly re-injected."""
+        injected = MaterializationState.INDETERMINATE.value
+        failed = MaterializationState.FAILED.value
+        if self._draft.state in (injected, failed):
+            raise InvalidMaterializationTransition(
+                f"cannot inject from state {self._draft.state!r}: the ambiguous/"
+                "failed TCP outcome must be reconciled (same run_id), never "
+                "re-injected (E1-B.3 §12)"
+            )
+        if self._draft.state in (
+            MaterializationState.EVENTS_INJECTED.value,
+            MaterializationState.EVENTS_RESOLVED.value,
+            MaterializationState.ALERT_RESOLVED.value,
+            MaterializationState.VERIFIED.value,
+            MaterializationState.MATERIALIZED.value,
+        ):
+            return  # completed/partial-injection window: already injected — no-op
+        _require_state(
+            self._draft.state,
+            MaterializationState.NEW,
+            MaterializationState.PREFLIGHTED,
+            MaterializationState.EVENTS_RENDERED,
+        )
         rendered = self.render_events()
         attempted = {attempt.logical_role for attempt in self._draft.injected}
         for event in rendered:
@@ -227,7 +377,8 @@ class Gp01Materializer:
             self._draft.injected.append(attempt)
             if attempt.write_status == WRITE_STATUS_INDETERMINATE:
                 # §12: the server-side outcome cannot be proven. The run MUST stop
-                # in INDETERMINATE and MUST NOT auto-resend this event.
+                # in INDETERMINATE and MUST NOT auto-resend this event; any later
+                # resume attempt is refused zero-write by the gate above.
                 self._draft.state = MaterializationState.INDETERMINATE.value
                 raise InjectionOutcomeIndeterminate(
                     f"injection of {event.role} is INDETERMINATE (server-side "
@@ -245,7 +396,36 @@ class Gp01Materializer:
     # -- resolution --------------------------------------------------------
 
     async def resolve_events(self, *, deadline: datetime, interval: float = 2.0) -> None:
-        """Resolve F1..F5, S1, W1 through HISIEM log-search (E1-B.3 §13)."""
+        """Resolve F1..F5, S1, W1 through HISIEM log-search (E1-B.3 §13).
+
+        Legal-from: EVENTS_INJECTED (must have injected first). A draft already in
+        EVENTS_RESOLVED is an idempotent resume reconcile — already-resolved roles
+        are skipped and the state is re-asserted. An INDETERMINATE/FAILED injection
+        window is TERMINAL (§12): its unattempted siblings were never sent and can
+        never be injected (re-injection is refused), so the run cannot be completed
+        by resolution — the operator abandons it for a NEW run_id."""
+        if self._draft.state in (
+            MaterializationState.NEW.value,
+            MaterializationState.PREFLIGHTED.value,
+            MaterializationState.EVENTS_RENDERED.value,
+            MaterializationState.INDETERMINATE.value,
+            MaterializationState.FAILED.value,
+        ):
+            raise InvalidMaterializationTransition(
+                f"cannot resolve events from state {self._draft.state!r}; a run in "
+                "INDETERMINATE/FAILED had its injection window interrupted — the "
+                "unattempted siblings were never sent and may not be re-injected "
+                "(E1-B.3 §12), so it cannot be completed by resolution. Abandon it "
+                "and start a NEW run_id."
+            )
+        _require_state(
+            self._draft.state,
+            MaterializationState.EVENTS_INJECTED,
+            MaterializationState.EVENTS_RESOLVED,
+            MaterializationState.ALERT_RESOLVED,
+            MaterializationState.VERIFIED,
+            MaterializationState.MATERIALIZED,
+        )
         for logical in self._logical():
             if logical.role in self._draft.resolved_events:
                 continue
@@ -285,11 +465,24 @@ class Gp01Materializer:
         return base
 
     async def resolve_alert(self, *, deadline: datetime, interval: float = 2.0) -> None:
-        """Resolve the real brute-force alert for this run (E1-B.3 §14)."""
+        """Resolve the real brute-force alert for this run (E1-B.3 §14).
+
+        Legal-from: EVENTS_RESOLVED. If the alert was already resolved (resume) the
+        state is simply re-asserted toward ALERT_RESOLVED."""
+        _require_state(
+            self._draft.state,
+            MaterializationState.EVENTS_RESOLVED,
+            MaterializationState.ALERT_RESOLVED,
+        )
         if self._draft.resolved_alert is not None:
+            self._set_state(MaterializationState.ALERT_RESOLVED)
             return
+        window_from = self._time_plan.events["F1"] - timedelta(minutes=1)
+        window_to = self._time_plan.events["W1"] + timedelta(minutes=1)
         resolved = await self._reader.wait_for_alert(
             attack_source_ip=self._identity.attack_source_ip,
+            from_=window_from,
+            to=window_to,
             deadline=deadline,
             interval=interval,
         )
@@ -298,7 +491,13 @@ class Gp01Materializer:
 
     def verify(self) -> VerifiedDataset:
         """Produce the immutable VerifiedDataset only when every invariant holds
-        (E1-B.3 §16). Raises DatasetInvariantViolation otherwise."""
+        (E1-B.3 §16). Legal-from: ALERT_RESOLVED. Raises
+        DatasetInvariantViolation otherwise."""
+        _require_state(
+            self._draft.state,
+            MaterializationState.ALERT_RESOLVED,
+            MaterializationState.VERIFIED,
+        )
         if self._draft.resolved_alert is None:
             raise DatasetInvariantViolation("cannot verify before the source alert is resolved")
         events = dict(self._draft.resolved_events)
@@ -307,6 +506,7 @@ class Gp01Materializer:
             raise DatasetInvariantViolation(f"cannot verify with unresolved events: {missing}")
         from .verifier import DatasetVerifier
 
+        materialized_at = _iso_now()
         dataset = DatasetVerifier(
             scenario=self._scenario,
             run=self._identity,
@@ -315,9 +515,13 @@ class Gp01Materializer:
         ).verify(
             resolved_events=events,
             source_alert=self._draft.resolved_alert,
-            materialized_at=_iso_now(),
+            materialized_at=materialized_at,
         )
+        # Record the frozen verification instant + state so a later resume can
+        # recover the VerifiedDataset without re-verifying (E1-B.4 §2).
+        self._draft.verified_at = dataset.materialized_at
         self._draft.state = MaterializationState.VERIFIED.value
+        self._draft.updated_at = _iso_now()
         return dataset
 
     # -- state helpers -----------------------------------------------------
@@ -327,6 +531,7 @@ class Gp01Materializer:
         self._draft.updated_at = _iso_now()
 
     def mark_materialized(self) -> None:
+        _require_state(self._draft.state, MaterializationState.VERIFIED)
         self._set_state(MaterializationState.MATERIALIZED)
 
 

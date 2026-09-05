@@ -107,6 +107,39 @@ def _rfc3339_utc(value: datetime | str) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _parse_ts_tolerant(value: str | None) -> datetime | None:
+    """Parse an RFC3339-ish ``created_at`` tolerantly; unparseable -> None.
+
+    A candidate whose creation time cannot be parsed is treated as OUTSIDE any
+    bounded time scope (never selected) so the reader stays safe (E1-B.3 §14).
+    """
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _alert_in_window(alert: FoundAlert, from_: datetime, to: datetime) -> bool:
+    """True only if the alert's ``created_at`` parses and lies within [from_, to].
+
+    An old same-source alert OUTSIDE the current-run materialization window is
+    never a candidate; an unparseable ``created_at`` is treated as out-of-scope.
+    """
+    created = _parse_ts_tolerant(alert.created_at)
+    if created is None:
+        return False
+    return from_ <= created <= to
+
+
+def _matches_run_alert(alert: FoundAlert, rule_id: str, attack_source_ip: str) -> bool:
+    """Rule + attack-entity match for a candidate source alert (E1-B.3 §14)."""
+    return alert.rule_id == rule_id and (
+        alert.entity == attack_source_ip or alert.source_ip == attack_source_ip
+    )
+
+
 # ---------------------------------------------------------------------------
 # Local bounded read models (defined here — never in contracts.py)
 # ---------------------------------------------------------------------------
@@ -460,15 +493,23 @@ class HisiemEvaluationReader:
         self,
         *,
         attack_source_ip: str,
+        from_: datetime,
+        to: datetime,
         deadline: datetime,
         interval: float = 2.0,
         stable_reads: int = 3,
     ) -> ResolvedAlert:
         """Bounded poll for a STABLE, unambiguous HISIEM alert (E1-B.3 §14, §15).
 
-        The list API is read and candidates filtered client-side by rule + attack
-        entity; a single candidate is re-read by its real ``_id``. Ambiguity is
-        NEVER resolved by newest/highest-risk/first.
+        Candidate selection is bounded to the CURRENT-RUN materialization window
+        ``[from_, to]``: an alert is a candidate only if its rule_id matches GP-01,
+        its entity/source is the attack source, AND its ``created_at`` falls inside
+        the window. An OLD same-source alert OUTSIDE the window is never selected.
+
+        After a single in-window candidate is found it is re-read by its real
+        ``_id`` (``get_alert``) and RE-VERIFIED against the same rule/entity/time
+        constraints — the list item is never trusted on its own. Ambiguity is NEVER
+        resolved by newest/highest-risk/first.
 
         Stability barrier (§15): the first visible alert may still be dedup-updating
         inside the detection pipeline, so the SAME candidate must present an
@@ -483,28 +524,41 @@ class HisiemEvaluationReader:
             candidates = [
                 a
                 for a in alerts
-                if a.rule_id == _GP01_RULE_ID
-                and (a.entity == attack_source_ip or a.source_ip == attack_source_ip)
+                if _matches_run_alert(a, _GP01_RULE_ID, attack_source_ip)
+                and _alert_in_window(a, from_, to)
             ]
             if len(candidates) > 1:
                 raise AmbiguousSourceAlertError(
-                    f"alert resolution found {len(candidates)} candidate alerts for "
-                    f"attack source {attack_source_ip}; expected exactly one"
+                    f"alert resolution found {len(candidates)} candidate alerts in "
+                    f"[{_rfc3339_utc(from_)}, {_rfc3339_utc(to)}] for attack source "
+                    f"{attack_source_ip}; expected exactly one"
                 )
+            selected: FoundAlert | None = None
             if len(candidates) == 1:
+                # Re-verify the in-window candidate against the SAME constraints
+                # before trusting it (E1-B.3 §14): read the alert detail by its real
+                # addressing ``_id`` and confirm rule/entity/time-scope AGAIN. The
+                # list item alone is never trusted — the authoritative detail read
+                # must pass, otherwise this round yields no candidate.
                 detail = await self.get_alert(candidates[0].address_id)
-                if detail is None:
-                    detail = candidates[0]
-                if not observed or detail.fingerprint == observed[-1].fingerprint:
+                if (
+                    detail is not None
+                    and detail.address_id == candidates[0].address_id
+                    and _matches_run_alert(detail, _GP01_RULE_ID, attack_source_ip)
+                    and _alert_in_window(detail, from_, to)
+                ):
+                    selected = detail
+            if selected is None:
+                consecutive = 0
+                observed = []
+            else:
+                if not observed or selected.fingerprint == observed[-1].fingerprint:
                     consecutive += 1
                 else:
                     consecutive = 1
-                observed.append(detail)
+                observed.append(selected)
                 if consecutive >= stable_reads:
-                    return _to_resolved_alert(detail)
-            else:
-                consecutive = 0
-                observed = []
+                    return _to_resolved_alert(selected)
             if _now() >= deadline:
                 if observed:
                     raise AlertNotStableError(

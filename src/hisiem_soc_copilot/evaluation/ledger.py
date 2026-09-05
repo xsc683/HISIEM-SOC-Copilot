@@ -143,6 +143,7 @@ def dump_draft(draft: MaterializationDraft) -> str:
         },
         "resolved_alert": _alert_to_dict(draft.resolved_alert) if draft.resolved_alert else None,
         "failure": draft.failure,
+        "verified_at": draft.verified_at,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -189,6 +190,7 @@ def load_draft_text(
         resolved_events=_events_from(data.get("resolved_events")),
         resolved_alert=_alert_from(alert_raw) if isinstance(alert_raw, dict) else None,
         failure=_opt_str(data.get("failure")),
+        verified_at=str(data.get("verified_at") or ""),
     )
 
 

@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from .contracts import (
     GP01_FAILURE_ROLES,
     GP01_RULE_ID,
+    GP01_RULE_THRESHOLD,
     GP01_SEMANTIC_ROLES,
     DatasetInvariantViolation,
     EventTimePlan,
@@ -72,12 +73,16 @@ class DatasetVerifier:
     ) -> VerifiedDataset:
         """Verify the resolved dataset; raise ``DatasetInvariantViolation`` on the
         first broken invariant, else return an immutable ``VerifiedDataset``."""
+        # Missing-first (no KeyError): assert every mandatory semantic role and the
+        # W1 control is present BEFORE indexing into the event map.
+        missing = [role for role in GP01_SEMANTIC_ROLES if role not in resolved_events]
+        if missing:
+            self._fail(f"missing resolved semantic events: {missing}")
+        if _GROUND_TRUTH_CONTROL_ROLE not in resolved_events:
+            self._fail(f"missing resolved watermark control event: {_GROUND_TRUTH_CONTROL_ROLE}")
         events: dict[str, ResolvedEvent] = {
             role: resolved_events[role] for role in GP01_SEMANTIC_ROLES
         }
-        missing = [role for role in GP01_SEMANTIC_ROLES if role not in events]
-        if missing:
-            self._fail(f"missing resolved semantic events: {missing}")
 
         self._check_failures([events[role] for role in GP01_FAILURE_ROLES])
         self._check_success(events["S1"], [events[r] for r in GP01_FAILURE_ROLES])
@@ -150,19 +155,26 @@ class DatasetVerifier:
             self._fail(
                 f"source alert entity {entity!r} != attack source {self._run.attack_source_ip!r}"
             )
+        # The alert must represent the committed failure threshold (E1-B.3 §16.2):
+        # at least GP01_RULE_THRESHOLD failures on one source.
+        if alert.event_count < GP01_RULE_THRESHOLD:
+            self._fail(
+                f"source alert event_count {alert.event_count} < required "
+                f"threshold {GP01_RULE_THRESHOLD}"
+            )
         # If HISIEM exposes related-event refs, cross-check them against the
-        # resolved semantic failure documents (E1-B.3 §16.2).
+        # resolved FAILURE documents ONLY (E1-B.3 §16.2). S1 alone can never prove
+        # the brute-force alert, so only F1..F5 overlap is meaningful.
         if alert.related_event_refs:
-            resolved_ids = {
-                f"{events[r].index}:{events[r].document_id}"
-                for r in GP01_SEMANTIC_ROLES
-                if events[r]
+            failure_refs = {
+                f"{events[r].index}:{events[r].document_id}" for r in GP01_FAILURE_ROLES
             }
             related = {f"{r.index}:{r.document_id}" for r in alert.related_event_refs}
-            if not related.intersection(resolved_ids):
+            if not related.intersection(failure_refs):
                 self._fail(
-                    "source alert related-event refs do not overlap any resolved GP-01 "
-                    "semantic event document"
+                    "source alert related-event refs do not overlap any resolved "
+                    "GP-01 failure (F1..F5) document; an S1-only overlap cannot "
+                    "prove the brute-force alert"
                 )
 
 

@@ -58,6 +58,14 @@ GP01_EVENT_ORDER: tuple[str, ...] = ("F1", "F2", "F3", "F4", "F5", "S1", "W1")
 GP01_SEMANTIC_ROLES: tuple[str, ...] = ("F1", "F2", "F3", "F4", "F5", "S1")
 GP01_FAILURE_ROLES: tuple[str, ...] = ("F1", "F2", "F3", "F4", "F5")
 
+# The GP-01 evidence contract (E1-B.4 §12, correctness round): the SOURCE ALERT
+# authoritatively proves the brute-force threshold (>= 5 failures on one source),
+# so the Agent must DISCOVER the subsequent S1 success — NOT re-retrieve F1..F5.
+# F1..F5 remain GROUND_TRUTH dataset events, but only S1 is a required
+# agent-discovered evidence role. This must NOT be treated as "which events belong
+# to the dataset".
+GP01_REQUIRED_EVIDENCE_ROLES: tuple[str, ...] = ("S1",)
+
 
 @dataclass(frozen=True)
 class ScenarioSpec:
@@ -89,7 +97,11 @@ class ScenarioSpec:
             "and host and occurs after the failure sequence",
         ),
     )
-    required_evidence_roles: tuple[str, ...] = GP01_SEMANTIC_ROLES
+    # Evidence roles the AGENT must independently discover (E1-B.4 §12). The source
+    # alert proves the failure threshold, so this is the S1 success only — NOT the
+    # full semantic ground-truth set (F1..F5 stay GROUND_TRUTH dataset events but
+    # are not "must re-retrieve" provider events).
+    required_evidence_roles: tuple[str, ...] = GP01_REQUIRED_EVIDENCE_ROLES
 
 
 @dataclass(frozen=True)
@@ -309,6 +321,12 @@ class MaterializationDraft:
     resolved_events: dict[str, ResolvedEvent] = field(default_factory=dict)
     resolved_alert: ResolvedAlert | None = None
     failure: str | None = None  # typed error code + bounded context
+    # Frozen instant the DatasetVerifier produced a VerifiedDataset (RFC3339 UTC).
+    # Distinct from ``updated_at`` (later ledger checkpoints change that); the
+    # sealed ``VerifiedDataset.materialized_at`` is recovered from THIS value, never
+    # regenerated at seal time. Lives only in the mutable ledger — no sealed
+    # manifest schema change.
+    verified_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -415,6 +433,17 @@ class EvaluationError(Exception):
 
 class PreflightError(EvaluationError):
     code = "PREFLIGHT_ERROR"
+
+
+class InvalidMaterializationTransition(EvaluationError):
+    """A state-machine call is illegal for the current MaterializationState.
+
+    The state machine is a real transition gate (not merely a record): calling
+    e.g. ``inject_events()`` from NEW, or ``resolve_events()`` before the events
+    are injected, is a typed failure — never a bare ``RuntimeError``.
+    """
+
+    code = "INVALID_MATERIALIZATION_TRANSITION"
 
 
 class RuleContractMismatch(PreflightError):
@@ -571,6 +600,7 @@ __all__ = [
     "SealedManifest",
     "EvaluationError",
     "PreflightError",
+    "InvalidMaterializationTransition",
     "RuleContractMismatch",
     "RunIdentityCollision",
     "EventInjectionError",
@@ -592,6 +622,7 @@ __all__ = [
     "GP01_EVENT_ORDER",
     "GP01_SEMANTIC_ROLES",
     "GP01_FAILURE_ROLES",
+    "GP01_REQUIRED_EVIDENCE_ROLES",
     "EVENT_PLAN_CROSSES_YEAR_BOUNDARY",
     "CANONICALIZATION_ID",
     "MANIFEST_SCHEMA_VERSION",

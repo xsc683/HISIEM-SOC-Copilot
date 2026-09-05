@@ -21,6 +21,7 @@ import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -80,7 +81,10 @@ async def test_live_gp01_materialize_resolve_verify_seal(hisiem_reachable: bool)
     ev = settings.evaluation
     hisiem = settings.hisiem
 
-    run_id = f"live-gp01-{os.getpid()}"
+    # Strong-unique run_id (uuid4 hex, not PID): a PID-reuse mapping onto the same
+    # deterministic attack source IP would collide with a prior run's suppression
+    # state / preflight collision check (E1-B.3 §10.4).
+    run_id = uuid4().hex
     scenario = load_scenario()
     identity = derive_run_identity(run_id)
     now = datetime.now(UTC)
