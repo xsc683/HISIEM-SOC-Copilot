@@ -9,15 +9,16 @@ LLM/network transaction.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ....application.ports.durable import (
+    CommandReceiptRecord,
     CommandReceiptStore,
     DomainEventEnvelope,
     DurableCommand,
@@ -113,27 +114,56 @@ class SqlAlchemyCommandReceiptStore(CommandReceiptStore):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def exists(self, *, idempotency_key: str) -> bool:
+    async def exists(
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
+    ) -> bool:
         result = await self._session.execute(
-            select(CommandReceiptRow.idempotency_key).where(
-                CommandReceiptRow.idempotency_key == idempotency_key
+            select(CommandReceiptRow.id).where(
+                CommandReceiptRow.tenant_id == tenant_id,
+                CommandReceiptRow.command_type == command_type,
+                CommandReceiptRow.idempotency_key == idempotency_key,
             )
         )
         return result.scalar_one_or_none() is not None
 
     async def get_safe_result(
-        self, *, idempotency_key: str
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
     ) -> dict[str, Any] | None:
         result = await self._session.execute(
             select(CommandReceiptRow.safe_result).where(
-                CommandReceiptRow.idempotency_key == idempotency_key
+                CommandReceiptRow.tenant_id == tenant_id,
+                CommandReceiptRow.command_type == command_type,
+                CommandReceiptRow.idempotency_key == idempotency_key,
             )
         )
         return result.scalar_one_or_none()
 
+    async def find(
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
+    ) -> CommandReceiptRecord | None:
+        result = await self._session.execute(
+            select(CommandReceiptRow).where(
+                CommandReceiptRow.tenant_id == tenant_id,
+                CommandReceiptRow.command_type == command_type,
+                CommandReceiptRow.idempotency_key == idempotency_key,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return CommandReceiptRecord(
+            idempotency_key=row.idempotency_key,
+            command_type=row.command_type,
+            tenant_id=row.tenant_id,
+            aggregate_id=row.aggregate_id,
+            request_fingerprint=row.request_fingerprint,
+            safe_result=dict(row.safe_result) if row.safe_result else None,
+        )
+
     async def record(self, receipt: DurableCommand) -> None:
         self._session.add(
             CommandReceiptRow(
+                id=uuid4(),
                 idempotency_key=receipt.idempotency_key,
                 command_id=receipt.command_id,
                 command_type=receipt.command_type,
@@ -143,6 +173,7 @@ class SqlAlchemyCommandReceiptStore(CommandReceiptStore):
                 result_ref_type=None,
                 result_ref_id=None,
                 safe_result=receipt.safe_result,
+                request_fingerprint=receipt.request_fingerprint,
                 completed_at=datetime.now(UTC),
             )
         )
@@ -318,15 +349,47 @@ class SqlAlchemyOutboxStore(OutboxStore):
         self._factory = session_factory
 
     async def claim_batch(
-        self, *, worker: str, limit: int, available_before: datetime
+        self,
+        *,
+        worker: str,
+        limit: int,
+        available_before: datetime,
+        lease_timeout_seconds: int = 60,
     ) -> list[OutboxRecord]:
+        """Atomically claim up to ``limit`` ready messages for one worker.
+
+        Claimable states:
+        - PENDING with ``available_at`` due;
+        - FAILED with ``available_at`` due (retry backoff elapsed);
+        - PROCESSING whose lease has EXPIRED (``locked_at <= available_before -
+          lease``) — a worker that crashed after claiming no longer holds it.
+
+        Every claim writes a FRESH ``lease_token`` (fencing token). The claim UPDATE
+        is conditional on the row still being in a claimable state and, for an
+        expired PROCESSING lease, on ``locked_at``/``locked_by`` still being the
+        stale values observed — so two workers reclaiming at once converge to one
+        holder. Settlements must later present this token.
+        """
         async with self._factory() as session:
             rows = await session.execute(
                 select(OutboxMessageRow)
                 .where(
-                    OutboxMessageRow.status.in_(["PENDING", "FAILED"]),
-                    OutboxMessageRow.available_at <= available_before,
-                    OutboxMessageRow.attempt_count < 10,
+                    or_(
+                        and_(
+                            OutboxMessageRow.status == "PENDING",
+                            OutboxMessageRow.available_at <= available_before,
+                        ),
+                        and_(
+                            OutboxMessageRow.status == "FAILED",
+                            OutboxMessageRow.available_at <= available_before,
+                        ),
+                        and_(
+                            OutboxMessageRow.status == "PROCESSING",
+                            OutboxMessageRow.locked_at
+                            <= available_before
+                            - timedelta(seconds=lease_timeout_seconds),
+                        ),
+                    )
                 )
                 .order_by(OutboxMessageRow.created_at)
                 .limit(limit)
@@ -334,24 +397,36 @@ class SqlAlchemyOutboxStore(OutboxStore):
             claimed: list[OutboxRecord] = []
             for row in rows.scalars().all():
                 now = datetime.now(UTC)
+                claimable = and_(
+                    OutboxMessageRow.id == row.id,
+                    OutboxMessageRow.status.in_(["PENDING", "FAILED"]),
+                )
+                if row.status == "PROCESSING":
+                    # Reclaim an expired lease only if it is STILL the same stale
+                    # lease (locked_by/locked_at unchanged) — never steal a live one.
+                    claimable = and_(
+                        OutboxMessageRow.id == row.id,
+                        OutboxMessageRow.status == "PROCESSING",
+                        OutboxMessageRow.locked_at == row.locked_at,
+                        OutboxMessageRow.locked_by == row.locked_by,
+                    )
+                token = uuid4().hex
                 updated = cast(
                     "CursorResult[object]",
                     await session.execute(
                         update(OutboxMessageRow)
-                        .where(
-                            OutboxMessageRow.id == row.id,
-                            OutboxMessageRow.status.in_(["PENDING", "FAILED"]),
-                        )
+                        .where(claimable)
                         .values(
                             status="PROCESSING",
                             locked_at=now,
                             locked_by=worker,
+                            lease_token=token,
                             attempt_count=row.attempt_count + 1,
                         )
                     ),
                 )
                 if updated.rowcount == 0:
-                    continue  # another worker claimed it first
+                    continue  # another worker claimed/reclaimed it first
                 claimed.append(
                     OutboxRecord(
                         id=row.id,
@@ -360,6 +435,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
                         status="PROCESSING",
                         attempt_count=row.attempt_count + 1,
                         available_at=row.available_at,
+                        lease_token=token,
                         locked_at=now,
                         locked_by=worker,
                     )
@@ -367,8 +443,46 @@ class SqlAlchemyOutboxStore(OutboxStore):
             await session.commit()
             return claimed
 
+    async def renew_lease(
+        self,
+        *,
+        outbox_id: UUID,
+        lease_token: str,
+        lease_timeout_seconds: int,
+        now: datetime,
+    ) -> bool:
+        """Renew a PROCESSING lease — only while the caller still owns it.
+
+        The UPDATE is conditioned on ``id + status=PROCESSING + lease_token``. A
+        worker whose lease was reclaimed writes a STALE token → 0 rows → False, so
+        a lost lease can never be silently extended (which would starve the real
+        owner). ``locked_at`` is set to ``now`` — the timestamp of this successful
+        renewal — so the expiry check ``locked_at <= now - lease_timeout`` measures
+        the time since the last successful claim OR renewal (never written into the
+        future). ``locked_by`` is left untouched.
+
+        ``lease_timeout_seconds`` is accepted only so the call site stays symmetric
+        with the claim; expiry is always computed from ``locked_at`` against the
+        store's own clock at claim time.
+        """
+        async with self._factory() as session:
+            result = cast(
+                "CursorResult[object]",
+                await session.execute(
+                    update(OutboxMessageRow)
+                    .where(
+                        OutboxMessageRow.id == outbox_id,
+                        OutboxMessageRow.status == "PROCESSING",
+                        OutboxMessageRow.lease_token == lease_token,
+                    )
+                    .values(locked_at=now)
+                ),
+            )
+            await session.commit()
+            return result.rowcount > 0
+
     async def mark_published(
-        self, *, outbox_id: UUID, published_at: datetime
+        self, *, outbox_id: UUID, lease_token: str, published_at: datetime
     ) -> bool:
         async with self._factory() as session:
             result = cast(
@@ -378,12 +492,14 @@ class SqlAlchemyOutboxStore(OutboxStore):
                     .where(
                         OutboxMessageRow.id == outbox_id,
                         OutboxMessageRow.status == "PROCESSING",
+                        OutboxMessageRow.lease_token == lease_token,
                     )
                     .values(
                         status="PUBLISHED",
                         published_at=published_at,
                         locked_at=None,
                         locked_by=None,
+                        lease_token=None,
                         last_error_code=None,
                     )
                 ),
@@ -392,8 +508,20 @@ class SqlAlchemyOutboxStore(OutboxStore):
             return result.rowcount > 0
 
     async def mark_failed(
-        self, *, outbox_id: UUID, error_code: str, next_available_at: datetime
+        self,
+        *,
+        outbox_id: UUID,
+        lease_token: str,
+        error_code: str,
+        next_available_at: datetime,
+        attempt_count: int,
     ) -> bool:
+        """Move a PROCESSING message to retryable FAILED with backoff.
+
+        Only ever re-claimed when its ``available_at`` becomes due again; a live
+        (non-expired) PROCESSING lease is never touched. The settlement is fenced
+        by ``lease_token``: a stale worker's attempt matches 0 rows.
+        """
         async with self._factory() as session:
             result = cast(
                 "CursorResult[object]",
@@ -402,12 +530,14 @@ class SqlAlchemyOutboxStore(OutboxStore):
                     .where(
                         OutboxMessageRow.id == outbox_id,
                         OutboxMessageRow.status == "PROCESSING",
+                        OutboxMessageRow.lease_token == lease_token,
                     )
                     .values(
                         status="FAILED",
                         available_at=next_available_at,
                         locked_at=None,
                         locked_by=None,
+                        lease_token=None,
                         last_error_code=error_code,
                     )
                 ),
@@ -415,9 +545,10 @@ class SqlAlchemyOutboxStore(OutboxStore):
             await session.commit()
             return result.rowcount > 0
 
-    async def settle_dead_letter(
-        self, *, outbox_id: UUID, error_code: str
+    async def mark_dead_letter(
+        self, *, outbox_id: UUID, lease_token: str, error_code: str
     ) -> bool:
+        """Terminal permanent-failure state — a dead letter is never re-claimed."""
         async with self._factory() as session:
             result = cast(
                 "CursorResult[object]",
@@ -426,13 +557,14 @@ class SqlAlchemyOutboxStore(OutboxStore):
                     .where(
                         OutboxMessageRow.id == outbox_id,
                         OutboxMessageRow.status == "PROCESSING",
+                        OutboxMessageRow.lease_token == lease_token,
                     )
                     .values(
-                        status="FAILED",
+                        status="DEAD_LETTER",
                         locked_at=None,
                         locked_by=None,
+                        lease_token=None,
                         last_error_code=error_code,
-                        available_at=datetime.now(UTC),
                     )
                 ),
             )

@@ -43,11 +43,27 @@ class OrchestrationBindingRow(CopilotBase):
 
 
 class CommandReceiptRow(CopilotBase):
-    """Command idempotency record."""
+    """Command idempotency record.
+
+    The receipt's logical identity is ``(tenant_id, command_type, idempotency_key)``
+    — an Idempotency-Key is scoped to a Tenant + Command Type, never a global key
+    (persistence-schema.md §25). ``id`` is a surrogate technical primary key;
+    ``command_id`` is additionally unique (one receipt per command); the scoped
+    unique constraint enforces the idempotency space.
+    """
 
     __tablename__ = "command_receipt"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "command_type",
+            "idempotency_key",
+            name="uq_command_receipt_tenant_command_key",
+        ),
+    )
 
-    idempotency_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(Text, nullable=False)
     command_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
     command_type: Mapped[str] = mapped_column(Text, nullable=False)
     tenant_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -56,6 +72,10 @@ class CommandReceiptRow(CopilotBase):
     result_ref_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_ref_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     safe_result: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    # Bounded fingerprint of the business request (e.g. the source_alert_ref) so a
+    # replayed Idempotency-Key bound to a DIFFERENT request can be rejected rather
+    # than silently returning the original (wrong) logical result.
+    request_fingerprint: Mapped[str | None] = mapped_column(Text, nullable=True)
     completed_at: Mapped[datetime] = mapped_column(nullable=False)
 
 
@@ -102,10 +122,19 @@ class OutboxMessageRow(CopilotBase):
             "ix_outbox_ready",
             "status",
             "available_at",
+            # PENDING (never claimed) + FAILED (retry backoff) + PROCESSING with an
+            # expired lease (locked_at <= now - lease) are the claimable states.
+            # DEAD_LETTER and a live PROCESSING lease are deliberately excluded.
             postgresql_where=("status IN ('PENDING','FAILED')"),
         ),
+        Index(
+            "ix_outbox_lease_reclaim",
+            "status",
+            "locked_at",
+            postgresql_where="status = 'PROCESSING'",
+        ),
         CheckConstraint(
-            "status IN ('PENDING','PROCESSING','PUBLISHED','FAILED')",
+            "status IN ('PENDING','PROCESSING','PUBLISHED','FAILED','DEAD_LETTER')",
             name="outbox_message_status_valid",
         ),
     )
@@ -118,6 +147,10 @@ class OutboxMessageRow(CopilotBase):
     available_at: Mapped[datetime] = mapped_column(nullable=False)
     locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
     locked_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Fencing token: claim writes a fresh token; every settlement (published /
+    # failed / dead-letter) and every lease renewal must present the SAME token,
+    # so a worker whose lease was lost to a reclaim can never settle the row.
+    lease_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)

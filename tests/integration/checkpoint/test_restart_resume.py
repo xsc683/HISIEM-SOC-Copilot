@@ -36,6 +36,7 @@ from hisiem_soc_copilot.infrastructure.durable.investigation_runner import (
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from hisiem_soc_copilot.infrastructure.persistence.unit_of_work import SqlAlchemyUnitOfWork
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.fixtures.ssh_models import GroundedSshModel
 
 _TRUNCATE = (
     "tool_invocation",
@@ -114,13 +115,17 @@ async def pg_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     await engine.dispose()
 
 
-class _CrashOnceOnVerdict(ScriptedModelProvider):
-    """Scripted model that raises on the FIRST ``verdict`` call (mid-run crash).
+class _CrashOnceOnVerdict(GroundedSshModel):
+    """Grounded model that raises on the FIRST ``verdict`` call (mid-run crash).
 
-    The verdict is consulted by ``finalize_result`` — AFTER the evidence + findings
-    nodes have committed their rows but BEFORE ``finalize_result``/``complete``
-    checkpoint. Raising here simulates a process death whose already-committed
-    work has no checkpoint yet: the resume must not duplicate that work.
+    Extends GroundedSshModel so run 1's ``assess`` grounds its Finding on the real
+    evidence ids (strict grounding, Fix #2) exactly as run 2's healthy model does —
+    otherwise run 1 would commit no Finding and the no-duplicate comparison below
+    would be meaningless (0 pre vs 1 post). The verdict is consulted by
+    ``finalize_result`` — AFTER the evidence + findings nodes have committed their
+    rows but BEFORE ``finalize_result``/``complete`` checkpoint. Raising here
+    simulates a process death whose already-committed work has no checkpoint yet:
+    the resume must not duplicate that work.
     """
 
     def __init__(self, *, script: dict[str, object]) -> None:
@@ -196,7 +201,7 @@ def _ssh_script() -> dict[str, object]:
 
 
 def _scripted_ssh_model() -> ScriptedModelProvider:
-    return ScriptedModelProvider(script=dict(_ssh_script()))
+    return GroundedSshModel(script=dict(_ssh_script()))
 
 
 async def test_postgres_checkpoint_restart_resume_no_duplicates(
@@ -254,6 +259,9 @@ async def test_postgres_checkpoint_restart_resume_no_duplicates(
     assert pre_binding is not None
     assert pre_status is not None and pre_status.status.value != "COMPLETED"
     assert len(pre_evidence) >= 1  # evidence committed before the crash
+    # Run 1's assess already grounded + committed its Finding before the verdict
+    # crash (strict grounding), so the resume's no-duplicate check is meaningful.
+    assert len(pre_findings) == 1
 
     # Run 2 (fresh process): a healthy model resumes the SAME thread from the
     # AsyncPostgresSaver checkpoint and reaches COMPLETED.

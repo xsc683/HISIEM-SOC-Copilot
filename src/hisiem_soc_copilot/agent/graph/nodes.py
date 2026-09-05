@@ -26,6 +26,7 @@ evidence.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from uuid import UUID
 
@@ -47,8 +48,19 @@ from ...application.commands.investigation import (
     ReviseInvestigationPlan,
     UncertaintyCandidate,
 )
-from ...application.ports.model_provider import AssessRequest, DecideNextRequest, PlanRequest
-from ...contracts.llm.types import NextStep
+from ...application.ports.model_provider import (
+    AssessRequest,
+    DecideNextRequest,
+    PlanRequest,
+    PreviousToolOutcome,
+)
+from ...contracts.llm.types import (
+    FindingCandidate as ModelFindingCandidate,
+)
+from ...contracts.llm.types import (
+    HypothesisAssessmentCandidate as ModelAssessmentCandidate,
+)
+from ...contracts.llm.types import NextStep, PlanStep
 from ...contracts.tools.types import ToolCandidate
 from ...domain.investigation.content import compute_content_hash
 from ...domain.investigation.entities import Evidence
@@ -58,6 +70,7 @@ from ...domain.investigation.enums import (
     VerdictDisposition,
 )
 from ..tools.executor import ToolExecution
+from .budget import RuntimeBudget
 from .runtime import GraphRuntime
 from .state import InvestigationGraphState
 from .tool_audit import record_finished, record_started
@@ -89,14 +102,92 @@ def _inv_key(inv_id: UUID, suffix: str) -> str:
     return f"investigation:{inv_id}:{suffix}"
 
 
+def _deadline_passed(state: InvestigationGraphState) -> bool:
+    """True when the runtime wall-clock deadline (epoch-seconds) has passed."""
+    return RuntimeBudget.from_state(state).deadline_exceeded
+
+
+# Upper bound on consecutive re-plans of the SAME failing tool call (same request
+# fingerprint) before the graph stops re-planning and converges to a bounded
+# finalize. Independent of the step/tool budget, so a degenerate model cannot spin
+# forever proposing one unavailable call (Fix #5 repeated-attempt guard).
+_MAX_SAME_FAILING_CALL_RETRIES = 2
+
+
+def _outcome_for(
+    tool_name: str,
+    status: str,
+    error_code: str | None,
+    *,
+    retryable: bool = False,
+) -> dict[str, object]:
+    """Bounded outcome for the graph state (only the tool's stable identity)."""
+    return {
+        "tool_name": tool_name,
+        "status": status,
+        "error_code": error_code,
+        "retryable": retryable,
+    }
+
+
+def _previous_outcome_of(state: InvestigationGraphState) -> PreviousToolOutcome | None:
+    """Reconstruct the bounded PreviousToolOutcome handed to the model on re-plan."""
+    raw = state.get("previous_tool_outcome")
+    if not raw:
+        return None
+    return PreviousToolOutcome(
+        tool_name=str(raw.get("tool_name", "")),
+        status=str(raw.get("status", "")),
+        error_code=str(raw["error_code"]) if raw.get("error_code") else None,
+        retryable=bool(raw.get("retryable", False)),
+    )
+
+
+def _repeat_budget_for(
+    state: InvestigationGraphState, fingerprint: str
+) -> tuple[int, str | None]:
+    """Return (retries_used, current_fingerprint) for the same failing call.
+
+    ``same_call_retries`` counts consecutive re-plans of ONE exact request
+    fingerprint; proposing a different request resets the counter to zero.
+    """
+    current = state.get("failing_call_fingerprint")
+    used = int(state.get("same_call_retries") or 0)
+    if current != fingerprint:
+        return 0, None
+    return used, current
+
+
+def _exceeded_repeat_budget(used_retries: int) -> bool:
+    return used_retries >= _MAX_SAME_FAILING_CALL_RETRIES
+
+
+def _invocation_uuid(inv_id: UUID, audit_key: str) -> UUID:
+    """Deterministic UUID for one logical tool invocation (stable across replay).
+
+    Namespaced under the investigation id + audit key so the same tool call on the
+    same candidate always maps to the same invocation identity.
+    """
+    import hashlib
+
+    digest = hashlib.sha256(f"{inv_id}:{audit_key}".encode()).hexdigest()
+    return UUID(digest[:32])
+
+
 async def load_investigation(
     runtime: GraphRuntime, state: InvestigationGraphState
 ) -> dict[str, Any]:
-    """Bind the aggregate by id; confirm RUNNING; seed the step budget.
+    """Bind the aggregate by id; confirm RUNNING; seed runtime budget on a FRESH run.
 
     The graph input is ONLY investigation_id. Tenant is bound by the trusted
     orchestrator scope on the runtime (runtime.tenant_id) and used to scope every
     repository read — never supplied by the model or an ordinary client.
+
+    Runtime budget (steps/tool-calls/LLM-calls/deadline) is checkpointed with the
+    graph state. On a fresh run the aggregate's limits seed full remaining counters;
+    on a crash/restart/resume the previously checkpointed remaining counters are
+    kept — a resumed run never gets its budget reset to full. The budget is runtime
+    authority: the model cannot raise it and no node may write it upward.
     """
     from ...domain.investigation.enums import InvestigationStatus
 
@@ -109,22 +200,41 @@ async def load_investigation(
         await uow.close()
     if investigation is None:
         raise RuntimeError(f"investigation {_inv_id(state)} not found")
+    limits = investigation.budget_limits
+    now = time.time()
+    base: dict[str, Any] = {
+        "investigation_id": str(investigation.id),
+        "investigation_revision": investigation.revision,
+        "iteration": 0,
+        "budget_deadline_at": now + limits.max_duration_seconds,
+    }
     if investigation.status != InvestigationStatus.RUNNING:
         # Reconciliation (application-commands...md §27): a terminal investigation
         # (COMPLETED/FAILED/CANCELLED) is not re-run — the graph stops with a
         # no-op, so a retried/resumed run never duplicates rows.
         return {
-            "investigation_id": str(investigation.id),
-            "investigation_revision": investigation.revision,
-            "iteration": 0,
+            **base,
             "budget_remaining_steps": 0,
+            "budget_remaining_tool_calls": 0,
+            "budget_remaining_llm_calls": 0,
             "stop_reason": f"ALREADY_{investigation.status.value}",
         }
+    # A resumed run has its counters checkpointed in state already; only a FRESH
+    # run (no counters present) seeds them from the aggregate's limits.
+    steps = int(state.get("budget_remaining_steps", limits.max_steps))
+    tool_calls = int(state.get("budget_remaining_tool_calls", limits.max_tool_calls))
+    llm_calls = int(state.get("budget_remaining_llm_calls", limits.max_llm_calls))
+    # A resumed run also keeps its original deadline (derived at first load), so a
+    # crash/restart can never extend the wall-clock budget.
+    deadline = state.get("budget_deadline_at")
+    if not isinstance(deadline, (int, float)):
+        deadline = float(base["budget_deadline_at"])
     return {
-        "investigation_id": str(investigation.id),
-        "investigation_revision": investigation.revision,
-        "iteration": 0,
-        "budget_remaining_steps": investigation.budget_limits.max_steps,
+        **base,
+        "budget_remaining_steps": steps,
+        "budget_remaining_tool_calls": tool_calls,
+        "budget_remaining_llm_calls": llm_calls,
+        "budget_deadline_at": deadline,
         "next_action": None,
         "assessment": None,
         "alert_context": {},
@@ -184,7 +294,10 @@ async def hydrate_alert(
 
 
 async def plan(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[str, Any]:
-    """Change phase to PLANNING; produce a plan revision + an OPEN hypothesis."""
+    """Change phase to PLANNING; produce a plan revision + an OPEN hypothesis.
+
+    The plan consult is one model call against the runtime LLM-call budget.
+    """
     inv_id = _inv_id(state)
     handler = runtime.workflow_handler
     await handler.change_phase(
@@ -195,22 +308,39 @@ async def plan(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[st
             phase=InvestigationPhase.PLANNING,
         )
     )
+    budget = RuntimeBudget.from_state(state)
     alert: dict[str, Any] = dict(state.get("alert_context") or {})
-    model_plan = await runtime.model.plan(
-        PlanRequest(
-            investigation_id=_inv_str(state),
-            alert_summary=(
-                f"{alert.get('title') or 'alert'} "
-                f"(severity={alert.get('severity') or '?'}, "
-                f"rule={alert.get('rule_name') or '?'}, "
-                f"source_ip={alert.get('source_ip') or '?'})"
-            ),
-            tool_names=runtime.registry.model_selectable_names,
+    # The plan consult consumes one LLM-call slot through the single budget
+    # authority. When no slot remains (a degraded replay), a system default plan is
+    # substituted deterministically — never an over-budget model call.
+    if budget.can_call_llm():
+        budget = budget.consume_llm_call()
+        model_plan = await runtime.model.plan(
+            PlanRequest(
+                investigation_id=_inv_str(state),
+                alert_summary=(
+                    f"{alert.get('title') or 'alert'} "
+                    f"(severity={alert.get('severity') or '?'}, "
+                    f"rule={alert.get('rule_name') or '?'}, "
+                    f"source_ip={alert.get('source_ip') or '?'})"
+                ),
+                tool_names=runtime.registry.model_selectable_names,
+            )
         )
-    )
+        plan_steps = model_plan.steps
+        plan_goal = model_plan.goal
+    else:
+        # Deterministic no-budget plan fallback: read the detection rule then run one
+        # bounded event search (a safe, useful system default; the model is not
+        # consulted).
+        plan_steps = [
+            PlanStep(step_id="read_rule", objective=_DEFAULT_PLAN_STEP_RULE),
+            PlanStep(step_id="search_success", objective=_DEFAULT_PLAN_STEP_SEARCH),
+        ]
+        plan_goal = _DEFAULT_PLAN_GOAL
     steps = [
         PlanStepCandidate(step_key=s.step_id, objective=s.objective, ordinal=i)
-        for i, s in enumerate(model_plan.steps)
+        for i, s in enumerate(plan_steps)
     ]
     _, plan_revision = await handler.revise_plan(
         ReviseInvestigationPlan(
@@ -218,7 +348,7 @@ async def plan(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[st
             investigation_id=inv_id,
             idempotency_key=_inv_key(inv_id, "plan:1"),
             revision=1,
-            goal=model_plan.goal,
+            goal=plan_goal,
             steps=steps,
         )
     )
@@ -233,7 +363,17 @@ async def plan(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[st
     return {
         "plan_revision_id": str(plan_revision.id),
         "iteration": 0,
+        **budget.to_updates(),
     }
+
+
+_DEFAULT_PLAN_GOAL = (
+    "Determine whether the SSH brute force escalated into a compromise"
+)
+_DEFAULT_PLAN_STEP_RULE = "Read the detection rule that fired on this alert"
+_DEFAULT_PLAN_STEP_SEARCH = (
+    "Search for a successful authentication after the failures"
+)
 
 
 def _default_hypothesis(alert: dict[str, Any]) -> str:
@@ -250,11 +390,24 @@ async def decide_next(
 ) -> dict[str, Any]:
     """Ask the model what to read next (candidate only); gate CONTINUE on budget.
 
-    Each CONTINUE decision consumes one budget step. When the model says FINALIZE
-    (or the budget is spent), route to the convergence ``assess`` node.
+    Each CONTINUE decision consumes one step and one tool call from the runtime
+    budget; each consult of the model consumes one LLM call. When the model says
+    FINALIZE (or step/tool-call budget is spent / the wall-clock deadline passed),
+    route to the convergence ``assess`` node. Exhaustion/deadline yield a bounded
+    finalize → COMPLETED + INCONCLUSIVE, never FAILED.
     """
-    budget = int(state.get("budget_remaining_steps") or 0)
+    budget = RuntimeBudget.from_state(state)
+    # The convergence path reserves the final two LLM-call slots (assess + verdict).
+    # decide_next stops consulting once only that reserve remains, so the total model
+    # consults can never exceed max_llm_calls — even against a model that always
+    # answers CONTINUE. A deadline that has already passed also stops the consult.
+    if not budget.can_consult_decide():
+        # No LLM-call budget (or wall-clock deadline) left → bounded finalize.
+        return {"next_action": CONVERGE, "assessment": "FINALIZE"}
+    # Consume one LLM call for this model consult through the single authority.
+    budget = budget.consume_llm_call()
     evidence_ids = state.get("new_evidence_ids") or []
+    outcome = _previous_outcome_of(state)
     next_step: NextStep = await runtime.model.decide_next(
         DecideNextRequest(
             investigation_id=_inv_str(state),
@@ -262,24 +415,59 @@ async def decide_next(
             plan_goal="Investigate whether the alert indicates an account compromise",
             evidence_summary=evidence_ids,
             tool_names=runtime.registry.model_selectable_names,
+            previous_tool_outcome=outcome,
         )
     )
-    if next_step.decision == "CONTINUE" and next_step.tool_name and budget > 0:
+    if (
+        next_step.decision == "CONTINUE"
+        and next_step.tool_name
+        and budget.can_take_step()
+        and budget.can_execute_tool()
+    ):
         arguments = dict(next_step.arguments or {})
+        call_fingerprint = compute_content_hash(
+            {"tool": next_step.tool_name, "arguments": arguments}
+        )
+        # Bounded repeated-attempt guard (Fix #5): when the previous tool call failed
+        # (transient/retryable) and the model proposes the EXACT SAME failing request
+        # (identical fingerprint), cap the consecutive replays. ``same_call_retries``
+        # is incremented by execute_and_ingest on each failure round, so the graph
+        # stops re-planning after a bounded number of attempts — independently of the
+        # step/tool budget — and converges to a bounded finalize (never FAILED).
+        used_retries, _current = _repeat_budget_for(state, call_fingerprint)
+        if (
+            outcome is not None
+            and outcome.retryable
+            and _exceeded_repeat_budget(used_retries)
+        ):
+            return {
+                "next_action": CONVERGE,
+                "assessment": "FINALIZE",
+                **budget.to_updates(),
+                "previous_tool_outcome": None,
+                "last_tool_error": (
+                    "the model repeatedly proposed the same failing tool call; "
+                    "investigation stopped"
+                ),
+            }
+        budget = budget.consume_step().consume_tool_call()
         tool_call_key = f"iteration-{state.get('iteration') or 0}"
         return {
             "next_action": EXECUTE_TOOL,
-            "budget_remaining_steps": budget - 1,
+            **budget.to_updates(),
             "pending_tool_request": {
                 "tool": next_step.tool_name,
                 "arguments": arguments,
                 "step_key": tool_call_key,
-                "call_fingerprint": compute_content_hash(
-                    {"tool": next_step.tool_name, "arguments": arguments}
-                ),
+                "call_fingerprint": call_fingerprint,
             },
+            "previous_tool_outcome": None,
         }
-    return {"next_action": CONVERGE, "assessment": "FINALIZE"}
+    return {
+        "next_action": CONVERGE,
+        "assessment": "FINALIZE",
+        **budget.to_updates(),
+    }
 
 
 async def execute_and_ingest(
@@ -300,14 +488,34 @@ async def execute_and_ingest(
     """
     pending = state.get("pending_tool_request")
     if not pending:
-        return {"next_action": CONVERGE, "last_tool_error": "no pending tool request"}
+        return {
+            "next_action": CONVERGE,
+            "last_tool_error": "no pending tool request",
+            "previous_tool_outcome": None,
+        }
     inv_id = _inv_id(state)
     tool_name = str(pending["tool"])
     arguments = dict(pending.get("arguments") or {})
+    # The tool-call budget is consumed when the CONTINUE decision is accepted
+    # (decide_next), so a scheduled request is always already budgeted. The wall-
+    # clock deadline is the one runtime bound enforced here as a backstop: a
+    # long-delayed replay must not execute a tool past the deadline.
+    if _deadline_passed(state):
+        return {
+            "next_action": CONVERGE,
+            "assessment": "FINALIZE",
+            "last_tool_error": "runtime deadline reached before tool execution",
+            "previous_tool_outcome": None,
+        }
     # Deterministic across a checkpointed resume: same investigation + tool +
     # candidate arguments → same audit row + idempotency key.
     fingerprint = str(pending.get("call_fingerprint") or "")
     audit_key = f"tool:{tool_name}:{fingerprint}"
+    # ONE stable invocation identity for this logical tool call: it is the audit
+    # row id (ToolInvocationRow.id), the executor's tool_call_id, and
+    # Evidence.source_tool_invocation_id — so provenance always resolves to the real
+    # audit row even across a checkpointed replay.
+    invocation_id = _invocation_uuid(inv_id, audit_key)
     alert: dict[str, Any] = dict(state.get("alert_context") or {})
 
     # 1) Audit STARTED in its own short transaction.
@@ -317,6 +525,7 @@ async def execute_and_ingest(
             uow,
             tenant_id=runtime.tenant_id,
             investigation_id=inv_id,
+            invocation_id=invocation_id,
             tool_name=tool_name,
             idempotency_key=audit_key,
             arguments=_bounded_arguments(tool_name, arguments),
@@ -325,7 +534,8 @@ async def execute_and_ingest(
     finally:
         await uow.close()
 
-    # 2) Run the tool — no DB transaction open.
+    # 2) Run the tool — no DB transaction open. The executor uses the SAME stable
+    #    invocation id so the returned tool_call_id matches the audit row.
     try:
         execution = await runtime.executor.execute(
             candidate=ToolCandidate(tool_name=tool_name, arguments=arguments),
@@ -335,10 +545,15 @@ async def execute_and_ingest(
                 "resource_type": "alert",
                 "address_id": alert.get("alert_id") or "",
             },
+            tool_call_id=str(invocation_id),
         )
     except Exception as exc:  # deterministic, typed; continue the investigation
         await _finish_audit(runtime, inv_id, audit_key, "FAILED", error_code="EXECUTION_ERROR")
-        return {"next_action": CONVERGE, "last_tool_error": str(exc)}
+        return {
+            "next_action": CONVERGE,
+            "last_tool_error": str(exc),
+            "previous_tool_outcome": _outcome_for(tool_name, "REJECTED", "EXECUTION_ERROR"),
+        }
 
     # 3) Audit FINISHED in its own short transaction.
     status, error_code, message, metadata = _audit_outcome(execution)
@@ -347,11 +562,73 @@ async def execute_and_ingest(
         error_code=error_code, safe_error_message=message, result_metadata=metadata,
     )
 
-    if execution.status in ("UNAVAILABLE", "REJECTED", "NO_DATA"):
+    # Recoverable-vs-deterministic outcome handling:
+    #   - REJECTED (unknown tool / invalid schema / policy violation) is a
+    #     deterministic candidate rejection, NOT a provider outage. It is never
+    #     retried as a transient failure; the investigation converges to finalize
+    #     with whatever grounded evidence exists.
+    #   - UNAVAILABLE is a transient provider/data-source failure. With budget +
+    #     alternative investigation paths still available, loop back to decide_next
+    #     so the model can pick another read; only when the budget is exhausted (or
+    #     the model has no further path) does the graph converge to finalize
+    #     (COMPLETED + INCONCLUSIVE).
+    #   - NO_DATA is a SUCCESSFUL bounded read (no events matched) — handled below.
+    runtime_budget = RuntimeBudget.from_state(state)
+    if execution.status == "REJECTED":
+        # Deterministic rejection (unknown tool / bad schema / policy) — never
+        # retried as transient; converge to finalize with whatever grounded evidence
+        # exists. The bounded outcome is still recorded so the finalize decision can
+        # reflect that the last read was rejected.
         return {
             "next_action": CONVERGE,
+            "assessment": "FINALIZE",
             "last_tool_invocation_id": None,
             "last_tool_error": execution.result.error,
+            "previous_tool_outcome": _outcome_for(
+                tool_name,
+                "REJECTED",
+                execution.result.error_code or "POLICY_REJECTED",
+                retryable=False,
+            ),
+        }
+    if execution.status == "UNAVAILABLE":
+        if not runtime_budget.can_take_step():
+            # No budget left to try another path → finalize with what we have.
+            return {
+                "next_action": CONVERGE,
+                "assessment": "FINALIZE",
+                "last_tool_invocation_id": None,
+                "last_tool_error": execution.result.error,
+                "previous_tool_outcome": _outcome_for(
+                    tool_name,
+                    "UNAVAILABLE",
+                    execution.result.error_code or "UPSTREAM_UNAVAILABLE",
+                    retryable=True,
+                ),
+            }
+        # Budget remains — loop back to decide_next so the model can choose an
+        # alternative path (or FINALIZE). The failure is surfaced via last_tool_error
+        # AND as a bounded previous_tool_outcome for the model's re-plan decision.
+        # The bounded repeated-attempt counter is advanced here: scheduling the SAME
+        # failing request again increments same_call_retries; a different request (a
+        # fresh fingerprint) resets it. A model that keeps picking the SAME failing
+        # call is stopped after _MAX_SAME_FAILING_CALL_RETRIES consecutive replans.
+        used_retries, _ = _repeat_budget_for(state, fingerprint)
+        return {
+            "next_action": "decide_next",
+            "assessment": None,
+            "iteration": int(state.get("iteration") or 0) + 1,
+            "last_tool_invocation_id": None,
+            "last_tool_error": execution.result.error,
+            "previous_tool_outcome": _outcome_for(
+                tool_name,
+                "UNAVAILABLE",
+                execution.result.error_code or "UPSTREAM_UNAVAILABLE",
+                retryable=True,
+            ),
+            "failing_call_fingerprint": fingerprint,
+            "same_call_retries": used_retries + 1,
+            "pending_tool_request": None,
         }
 
     # 4) Ingest the normalized evidence (same node, same crash/replay window).
@@ -375,11 +652,24 @@ async def execute_and_ingest(
         )
 
     # Loop back to decide_next to pick the next read (or finalize).
+    outcome_for_replan: dict[str, object] | None = None
+    failing_fp: str | None = None
+    same_call_retries = 0
+    if execution.status == "NO_DATA":
+        # A SUCCESSFUL bounded read that matched nothing: the model is told the last
+        # query returned NO_DATA so it can refine the query/conditions — never passed
+        # the raw (empty) result.
+        outcome_for_replan = _outcome_for(
+            tool_name, "NO_DATA", error_code=None, retryable=False
+        )
     return {
         "next_action": "decide_next",
         "assessment": None,
         "last_tool_invocation_id": execution.tool_call_id,
         "last_tool_error": None,
+        "previous_tool_outcome": outcome_for_replan,
+        "failing_call_fingerprint": failing_fp,
+        "same_call_retries": same_call_retries,
         "pending_tool_request": None,
     }
 
@@ -447,11 +737,15 @@ def _bounded_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
 
 
 async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[str, Any]:
-    """Convergence node — run once: AssessHypotheses + RecordFindings.
+    """Convergence node — run once: structured AssessHypotheses + RecordFindings.
 
     Called when decide_next returns FINALIZE (budget spent or the model is done).
-    Records the hypothesis assessment and the evidence-grounded findings that the
-    verdict will rest on, then routes to finalize_result.
+    The model returns a STRUCTURED per-hypothesis assessment that cites specific
+    evidence ids with a semantic relation (SUPPORTS / CONTRADICTS / CONTEXT). The
+    node then resolves every citation strictly against evidence that exists in this
+    investigation and refuses to auto-support: rule metadata or unrelated context
+    evidence can never, on its own, make the account-compromise hypothesis
+    SUPPORTED. A hypothesis the model cannot ground is assessed UNRESOLVED.
     """
     inv_id = _inv_id(state)
     handler = runtime.workflow_handler
@@ -475,45 +769,127 @@ async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[
     finally:
         await uow.close()
 
-    evidence_uuids = [e.id for e in evidence]
+    evidence_by_id = {e.id: e for e in evidence}
     evidence_ids = [str(e.id) for e in evidence]
-    summary = await runtime.model.assess(
-        AssessRequest(
-            investigation_id=_inv_str(state),
-            evidence_summary=[_evidence_line(e) for e in evidence],
-            finding_candidates=[],
-        )
-    )
-    if hypotheses:
-        status = "SUPPORTED" if evidence_ids else "UNRESOLVED"
-        relations = []
-        if evidence_ids:
-            relations = [
-                AssessmentEvidenceRelation(
-                    evidence_id=e.id, relation=EvidenceRelation.SUPPORTS
-                )
-                for e in evidence
-            ]
-        await handler.assess_hypotheses(
-            AssessHypotheses(
-                tenant_id=runtime.tenant_id,
-                investigation_id=inv_id,
-                idempotency_key=_inv_key(inv_id, "assess:convergence"),
-                assessments=[
-                    HypothesisAssessmentCandidate(
-                        hypothesis_id=h.id,
-                        status=status,
-                        reason_summary=summary.reason,
-                        evidence_relations=relations,
-                    )
-                    for h in hypotheses
+
+    # The assess consult consumes one LLM-call slot through the single budget
+    # authority. decide_next reserves this slot, but a replay arriving after the
+    # wall-clock deadline (or with no slot left) must not make a further model call:
+    # hypotheses are then left UNRESOLVED and findings are not produced, so the run
+    # still ends COMPLETED + INCONCLUSIVE via the low-budget fallback.
+    budget = RuntimeBudget.from_state(state)
+    summary: Any = None
+    if budget.can_call_llm():
+        budget = budget.consume_llm_call()
+        # Give the model the actual hypothesis ids and per-id evidence so it can
+        # cite them precisely (candidate only — resolution happens below).
+        summary = await runtime.model.assess(
+            AssessRequest(
+                investigation_id=_inv_str(state),
+                hypotheses=[
+                    {"id": str(h.id), "statement": h.statement} for h in hypotheses
+                ],
+                evidence=[
+                    {"id": str(e.id), "summary": _evidence_line(e),
+                     "operation": e.source.operation}
+                    for e in evidence
                 ],
             )
         )
-    if evidence_ids:
-        statements = [f.statement for f in summary.findings] or [
-            _default_finding(evidence)
-        ]
+
+    # Build structured per-hypothesis assessments, resolving references strictly to
+    # THIS investigation's evidence. Anything unresolved is UNRESOLVED (never an
+    # automatic SUPPORTED).
+    assessments: list[HypothesisAssessmentCandidate] = []
+    if hypotheses:
+        for h in hypotheses:
+            candidate = _candidate_for(h.id, summary.assessments if summary else [])
+            if candidate is None:
+                # The model did not assess this hypothesis → deterministic UNRESOLVED.
+                assessments.append(
+                    HypothesisAssessmentCandidate(
+                        hypothesis_id=h.id,
+                        status="UNRESOLVED",
+                        reason_summary="No evidence-based model assessment was produced",
+                    )
+                )
+                continue
+            status = candidate.status
+            relations: list[AssessmentEvidenceRelation] = []
+            resolvable = [
+                r for r in candidate.evidence_relations
+                if _is_known_evidence(evidence_by_id, r.evidence_id)
+            ]
+            if status in ("SUPPORTED", "CONTRADICTED"):
+                # Directional grounding: SUPPORTED needs at least one SUPPORTS
+                # relation to resolvable evidence in THIS investigation; CONTRADICTED
+                # needs at least one CONTRADICTS. CONTEXT (rule metadata / unrelated
+                # events) is never sufficient, and a SUPPORTS relation cannot support
+                # a CONTRADICTED verdict (nor vice-versa). Citations that do not
+                # resolve to this investigation's evidence are dropped entirely.
+                needed = "SUPPORTS" if status == "SUPPORTED" else "CONTRADICTS"
+                matching = [
+                    r for r in resolvable if str(r.relation) == needed
+                ]
+                if not matching:
+                    # No resolvable relation in the required direction → downgrade
+                    # to UNRESOLVED (never SUPPORTED/CONTRADICTED on other evidence).
+                    status = "UNRESOLVED"
+                    relations = []
+                else:
+                    relations = [
+                        AssessmentEvidenceRelation(
+                            evidence_id=UUID(r.evidence_id), relation=EvidenceRelation(r.relation)
+                        )
+                        for r in resolvable
+                    ]
+            else:
+                relations = [
+                    AssessmentEvidenceRelation(
+                        evidence_id=UUID(r.evidence_id), relation=EvidenceRelation(r.relation)
+                    )
+                    for r in resolvable
+                ]
+            assessments.append(
+                HypothesisAssessmentCandidate(
+                    hypothesis_id=h.id,
+                    status=status,
+                    reason_summary=candidate.reason_summary or "evidence-based assessment",
+                    evidence_relations=relations,
+                )
+            )
+        if assessments:
+            await handler.assess_hypotheses(
+                AssessHypotheses(
+                    tenant_id=runtime.tenant_id,
+                    investigation_id=inv_id,
+                    idempotency_key=_inv_key(inv_id, "assess:convergence"),
+                    assessments=assessments,
+                )
+            )
+
+    # Findings come ONLY from model Finding Candidates whose evidence citations
+    # resolve to real evidence in THIS investigation. There is deliberately NO
+    # generic fallback that invents a "supports compromise" Finding from mere
+    # evidence/rule metadata — CONTEXT evidence must never become a supporting
+    # business fact. If no validated model finding survives resolution, zero
+    # findings are persisted.
+    grounded: list[ModelFindingCandidate] = []
+    if summary is not None:
+        for f in summary.findings:
+            if not f.evidence_citations:
+                continue  # a finding must cite at least one evidence id
+            resolved = [
+                str(eid) for eid in f.evidence_citations
+                if _is_known_evidence_id(evidence_by_id, eid)
+            ]
+            if resolved:
+                grounded.append(
+                    ModelFindingCandidate(
+                        statement=f.statement, evidence_citations=resolved
+                    )
+                )
+    if grounded:
         await handler.record_findings(
             RecordFindings(
                 tenant_id=runtime.tenant_id,
@@ -521,39 +897,81 @@ async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[
                 idempotency_key=_inv_key(inv_id, "findings:convergence"),
                 findings=[
                     FindingCandidate(
-                        statement=statement,
-                        evidence_citations=evidence_uuids,
+                        statement=f.statement,
+                        evidence_citations=[
+                            UUID(str(eid)) for eid in f.evidence_citations
+                        ],
                     )
-                    for statement in statements
+                    for f in grounded
                 ],
             )
         )
     return {
         "iteration": iteration,
         "assessment": "FINALIZE",
+        **budget.to_updates(),
         "new_evidence_ids": evidence_ids,
     }
+
+
+def _candidate_for(
+    hypothesis_id: UUID,
+    candidates: list[ModelAssessmentCandidate],
+) -> ModelAssessmentCandidate | None:
+    wanted = str(hypothesis_id)
+    for c in candidates:
+        if c.hypothesis_id == wanted:
+            return c
+    return None
+
+
+def _is_known_evidence(
+    evidence_by_id: dict[UUID, Evidence], evidence_id: str
+) -> bool:
+    return _is_known_evidence_id(evidence_by_id, evidence_id)
+
+
+def _is_known_evidence_id(
+    evidence_by_id: dict[UUID, Evidence], evidence_id: str
+) -> bool:
+    try:
+        return UUID(evidence_id) in evidence_by_id
+    except (ValueError, AttributeError):
+        return False
 
 
 async def finalize_result(
     runtime: GraphRuntime, state: InvestigationGraphState
 ) -> dict[str, Any]:
-    """Finalize one immutable InvestigationResult from grounded facts + verdict."""
+    """Finalize one immutable InvestigationResult from grounded facts + verdict.
+
+    The verdict consult never begins once the wall-clock deadline has passed: the
+    graph deterministically finalizes the available grounded facts as INCONCLUSIVE
+    (COMPLETED, never FAILED), even when a replay arrives late.
+    """
     inv_id = _inv_id(state)
     handler = runtime.workflow_handler
+    budget = RuntimeBudget.from_state(state)
+    verdict_candidate = None
+    # The verdict consult never begins without a remaining LLM slot or once the
+    # wall-clock deadline has passed: the graph deterministically finalizes the
+    # available grounded facts as INCONCLUSIVE (COMPLETED, never FAILED) even when a
+    # replay arrives late.
+    if budget.can_call_llm():
+        budget = budget.consume_llm_call()
+        verdict_candidate = await runtime.model.verdict(
+            AssessRequest(
+                investigation_id=_inv_str(state),
+                evidence_summary=state.get("new_evidence_ids") or [],
+                finding_candidates=[],
+            )
+        )
     await handler.change_phase(
         ChangeInvestigationPhase(
             tenant_id=runtime.tenant_id,
             investigation_id=inv_id,
             idempotency_key=_inv_key(inv_id, "phase:finalizing"),
             phase=InvestigationPhase.FINALIZING,
-        )
-    )
-    verdict_candidate = await runtime.model.verdict(
-        AssessRequest(
-            investigation_id=_inv_str(state),
-            evidence_summary=state.get("new_evidence_ids") or [],
-            finding_candidates=[],
         )
     )
     uow = runtime.new_unit_of_work()
@@ -564,13 +982,53 @@ async def finalize_result(
     finally:
         await uow.close()
 
-    disposition = VerdictDisposition(verdict_candidate.disposition)
-    uncertainties = []
-    if verdict_candidate.uncertainty:
-        uncertainties.append(
-            UncertaintyCandidate(description=verdict_candidate.uncertainty)
-        )
-    result_key = _inv_key(inv_id, f"result:{verdict_candidate.disposition}")
+    if verdict_candidate is not None:
+        disposition = VerdictDisposition(verdict_candidate.disposition)
+        summary = verdict_candidate.summary
+        confidence = verdict_candidate.confidence
+        uncertainties = []
+        if verdict_candidate.uncertainty:
+            uncertainties.append(
+                UncertaintyCandidate(description=verdict_candidate.uncertainty)
+            )
+        result_key = _inv_key(inv_id, f"result:{verdict_candidate.disposition}")
+        if disposition in (
+            VerdictDisposition.MALICIOUS,
+            VerdictDisposition.BENIGN,
+        ) and not findings:
+            # Grounding invariant: MALICIOUS/BENIGN requires at least one grounded
+            # Finding. The model proposed a firm verdict with NO validated finding —
+            # deterministically bounded to INCONCLUSIVE (never a guessed disposition,
+            # never FAILED).
+            disposition = VerdictDisposition.INCONCLUSIVE
+            summary = "No grounded finding supported the model's proposed verdict"
+            confidence = 0.0
+            uncertainties = [
+                UncertaintyCandidate(
+                    description="The model proposed a MALICIOUS/BENIGN verdict but no "
+                    "evidence-grounded finding was recorded"
+                )
+            ]
+            result_key = _inv_key(inv_id, "result:INCONCLUSIVE")
+    else:
+        # Bounded finalize: the verdict model call could not start — either the
+        # wall-clock deadline passed, or no LLM-call slot remained (low-budget
+        # fallback). In both cases the graph deterministically finalizes the
+        # available grounded facts INCONCLUSIVE with a low confidence and a clear
+        # "model-call budget exhausted"-style uncertainty (never FAILED).
+        if budget.deadline_exceeded:
+            summary = "Investigation stopped at the runtime duration deadline"
+            uncertainty = (
+                "The runtime duration deadline was reached before the model could "
+                "render a verdict"
+            )
+        else:
+            summary = "Investigation stopped before a model verdict was possible"
+            uncertainty = "model-call budget exhausted before the verdict consult"
+        disposition = VerdictDisposition.INCONCLUSIVE
+        confidence = 0.0
+        uncertainties = [UncertaintyCandidate(description=uncertainty)]
+        result_key = _inv_key(inv_id, "result:INCONCLUSIVE")
     _, result = await handler.finalize_result(
         FinalizeInvestigationResult(
             tenant_id=runtime.tenant_id,
@@ -578,14 +1036,14 @@ async def finalize_result(
             idempotency_key=result_key,
             verdict=ResultVerdictCandidate(
                 disposition=disposition,
-                summary=verdict_candidate.summary,
-                confidence=verdict_candidate.confidence,
+                summary=summary,
+                confidence=confidence,
             ),
             finding_ids=[f.id for f in findings],
             uncertainties=uncertainties,
         )
     )
-    return {"result_id": str(result.id)}
+    return {"result_id": str(result.id), **budget.to_updates()}
 
 
 async def complete(
@@ -609,11 +1067,3 @@ def _evidence_line(evidence: Evidence) -> str:
     line = evidence.summary or str(evidence.observation)
     return str(line)[:200]
 
-
-def _default_finding(evidence: list[Evidence]) -> str:
-    first = evidence[0]
-    op = first.source.operation
-    return (
-        f"Evidence gathered by {op} supports the alert's account-compromise "
-        "hypothesis (grounded in collected HISIEM events)."
-    )

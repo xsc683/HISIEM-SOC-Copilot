@@ -42,6 +42,7 @@ from ...domain.investigation.entities import (
     Verdict,
 )
 from ...domain.investigation.enums import (
+    EvidenceRelation,
     EvidenceSourceType,
     HypothesisStatus,
     InvestigationStatus,
@@ -358,6 +359,26 @@ class InvestigationWorkflowHandler:
                         raise ValueError(
                             "SUPPORTED/CONTRADICTED assessment requires an "
                             "EvidenceRelation"
+                        )
+                    # Directional invariant (strict grounding): SUPPORTED needs at
+                    # least one SUPPORTS relation; CONTRADICTED needs at least one
+                    # CONTRADICTS. CONTEXT / wrong-direction relations alone can
+                    # never ground a firm hypothesis verdict.
+                    if status == HypothesisStatus.SUPPORTED and not any(
+                        rel.relation == EvidenceRelation.SUPPORTS
+                        for rel in candidate.evidence_relations
+                    ):
+                        raise ValueError(
+                            "SUPPORTED assessment requires at least one SUPPORTS "
+                            "EvidenceRelation"
+                        )
+                    if status == HypothesisStatus.CONTRADICTED and not any(
+                        rel.relation == EvidenceRelation.CONTRADICTS
+                        for rel in candidate.evidence_relations
+                    ):
+                        raise ValueError(
+                            "CONTRADICTED assessment requires at least one "
+                            "CONTRADICTS EvidenceRelation"
                         )
                     revision = hypothesis.assessment_revision + 1
                     relations = [

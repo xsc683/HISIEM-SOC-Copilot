@@ -48,7 +48,15 @@ class InvestigationGraphState(TypedDict, total=False):
     plan_revision_id: str | None
 
     iteration: int
+
+    # Runtime budget counters (system-authoritative, never model-settable). They are
+    # checkpointed with the graph state so a crash/restart/resume continues from the
+    # CONSUMED budget — never reset to full. ``budget_deadline_at`` is the UTC
+    # epoch-seconds wall-clock deadline derived from max_duration_seconds.
     budget_remaining_steps: int
+    budget_remaining_tool_calls: int
+    budget_remaining_llm_calls: int
+    budget_deadline_at: float | None
 
     # Runtime routing signals (system-set, never model-authoritative).
     next_action: str | None  # "CALL_TOOL" | "ASSESS"
@@ -57,6 +65,15 @@ class InvestigationGraphState(TypedDict, total=False):
     pending_tool_request: PendingToolRequest | None
     last_tool_invocation_id: str | None
     last_tool_error: str | None
+    # Failure-aware re-plan context. ``previous_tool_outcome`` is the bounded outcome
+    # (tool_name/status/error_code/retryable) of the most recently executed tool —
+    # never raw exceptions or full results. ``failing_call_fingerprint`` is the
+    # deterministic request fingerprint of the last call that did not SUCCEED, and
+    # ``same_call_retries`` counts how many consecutive times that exact call has
+    # been re-scheduled — together they bound the repeated-attempt re-plan loop.
+    previous_tool_outcome: NotRequired[dict[str, Any]]
+    failing_call_fingerprint: NotRequired[str | None]
+    same_call_retries: NotRequired[int]
     new_evidence_ids: list[str]
 
     result_id: str | None

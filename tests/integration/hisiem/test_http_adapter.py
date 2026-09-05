@@ -172,7 +172,31 @@ async def test_invalid_payload_raises() -> None:
         return httpx.Response(200, json={"not": "an alert object"})
 
     adapter = _adapter(handler)
-    alert = await adapter.get_alert(tenant_id="tenant-a", alert_id="alert-99")
-    # mapper tolerates missing keys; alert id empty indicates malformed authority data
-    assert alert is not None and alert.alert_id == ""
+    # A provider response WITHOUT the addressing ``_id`` is invalid — it must never
+    # be silently mapped (e.g. by falling back to ``alert.id``); it raises instead.
+    with pytest.raises(ExternalServiceError):
+        await adapter.get_alert(tenant_id="tenant-a", alert_id="alert-99")
     await adapter.close()
+
+
+async def test_alert_id_never_falls_back_to_alert_id_business_field() -> None:
+    """Fix #17: the addressing alert_id comes ONLY from ``_id``.
+
+    A payload that has ``alert.id`` but NO ``_id`` is an invalid provider response
+    (never silently addressed by the business id); and when ``_id`` IS present, the
+    ``alert.id`` value only ever populates the optional ``business_id`` display field
+    — never the addressing alert_id.
+    """
+    from hisiem_soc_copilot.infrastructure.hisiem.mapper import map_alert_detail
+
+    # 1) _id present + alert.id present → alert_id = _id; business_id = alert.id.
+    mapped = map_alert_detail(
+        {"_id": "es_alert_sha1", "alert": {"id": "alert-uuid-1"}},
+        tenant_id="tenant-a",
+    )
+    assert mapped.alert_id == "es_alert_sha1"
+    assert mapped.business_id == "alert-uuid-1"
+
+    # 2) alert.id present but _id MISSING → invalid (raises, no fallback).
+    with pytest.raises(ExternalServiceError):
+        map_alert_detail({"alert": {"id": "alert-uuid-1"}}, tenant_id="tenant-a")

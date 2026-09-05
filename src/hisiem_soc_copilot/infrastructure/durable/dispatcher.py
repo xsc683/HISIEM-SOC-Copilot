@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _DISPATCHER_DESTINATION = "investigation.graph.run"
 _MAX_ATTEMPTS = 10
+_LEASE_TIMEOUT_SECONDS = 60
 
 
 class Resolver(Protocol):
@@ -94,7 +96,10 @@ class AsyncOutboxDispatcher:
         """Claim + deliver one batch; returns the number of messages processed."""
         now = datetime.now(UTC)
         claimed = await self._outbox.claim_batch(
-            worker=self._worker, limit=self._batch, available_before=now
+            worker=self._worker,
+            limit=self._batch,
+            available_before=now,
+            lease_timeout_seconds=_LEASE_TIMEOUT_SECONDS,
         )
         if not claimed:
             return 0
@@ -106,8 +111,10 @@ class AsyncOutboxDispatcher:
 
     async def _deliver(self, record: OutboxRecord) -> None:
         if record.destination != _DISPATCHER_DESTINATION:
-            await self._outbox.settle_dead_letter(
-                outbox_id=record.id, error_code="UNKNOWN_DESTINATION"
+            await self._outbox.mark_dead_letter(
+                outbox_id=record.id,
+                lease_token=record.lease_token,
+                error_code="UNKNOWN_DESTINATION",
             )
             return
         try:
@@ -119,15 +126,24 @@ class AsyncOutboxDispatcher:
         if target is None:
             # The originating event vanished — nothing to dispatch.
             await self._outbox.mark_published(
-                outbox_id=record.id, published_at=datetime.now(UTC)
+                outbox_id=record.id,
+                lease_token=record.lease_token,
+                published_at=datetime.now(UTC),
             )
             return
         tenant_id, investigation_id = target
         lock = await self._lock_for(UUID(investigation_id))
         async with lock:
             try:
-                await self._runner.run_investigation(
-                    investigation_id=investigation_id, tenant_id=tenant_id
+                # A long investigation (up to the runtime duration budget) must not
+                # be stolen by the fixed lease: renew the lease WHILE the run is in
+                # flight. Each renewal is token-fenced, so only the current owner
+                # extends the lease; a stale worker's renewal is a no-op.
+                await self._run_with_lease_renewal(
+                    record,
+                    lambda: self._runner.run_investigation(
+                        investigation_id=investigation_id, tenant_id=tenant_id
+                    ),
                 )
             except Exception as exc:  # recoverable: retry with backoff
                 await self._fail(record, "RUN_FAILED")
@@ -136,20 +152,65 @@ class AsyncOutboxDispatcher:
                 )
                 return
         await self._outbox.mark_published(
-            outbox_id=record.id, published_at=datetime.now(UTC)
+            outbox_id=record.id,
+            lease_token=record.lease_token,
+            published_at=datetime.now(UTC),
         )
 
+    async def _run_with_lease_renewal(
+        self, record: OutboxRecord, run: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Run ``run()`` while periodically renewing the record's lease.
+
+        The lease is renewed every half of ``_LEASE_TIMEOUT_SECONDS``. Renewal
+        failures are ignored (the run continues): if the lease was genuinely lost
+        to a reclaim, the final settlement will be rejected by the token fence and
+        the reclaiming worker owns the row.
+        """
+        renewal = _LEASE_TIMEOUT_SECONDS / 2.0
+
+        async def _renew_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(renewal)
+                    renewed = await self._outbox.renew_lease(
+                        outbox_id=record.id,
+                        lease_token=record.lease_token,
+                        lease_timeout_seconds=_LEASE_TIMEOUT_SECONDS,
+                        now=datetime.now(UTC),
+                    )
+                    if not renewed:
+                        logger.warning(
+                            "lease renewal rejected for outbox %s — lease lost",
+                            record.id,
+                        )
+            except asyncio.CancelledError:
+                pass
+
+        renewer = asyncio.create_task(_renew_loop())
+        try:
+            await run()
+        finally:
+            renewer.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewer
+
     async def _fail(self, record: OutboxRecord, error_code: str) -> None:
+        """Exhausted attempts → DEAD_LETTER (terminal); else FAILED with backoff."""
         if record.attempt_count >= _MAX_ATTEMPTS:
-            await self._outbox.settle_dead_letter(
-                outbox_id=record.id, error_code=error_code
+            await self._outbox.mark_dead_letter(
+                outbox_id=record.id,
+                lease_token=record.lease_token,
+                error_code=error_code,
             )
             return
         backoff = timedelta(seconds=min(2 ** record.attempt_count, 120))
         await self._outbox.mark_failed(
             outbox_id=record.id,
+            lease_token=record.lease_token,
             error_code=error_code,
             next_available_at=datetime.now(UTC) + backoff,
+            attempt_count=record.attempt_count,
         )
 
     # ------------------------------------------------------------------

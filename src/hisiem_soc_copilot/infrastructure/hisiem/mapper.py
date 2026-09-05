@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...application.errors import ExternalServiceError
 from ...application.ports.hisiem import (
     DetectionRuleContext,
     HisiemAlertData,
@@ -43,10 +44,11 @@ def _opt_list(value: Any) -> list[Any]:
 def map_alert_detail(payload: Any, *, tenant_id: str | None = None) -> HisiemAlertData:
     """Map a HISIEM ``GET /api/alerts/{id}`` JSON object to a HisiemAlertData.
 
-    The detail endpoint returns the ES ``_source``; ``alert_id`` (the addressable
-    ES ``_id``) is read from ``_id`` and falls back to ``alert.id``. A payload that
-    is not a JSON object yields an empty ``alert_id`` which the caller treats as
-    invalid/absent authority data.
+    ``alert_id`` (the addressable ES ``_id``) is read STRICTLY from ``_id`` — it is
+    NEVER inferred from ``alert.id`` (a business identifier, not the addressing id;
+    see hisiem-integration-contract.md). ``alert.id`` may only populate the optional
+    ``business_id`` display field. A payload whose ``_id`` is missing yields an empty
+    ``alert_id``: the caller treats that as an invalid/absent provider response.
     """
     if not isinstance(payload, dict):
         raise ValueError("alert detail payload must be a JSON object")
@@ -69,7 +71,17 @@ def map_alert_detail(payload: Any, *, tenant_id: str | None = None) -> HisiemAle
                 return node
         return None
 
-    alert_id = str(payload.get("_id") or pick("alert.id", "id") or "")
+    raw_id = payload.get("_id")
+    if raw_id is None or str(raw_id) == "":
+        # The addressable ES ``_id`` is mandatory and may NEVER be inferred from
+        # ``alert.id`` (a business identifier). A payload without it is an invalid
+        # provider response, not a usable alert.
+        raise ExternalServiceError(
+            "HISIEM alert response is missing the addressing _id",
+            service="hisiem",
+            code="INVALID_RESPONSE",
+        )
+    alert_id = str(raw_id)
     tenant = tenant_id or _opt(payload.get("tenant_id"))
     alert = payload.get("alert")
     if isinstance(alert, dict):
@@ -94,7 +106,8 @@ def map_alert_detail(payload: Any, *, tenant_id: str | None = None) -> HisiemAle
     return HisiemAlertData(
         alert_id=alert_id,
         tenant_id=tenant or "",
-        alert_uuid=_opt(pick("alert.id", "id")) or _opt(payload.get("alert_uuid")),
+        business_id=_opt(alert.get("id") if isinstance(alert, dict) else None),
+        alert_uuid=_opt(payload.get("alert_uuid")),
         rule_id=_opt(pick("alert.rule_id", "rule_id")),
         rule_name=_opt(pick("alert.rule_name", "rule_name")),
         rule_type=_opt(pick("alert.type", "rule.type", "rule_type")),

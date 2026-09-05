@@ -34,6 +34,7 @@ from hisiem_soc_copilot.domain.shared.identifiers import utc_now
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.fakes import FakeUnitOfWorkFactory
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.fixtures.ssh_models import GroundedSshModel
 
 
 def _scripted_ssh_model() -> ScriptedModelProvider:
@@ -42,10 +43,10 @@ def _scripted_ssh_model() -> ScriptedModelProvider:
     decide turns:
     1. read the detection rule
     2. search for a successful login after the failures
-    then FINALIZE. The assess step emits one grounded finding; the verdict is
-    MALICIOUS (possible account compromise).
+    then FINALIZE. The assess step grounds the account-compromise hypothesis on the
+    observed successful login and emits a MALICIOUS verdict.
     """
-    return ScriptedModelProvider(
+    return GroundedSshModel(
         script={
             "plan_steps": {
                 "read_rule": "Read the detection rule that fired",
@@ -187,3 +188,38 @@ async def test_ssh_golden_path_graph_reaches_completed_with_result() -> None:
     assert result is not None
     assert result.verdict.disposition.value == "MALICIOUS"
     assert set(result.finding_ids) == {f.id for f in findings}
+
+
+async def test_evidence_source_tool_invocation_matches_audit_row() -> None:
+    """Evidence.source_tool_invocation_id must resolve to the EXACT audit row id.
+
+    The invocation identity is generated ONCE per logical tool call and threads
+    through ToolInvocationRow.id, ToolExecution.tool_call_id, and
+    Evidence.source_tool_invocation_id — so provenance is never a dangling/random
+    id that cannot be joined to the real tool_invocation audit row.
+    """
+    uows, investigation, tenant = await _started_investigation()
+    hisiem = FakeHisiem(alert_id="ssh-bruteforce-alert-1")
+    runtime = _runtime(uows, tenant_id=tenant, hisiem=hisiem)
+    graph = build_investigation_graph(runtime)
+    await graph.ainvoke(
+        {"investigation_id": str(investigation.id)},
+        thread_config(str(investigation.id)),
+    )
+
+    uow = uows()
+    evidence = await uow.evidence.list_by_investigation(
+        tenant_id=tenant, investigation_id=investigation.id
+    )
+    invocations = uow.tool_invocations.by_investigation(investigation.id)
+    invocation_ids = {r.id for r in invocations}
+
+    # Every piece of evidence that claims a tool-invocation source must point at a
+    # REAL audit row in this investigation.
+    linked = [e for e in evidence if e.source_tool_call_id is not None]
+    assert linked, "expected some tool-linked evidence in the SSH golden path"
+    for e in linked:
+        assert e.source_tool_call_id in invocation_ids, (
+            f"evidence {e.id} cites source_tool_invocation_id {e.source_tool_call_id} "
+            "that is not an existing tool_invocation row"
+        )

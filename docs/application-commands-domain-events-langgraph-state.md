@@ -133,7 +133,7 @@ proposal:{id}:execute:{content_revision}
 
 ## 6. V1 Command Catalog
 
-### 6.1 用户触发 Command
+### 6.1 API 入口 Command（持久化创建 + 调度）
 
 ```text
 StartAlertInvestigation
@@ -142,9 +142,12 @@ ApproveResponse
 RejectResponse
 ```
 
+`StartAlertInvestigation` 只负责 durable creation + scheduling：校验并写入 Investigation（CREATED）+ Domain Event + Outbox，随后由 Outbox Dispatcher 调度执行。它不直接驱动 Graph / Checkpoint。
+
 ### 6.2 Orchestrator / System Command
 
 ```text
+StartInvestigation
 ChangeInvestigationPhase
 ReviseInvestigationPlan
 RegisterHypotheses
@@ -162,6 +165,8 @@ CompleteInvestigationAfterResponse
 FailInvestigation
 ```
 
+`StartInvestigation` 是受信 Orchestrator / System Command：由 Durable Runtime（Outbox Dispatcher → Investigation Runner）在 Graph 执行前调用，将 Investigation 从 `CREATED` 桥接为 `RUNNING`。
+
 读取 Alert、Events、Threat Intelligence、Knowledge、SOAR Execution 等操作是 Query / Tool / Port，不是 Domain Command。
 
 ---
@@ -173,29 +178,90 @@ FailInvestigation
 输入：
 
 ```text
-source_alert_ref
+source_alert_ref {provider, resource_type, address_id, business_id?}
 ```
 
-可信信息来自 Trusted Context。
+可选幂等输入：
+
+```text
+idempotency_key    → 同一 key 返回同一逻辑结果（Command Receipt）
+```
+
+可信信息（Tenant / Actor）来自 Trusted Context。
 
 行为：
 
 ```text
 validate authorization
-→ resolve/check active Investigation
-→ create Investigation when absent
-→ start Investigation
-→ create OrchestrationBinding
+→ (短读事务) resolve/check active Investigation
+→ 关闭短读事务（不留业务事务跨越 HISIEM HTTP）
+→ hydrate authoritative Alert（HISIEM get_alert，无 DB 事务打开）
+→ (新事务) re-check active Investigation
+→ absent 才创建 Investigation（status=CREATED）
+→ 同一事务持久化 InvestigationCreated 事件 + Outbox 消息
+→ COMMIT
 ```
 
+事务边界：
+
+- 任何 HISIEM HTTP（`get_alert`）不得在打开的 DB 业务事务内执行。
+- `source_alert_ref` 必须 `provider=hisiem && resource_type=alert`；HISIEM 调用一律使用 `address_id`，绝不从 `business_id` 推断寻址 ID。
+- 并发启动收敛：partial unique index（`tenant_id + provider + resource_type + address_id`，active）作为最终并发护栏；hydrate 后 re-check 使并发启动返回既有 Active Investigation，而不是创建第二个。
+
 同一 `tenant + source_alert_ref` 已存在 Active Investigation 时必须返回现有 Investigation，不创建第二个 Active Investigation。
+
+`StartAlertInvestigation` 自身 **不** 直接驱动 Graph。它创建后由 Outbox Dispatcher 调度：Runner 随后执行 `StartInvestigation`（CREATED → RUNNING）并在 Graph 执行前建立 `OrchestrationBinding`。
 
 主要事件：
 
 ```text
 InvestigationCreated
+```
+
+`InvestigationStarted` 由 Runner 的 `StartInvestigation` 在运行时触发，不属于 API 启动命令。
+
+---
+
+### StartInvestigation
+
+受信 Orchestrator / System Command（由 Durable Runner 调用，不属于 API 请求面）。
+
+输入：
+
+```text
+investigation_id
+tenant_id           → 受信 Orchestrator scope
+```
+
+允许状态：
+
+```text
+CREATED
+```
+
+目标状态：
+
+```text
+RUNNING
+```
+
+行为：
+
+```text
+validate authorization (orchestrator)
+→ (短读) 拒绝 terminal Investigation（Domain 优先于 Checkpoint）
+→ ensure OrchestrationBinding（investigation_id ↔ 确定性 thread_id）
+→ CREATED → RUNNING
+→ 编译并执行 / resume Graph（AsyncPostgresSaver checkpointer）
+```
+
+事件：
+
+```text
 InvestigationStarted
 ```
+
+`OrchestrationBinding` 在每次 Graph 执行 / resume 前确认存在（idempotent，确定性 `thread_id`），使恢复始终命中同一线程的 Checkpoint。
 
 ---
 
@@ -746,7 +812,8 @@ COMMIT
 
 | Command | 主要 Event |
 |---|---|
-| StartAlertInvestigation | InvestigationCreated, InvestigationStarted |
+| StartAlertInvestigation | InvestigationCreated |
+| StartInvestigation | InvestigationStarted |
 | CancelInvestigation | InvestigationCancelled |
 | ChangeInvestigationPhase | InvestigationPhaseChanged |
 | ReviseInvestigationPlan | InvestigationPlanRevised |
@@ -875,8 +942,19 @@ stop_reason
 `plan_revision_id`
 : 当前持久化 Plan Revision 引用，不复制完整 Plan History。
 
-`budget`
-: Runtime Authority，包括 step/tool/LLM/token/time budget。
+`budget` → 拆分为确定性剩余计数（Runtime Authority，逐节点消耗，随 Checkpoint 持久化）
+
+```text
+budget_remaining_steps
+budget_remaining_tool_calls
+budget_remaining_llm_calls
+budget_deadline_at        # max_duration_seconds 派生的 UTC epoch 秒
+```
+
+- FRESH 运行由 Aggregate 的 `BudgetLimits` 播种为满额；resume 保留 Checkpoint 中的剩余计数 —— 进程崩溃 / 重启不会把预算错误重置为满额（从而获得无限调用）。
+- `max_llm_tokens` 保留给真实 provider 的 token 计量；本轮确定性上限为 `max_llm_calls`。
+- 预算由 Runtime 权威执行；模型 / Graph Node 不能上调。
+- 耗尽 / deadline → finalize 已有事实 → COMPLETED + INCONCLUSIVE（非 FAILED）。
 
 `new_evidence_ids`
 : 仅表示本轮 Evidence Delta，不保存完整 Evidence Collection。
@@ -952,52 +1030,46 @@ response_execution_id?
 
 ## 19. V1 Graph 逻辑结构
 
+Read-only 前缀（本阶段实现）：
+
 ```text
 START
   ↓
-load_investigation
+load_investigation        ← 绑定 RUNNING；FRESH 运行播种运行期预算，resume 保留已消耗预算
   ↓
-hydrate_alert
+hydrate_alert             ← HISIEM get_alert（无 DB 事务跨越 HTTP）
   ↓
-plan
+plan                      ← 消耗 1 次 LLM-Call 预算
   ↓
-decide_next
+decide_next               ← 每次咨询消耗 1 次 LLM-Call；CONTINUE 消耗 1 step + 1 tool-call
   │
-  ├── CALL_TOOL
-  │      ↓
-  │  execute_read_tool
-  │      ↓
-  │  ingest_evidence
-  │      ↓
-  │  assess
-  │    /    \
-  │ CONTINUE FINALIZE
-  │    │       │
-  └────┘       ↓
-         finalize_result
-               ↓
-         prepare_response
-          /          \
-      NONE/DENY   REQUIRE_APPROVAL
-         │              │
-      complete     request_approval
-         │              │
-        END        wait_approval
-                        │
-                    interrupt
-                        │
-                      resume
-                        ↓
-                   load_approval
-                    /        \
-                 REJECT     APPROVE
-                    │          │
-                   END   submit_response
-                               │
-                              END
+  ├── execute_and_ingest  ← 运行 1 个白名单只读工具 + 审计 + 归一化 Evidence
+  │         │
+  │         └────────────→ decide_next        （loop）
+  │
+  └── assess              ← convergence：AssessHypotheses + RecordFindings（消耗 1 次 LLM-Call）
+          ↓
+     finalize_result      ← verdict（消耗最后 1 次 LLM-Call / deadline 到达则确定性 INCONCLUSIVE）
+          ↓
+     complete             ← RUNNING → COMPLETED（read-only 无 executable response）
+          ↓
+        END
 ```
 
-提交 Response 后 Graph 结束；SOAR Workflow 生命周期由 HISIEM SOAR 管理。
+预算规则：
+
+```text
+max_steps / max_tool_calls / max_llm_calls / max_duration_seconds
+= Runtime Authority，确定性执行，Checkpoint 持久化，resume 不重置
+max_llm_tokens          = 保留给真实 provider token 计量（本轮不确定执行）
+
+exhaustion / deadline   → finalize available facts → COMPLETED + INCONCLUSIVE
+绝不默认 FAILED
+```
+
+`execute_and_ingest` 在单个 Checkpoint 步内执行工具并写入其归一化 Evidence：crash mid-node 重跑整个节点，Tool 审计（by-key）与 Evidence（by dedup key）均幂等 —— checkpointed resume 既不丢也不重复。
+
+后续阶段追加 Response 分支（V1 之外的 Response 提议 / Approval 流程）：
 
 ---
 
@@ -1005,15 +1077,13 @@ decide_next
 
 | Graph Node | Application / Query |
 |---|---|
-| load_investigation | GetInvestigation |
+| load_investigation | GetInvestigation + 运行期预算播种 / resume 保留 |
 | hydrate_alert | GetAlert / related context queries |
-| plan | ChangeInvestigationPhase, ReviseInvestigationPlan, RegisterHypotheses |
-| decide_next | LLM structured candidate only |
-| execute_read_tool | ToolExecutor / Query Port |
-| ingest_evidence | RecordEvidenceBatch |
-| assess | ChangeInvestigationPhase, AssessHypotheses, RecordFindings |
-| finalize_result | ChangeInvestigationPhase, FinalizeInvestigationResult |
-| prepare_response | CreateResponseProposal, EvaluateResponsePolicy |
+| plan | ChangeInvestigationPhase, ReviseInvestigationPlan, RegisterHypotheses（消耗 1 LLM-Call） |
+| decide_next | LLM structured candidate only（每次咨询消耗 1 LLM-Call） |
+| execute_and_ingest | ToolExecutor / Query Port + RecordEvidenceBatch（单节点执行工具 + 审计 + Evidence） |
+| assess | ChangeInvestigationPhase, AssessHypotheses, RecordFindings（消耗 1 LLM-Call） |
+| finalize_result | ChangeInvestigationPhase, FinalizeInvestigationResult（verdict 消耗最后 1 LLM-Call；deadline 到达则确定性 INCONCLUSIVE） |
 | complete | CompleteInvestigation |
 | request_approval | RequestResponseApproval |
 | wait_approval | LangGraph interrupt only |
@@ -1195,7 +1265,16 @@ persist execution reference
 
 ### Budget Exhaustion
 
-优先：
+Runtime Authority 确定性执行：
+
+```text
+max_steps
+max_tool_calls
+max_llm_calls        # 本轮确定性 LLM 调用上限（convergence 需要 2 个固定调用，会预留给 assess + verdict）
+max_duration_seconds # 派生出 wall-clock deadline；deadline 到达后不再执行工具、不再发起模型咨询
+```
+
+耗尽 / deadline 时：
 
 ```text
 stop investigation loop
@@ -1204,6 +1283,8 @@ stop investigation loop
 ```
 
 而不是默认 `FAILED`。
+
+Checkpoint restart / resume 后预算不被重置为满额（剩余计数随 Checkpoint 持久化），因此无法通过反复重启获得无限调用。`max_llm_tokens` 保留给真实 provider token 计量，不参与确定性执行。
 
 ---
 

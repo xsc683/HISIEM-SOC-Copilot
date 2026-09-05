@@ -40,6 +40,7 @@ from hisiem_soc_copilot.infrastructure.durable.investigation_runner import (
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.fakes import FakeUnitOfWorkFactory
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.fixtures.ssh_models import GroundedSshModel
 
 
 def _runner_factory(
@@ -84,7 +85,7 @@ async def _create_investigation(
 
 
 def _ssh_model() -> ScriptedModelProvider:
-    return ScriptedModelProvider(
+    return GroundedSshModel(
         script={
             "plan_steps": {
                 "read_rule": "Read the detection rule that fired",

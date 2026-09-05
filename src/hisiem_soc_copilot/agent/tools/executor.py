@@ -58,13 +58,18 @@ class ToolExecutor:
         candidate: ToolCandidate,
         tenant_id: str,
         source_alert_ref: dict[str, str],
+        tool_call_id: str | None = None,
     ) -> ToolExecution:
         """Validate + execute one candidate into a typed ToolExecution.
 
+        ``tool_call_id`` is the STABLE invocation identity: it becomes the audit
+        row id and Evidence.source_tool_invocation_id. When the caller does not
+        supply one (direct executor use) a fresh id is generated, but the graph
+        always passes its deterministic id so audit ↔ evidence provenance matches.
         Raises ToolPolicyError/UnknownToolError (no budget check here — budget is
         consumed by the caller after a successful read, per the graph step).
         """
-        tool_call_id = str(uuid4())
+        tool_call_id = tool_call_id or str(uuid4())
         fetched_at = datetime.now(UTC).isoformat()
         try:
             if candidate.tool_name == "hisiem.search_events":

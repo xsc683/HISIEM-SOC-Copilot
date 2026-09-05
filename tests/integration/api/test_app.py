@@ -79,7 +79,13 @@ async def test_unknown_alert_start_returns_not_found(client: httpx.AsyncClient) 
     # a service error; the API should return 502 rather than crash.
     res = await client.post(
         "/api/v1/investigations",
-        json={"source_alert_id": "alert-x"},
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "alert-x",
+            }
+        },
         headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
     )
     assert res.status_code in (502, 503)
@@ -98,7 +104,13 @@ async def test_no_provider_fails_closed() -> None:
             # Even with headers present, no configured provider → untrusted.
             res = await c.post(
                 "/api/v1/investigations",
-                json={"source_alert_id": "alert-x"},
+                json={
+                    "source_alert_ref": {
+                        "provider": "hisiem",
+                        "resource_type": "alert",
+                        "address_id": "alert-x",
+                    }
+                },
                 headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
             )
             assert res.status_code == 403

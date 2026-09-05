@@ -13,6 +13,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from hisiem_soc_copilot.application.ports.durable import (
+    CommandReceiptRecord,
     DomainEventEnvelope,
     DurableCommand,
     OrchestrationBinding,
@@ -35,15 +36,22 @@ from hisiem_soc_copilot.domain.investigation.value_objects import ExternalResour
 
 @dataclass
 class FakeOutboxStore:
-    """In-memory outbox for dispatcher tests; keeps a PENDING/PROCESSING/PUBLISHED log.
+    """In-memory outbox with lease fencing + dead-letter semantics.
 
-    Claiming moves ready rows to PROCESSING and records them so tests can assert
-    delivery happened exactly once.
+    Mirrors the real store: claim moves ready rows (PENDING / FAILED retry-due /
+    PROCESSING with an expired lease) to PROCESSING with a fresh lease_token; every
+    settlement (published / failed / dead-letter) and every renewal must present the
+    SAME token — a worker whose lease was reclaimed holds a stale token and is
+    rejected (rowcount == 0). Tracks a clock so tests can simulate lease expiry.
     """
 
     rows: dict[UUID, dict[str, Any]] = field(default_factory=dict)
     published_ids: list[UUID] = field(default_factory=list)
     failed_ids: list[UUID] = field(default_factory=list)
+    dead_letter_ids: list[UUID] = field(default_factory=list)
+    now: Any = field(default_factory=lambda: __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ))
     _seq = 0
 
     def enqueue(
@@ -56,51 +64,139 @@ class FakeOutboxStore:
             "destination": destination,
             "status": "PENDING",
             "attempt_count": 0,
+            "locked_at": None,
+            "locked_by": None,
+            "lease_token": None,
+            "available_at": self.now,
         }
 
+    def advance(self, seconds: float) -> None:
+        from datetime import timedelta
+
+        self.now = self.now + timedelta(seconds=seconds)
+
     async def claim_batch(
-        self, *, worker: str, limit: int, available_before: Any
+        self,
+        *,
+        worker: str,
+        limit: int,
+        available_before: Any,
+        lease_timeout_seconds: int = 60,
     ) -> list[OutboxRecord]:
+        # The fake owns its own clock (``self.now``) so tests can drive lease
+        # expiry via ``advance()`` deterministically.
+        del available_before
         ready = [
-            OutboxRecord(
-                id=row["id"],
-                event_id=row["event_id"],
-                destination=row["destination"],
-                status="PENDING",
-                attempt_count=row["attempt_count"],
-                available_at=available_before,
-            )
-            for row in self.rows.values()
-            if row["status"] == "PENDING"
-        ][:limit]
-        for rec in ready:
-            row = self.rows[rec.event_id]
+            self.rows[row_event_id]
+            for row_event_id, row in self.rows.items()
+            if self._claimable(row, lease_timeout_seconds)
+        ]
+        ready.sort(key=lambda r: r["event_id"])  # deterministic order
+        claimed: list[OutboxRecord] = []
+        for row in ready[:limit]:
             row["status"] = "PROCESSING"
             row["attempt_count"] += 1
-        return ready
+            row["locked_at"] = self.now
+            row["locked_by"] = worker
+            row["lease_token"] = uuid4().hex
+            claimed.append(
+                OutboxRecord(
+                    id=row["id"],
+                    event_id=row["event_id"],
+                    destination=row["destination"],
+                    status="PROCESSING",
+                    attempt_count=row["attempt_count"],
+                    available_at=row.get("available_at", self.now),
+                    lease_token=row["lease_token"],
+                    locked_at=self.now,
+                    locked_by=worker,
+                )
+            )
+        return claimed
 
-    async def mark_published(self, *, outbox_id: UUID, published_at: Any) -> bool:
+    def _claimable(self, row: dict[str, Any], lease_timeout_seconds: int) -> bool:
+        from datetime import timedelta
+
+        status = row["status"]
+        if status in ("PENDING", "FAILED"):
+            return row.get("available_at", self.now) <= self.now
+        if status == "PROCESSING":
+            locked_at = row.get("locked_at")
+            if locked_at is None:
+                return False
+            return locked_at <= self.now - timedelta(seconds=lease_timeout_seconds)
+        return False
+
+    async def renew_lease(
+        self,
+        *,
+        outbox_id: UUID,
+        lease_token: str,
+        lease_timeout_seconds: int,
+        now: Any,
+    ) -> bool:
         for row in self.rows.values():
-            if row["status"] == "PROCESSING" and row["id"] == outbox_id:
+            if (
+                row["status"] == "PROCESSING"
+                and row["id"] == outbox_id
+                and row.get("lease_token") == lease_token
+            ):
+                # locked_at = the timestamp of this successful renewal (never the
+                # future). The expiry check is locked_at <= now - lease_timeout, so a
+                # renewal re-arms the 60s window from NOW, exactly as the real store.
+                row["locked_at"] = now
+                return True
+        return False
+
+    async def mark_published(
+        self, *, outbox_id: UUID, lease_token: str, published_at: Any
+    ) -> bool:
+        for row in self.rows.values():
+            if (
+                row["status"] == "PROCESSING"
+                and row["id"] == outbox_id
+                and row.get("lease_token") == lease_token
+            ):
                 row["status"] = "PUBLISHED"
+                row["lease_token"] = None
                 self.published_ids.append(outbox_id)
                 return True
         return False
 
     async def mark_failed(
-        self, *, outbox_id: UUID, error_code: str, next_available_at: Any
+        self,
+        *,
+        outbox_id: UUID,
+        lease_token: str,
+        error_code: str,
+        next_available_at: Any,
+        attempt_count: int,
     ) -> bool:
         for row in self.rows.values():
-            if row["status"] == "PROCESSING" and row["id"] == outbox_id:
+            if (
+                row["status"] == "PROCESSING"
+                and row["id"] == outbox_id
+                and row.get("lease_token") == lease_token
+            ):
                 row["status"] = "FAILED"
+                row["available_at"] = next_available_at
+                row["lease_token"] = None
                 self.failed_ids.append(outbox_id)
                 return True
         return False
 
-    async def settle_dead_letter(self, *, outbox_id: UUID, error_code: str) -> bool:
+    async def mark_dead_letter(
+        self, *, outbox_id: UUID, lease_token: str, error_code: str
+    ) -> bool:
         for row in self.rows.values():
-            if row["status"] == "PROCESSING" and row["id"] == outbox_id:
-                row["status"] = "DEAD"
+            if (
+                row["status"] == "PROCESSING"
+                and row["id"] == outbox_id
+                and row.get("lease_token") == lease_token
+            ):
+                row["status"] = "DEAD_LETTER"
+                row["lease_token"] = None
+                self.dead_letter_ids.append(outbox_id)
                 return True
         return False
 
@@ -143,18 +239,44 @@ class FakeEventLedger:
 
 @dataclass
 class FakeCommandReceiptStore:
-    """In-memory command_receipt store."""
+    """In-memory command_receipt store.
 
-    _receipts: dict[str, DurableCommand] = field(default_factory=dict)
+    Mirrors the real (tenant, command_type, idempotency_key)-scoped identity: the
+    backing dict is keyed by that triple, so the same key in two tenants (or two
+    command types) are distinct idempotency spaces.
+    """
 
-    async def exists(self, *, idempotency_key: str) -> bool:
-        return idempotency_key in self._receipts
+    _receipts: dict[tuple[str, str, str], DurableCommand] = field(default_factory=dict)
+
+    async def exists(
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
+    ) -> bool:
+        return (tenant_id, command_type, idempotency_key) in self._receipts
 
     async def record(self, receipt: DurableCommand) -> None:
-        self._receipts[receipt.idempotency_key] = receipt
+        self._receipts[(receipt.tenant_id, receipt.command_type, receipt.idempotency_key)] = (
+            receipt
+        )
 
-    async def get_safe_result(self, *, idempotency_key: str) -> dict[str, Any] | None:
-        receipt = self._receipts.get(idempotency_key)
+    async def find(
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
+    ) -> CommandReceiptRecord | None:
+        receipt = self._receipts.get((tenant_id, command_type, idempotency_key))
+        if receipt is None:
+            return None
+        return CommandReceiptRecord(
+            idempotency_key=receipt.idempotency_key,
+            command_type=receipt.command_type,
+            tenant_id=receipt.tenant_id,
+            aggregate_id=receipt.aggregate_id,
+            request_fingerprint=receipt.request_fingerprint,
+            safe_result=dict(receipt.safe_result) if receipt.safe_result else None,
+        )
+
+    async def get_safe_result(
+        self, *, tenant_id: str, command_type: str, idempotency_key: str
+    ) -> dict[str, Any] | None:
+        receipt = self._receipts.get((tenant_id, command_type, idempotency_key))
         return dict(receipt.safe_result) if receipt and receipt.safe_result else None
 
     def receipts(self) -> list[DurableCommand]:
@@ -469,10 +591,15 @@ class FakeUnitOfWork:
         self.bindings = FakeOrchestrationBindingStore()
         self.tool_invocations = FakeToolInvocationStore()
         self._commits = 0
+        self._closed = False
 
     @property
     def commits(self) -> int:
         return self._commits
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
 
     async def commit(self) -> None:
         self._commits += 1
@@ -481,7 +608,7 @@ class FakeUnitOfWork:
         pass
 
     async def close(self) -> None:
-        pass
+        self._closed = True
 
     async def __aenter__(self) -> FakeUnitOfWork:
         return self

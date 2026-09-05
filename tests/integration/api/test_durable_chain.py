@@ -24,8 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from hisiem_soc_copilot.api.app import create_app
 from hisiem_soc_copilot.config import Settings
-from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.fixtures.ssh_models import GroundedSshModel
 
 _TRUNCATE = (
     "tool_invocation",
@@ -107,7 +107,7 @@ async def chain_client() -> AsyncIterator[tuple[httpx.AsyncClient, Any]]:
         container.hisiem_adapter = hisiem  # type: ignore[assignment]
         container.dispatcher = container.outbox_dispatcher(
             hisiem=hisiem,
-            model=ScriptedModelProvider(
+            model=GroundedSshModel(
                 script={
                     "decide": [
                         {
@@ -165,7 +165,13 @@ async def test_post_then_dispatch_reaches_completed(
     # POST commits + returns fast with the investigation still CREATED.
     res = await client.post(
         "/api/v1/investigations",
-        json={"source_alert_id": "chain-alert-1"},
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "chain-alert-1",
+            },
+        },
         headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
     )
     assert res.status_code == 201
@@ -223,7 +229,13 @@ async def test_duplicate_post_returns_existing_and_does_not_re_dispatch(
     client, container = chain_client
     first = await client.post(
         "/api/v1/investigations",
-        json={"source_alert_id": "chain-alert-1"},
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "chain-alert-1",
+            },
+        },
         headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
     )
     assert first.status_code == 201
@@ -233,7 +245,13 @@ async def test_duplicate_post_returns_existing_and_does_not_re_dispatch(
     # (no second outbox row, so a subsequent drain is a no-op for it).
     second = await client.post(
         "/api/v1/investigations",
-        json={"source_alert_id": "chain-alert-1"},
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "chain-alert-1",
+            },
+        },
         headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
     )
     assert second.status_code == 201
@@ -260,3 +278,104 @@ async def test_duplicate_post_returns_existing_and_does_not_re_dispatch(
     assert investigation_rows == 1
     assert outbox_rows == 1
     assert status == "COMPLETED"
+
+
+async def test_same_idempotency_key_different_alert_api_409(
+    chain_client: tuple[httpx.AsyncClient, Any],
+) -> None:
+    """A stable Idempotency-Key bound to alert-1, replayed for alert-2 through the
+    API → a deterministic 409 IDEMPOTENCY_CONFLICT (never 500 / raw IntegrityError)."""
+    import uuid
+
+    from hisiem_soc_copilot.application.ports.hisiem import HisiemAlertData
+
+    client, container = chain_client
+
+    class _TwoAlertHisiem(FakeHisiem):
+        """Serves both chain alerts so each POST can hydrate."""
+
+        def __init__(self) -> None:
+            super().__init__(alert_id="chain-alert-1")
+            self._base = super()
+
+        async def get_alert(self, *, tenant_id: str, alert_id: str):
+            self.calls.append(f"get_alert:{alert_id}")
+            base = await self._base.get_alert(
+                tenant_id=tenant_id, alert_id="chain-alert-1"
+            )
+            if base is None:
+                return None
+            return HisiemAlertData(
+                alert_id=alert_id,
+                tenant_id=base.tenant_id,
+                rule_id=base.rule_id,
+                rule_name=base.rule_name,
+                rule_type=base.rule_type,
+                severity=base.severity,
+                description=base.description,
+                status=base.status,
+            )
+
+    container.hisiem_adapter = _TwoAlertHisiem()  # type: ignore[assignment]
+
+    key = f"api-key-{uuid.uuid4()}"
+    ok = await client.post(
+        "/api/v1/investigations",
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "chain-alert-1",
+            },
+        },
+        headers={
+            "X-Tenant-ID": "tenant-a",
+            "X-Actor-Subject": "analyst",
+            "Idempotency-Key": key,
+        },
+    )
+    assert ok.status_code == 201
+
+    # Replaying the SAME key for a DIFFERENT alert is a deterministic conflict.
+    conflict = await client.post(
+        "/api/v1/investigations",
+        json={
+            "source_alert_ref": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "chain-alert-2",
+            },
+        },
+        headers={
+            "X-Tenant-ID": "tenant-a",
+            "X-Actor-Subject": "analyst",
+            "Idempotency-Key": key,
+        },
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+    # Exactly ONE receipt for this key/tenant/command scope, pointing at alert-1's
+    # investigation — no second row, no second investigation leaked.
+    sessions = container.session_factory()
+    async with sessions() as session:
+        receipt_rows = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM copilot.command_receipt "
+                    "WHERE tenant_id='tenant-a' AND command_type='StartAlertInvestigation' "
+                    "AND idempotency_key=:key"
+                ),
+                {"key": key},
+            )
+        ).scalar()
+        alert2_investigations = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM copilot.investigation "
+                    "WHERE source_address_id='chain-alert-2'"
+                )
+            )
+        ).scalar()
+    assert receipt_rows == 1
+    assert alert2_investigations == 0

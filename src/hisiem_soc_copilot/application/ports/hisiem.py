@@ -20,12 +20,16 @@ from typing import Any, Protocol
 class HisiemAlertData:
     """Bounded alert hydration read model (source: HISIEM authority).
 
-    ``alert_id`` is the ES ``_id`` used to address the alert. Only a bounded
-    subset of HISIEM fields enters Copilot context — never a full SIEM data copy.
+    ``alert_id`` is the ES ``_id`` used to address the alert — read STRICTLY from the
+    provider's ``_id``, never inferred from ``alert.id``. ``business_id`` (optional)
+    is the provider's own display identifier (``alert.id``); it is never used as an
+    addressing id downstream. Only a bounded subset of HISIEM fields enters Copilot
+    context — never a full SIEM data copy.
     """
 
     alert_id: str
     tenant_id: str
+    business_id: str | None = None
     alert_uuid: str | None = None
     rule_id: str | None = None
     rule_name: str | None = None

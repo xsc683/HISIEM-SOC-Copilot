@@ -91,6 +91,9 @@ class AgentBudgetSettings(BaseSettings):
     max_steps: int = Field(default=20, ge=1)
     max_tool_calls: int = Field(default=30, ge=1)
     max_tool_calls_per_step: int = Field(default=4, ge=1)
+    max_llm_calls: int = Field(default=20, ge=1)
+    # Token ceiling is reserved for a real provider's accounting; the deterministic
+    # ceiling enforced at runtime is max_llm_calls (no token metering exists yet).
     max_llm_tokens: int = Field(default=20_000, ge=1)
     max_duration_seconds: int = Field(default=600, ge=1)
 

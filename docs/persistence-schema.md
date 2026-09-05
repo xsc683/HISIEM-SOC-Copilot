@@ -729,19 +729,46 @@ Investigation ID != LangGraph thread_id
 支持 Application Command Idempotency。
 
 ```text
-idempotency_key TEXT PK
-command_id UUID NOT NULL UNIQUE
+id UUID PK                          # surrogate technical primary key
+idempotency_key TEXT NOT NULL
+command_id UUID NOT NULL UNIQUE     # 每个 command 至多一条 receipt
 command_type VARCHAR(128) NOT NULL
 tenant_id TEXT NOT NULL
 aggregate_type VARCHAR(64) NULL
 aggregate_id UUID NULL
-result_ref_type VARCHAR(64) NULL
-result_ref_id TEXT NULL
+result_ref_type VARCHAR(64) NULL    # 保留列（当前恒为 NULL，未使用）
+result_ref_id TEXT NULL             # 保留列（当前恒为 NULL，未使用）
+request_fingerprint TEXT NULL
 safe_result JSONB NULL
 completed_at TIMESTAMPTZ NOT NULL
 ```
 
+约束：
+
+```text
+UNIQUE(tenant_id, command_type, idempotency_key)
+```
+
+Idempotency-Key 的作用域是 **Tenant + Command Type**，不是全系统 global key：
+两个 tenant 可以各自使用相同的 `idempotency_key`，同一 tenant 下不同
+`command_type` 也可使用相同的 key —— 它们都是互不相关的幂等空间。数据库唯一性
+由 `(tenant_id, command_type, idempotency_key)` 复合约束保证。
+
+`request_fingerprint` 保存业务请求的有界指纹（例如 `source_alert_ref`），用于
+检测 `same key + different business request`：同一个 Idempotency-Key 被绑定到
+一个不同的业务请求上是确定性的幂等冲突（409 `IDEMPOTENCY_CONFLICT`），而不是
+静默返回原始（错误）逻辑结果。
+
 `safe_result` 只保存重复调用时需要返回的最小安全结果，不保存 raw Tool response、凭据、Prompt 或敏感日志内容。
+
+并发：两个携带相同 Idempotency-Key 的请求同时通过 replay 查找（都未命中）后会
+在 `UNIQUE(tenant_id, command_type, idempotency_key)` 上竞争。loser 的 commit
+冲突被翻译为 `CommandReceiptConflictError`（infrastructure 层），handler 在全新
+事务中重读 winner 的 receipt 并比较 `request_fingerprint`：
+- same request → 返回 winner 的原始 aggregate；
+- different request → `IdempotencyConflictError`（409）。
+
+绝不把该唯一性冲突作为 raw `IntegrityError` → HTTP 500 泄漏。
 
 ---
 
@@ -789,6 +816,7 @@ attempt_count INTEGER NOT NULL DEFAULT 0
 available_at TIMESTAMPTZ NOT NULL
 locked_at TIMESTAMPTZ NULL
 locked_by TEXT NULL
+lease_token TEXT NULL
 published_at TIMESTAMPTZ NULL
 last_error_code VARCHAR(128) NULL
 created_at TIMESTAMPTZ NOT NULL
@@ -797,16 +825,41 @@ created_at TIMESTAMPTZ NOT NULL
 Status：
 
 ```text
-PENDING
-PROCESSING
-PUBLISHED
-FAILED
+PENDING        # 待投递
+PROCESSING     # 已租约认领（worker 正在投递）
+PUBLISHED      # 投递成功（terminal）
+FAILED         # 可重试失败（attempt_count < max，按 backoff 重试）
+DEAD_LETTER    # 永久失败（attempt_count >= max；terminal，永不回收）
 ```
+
+租约时间语义（统一）：
+
+```text
+locked_at      # = 最后一次成功 claim / renewal 的时间（绝不写入未来）
+lease expired  # locked_at <= now - lease_timeout
+```
+
+```text
+claim            → PROCESSING + locked_at = now + locked_by = worker
+                   + 写入 fresh lease_token
+renew_lease      → locked_at = now（仅当 id + status=PROCESSING + lease_token 匹配）
+lease expired    → 其它 worker 可回收（在过期 PROCESSING 租约上重新 claim）
+attempt++        → 仅在 worker 持有租约时安全递增
+DEAD_LETTER      → attempt_count >= max_attempts 后置入；terminal，不再被 claim
+```
+
+Fencing：`lease_token` 是 claim 写入的 fencing token。所有
+`renew` / `mark_published` / `mark_failed` / `mark_dead_letter` 都必须携带并匹配
+该 token（`WHERE id + status=PROCESSING + lease_token`）。持有 stale token 的旧
+worker（其租约已被回收）匹配 0 行 → 被拒绝。正常长时间执行在每次成功 renewal
+时把 `locked_at` 重置为 renewal 时刻；worker 崩溃停止 renewal 后，
+`last locked_at + lease_timeout` 一到消息即可被其它 worker 回收。
 
 约束：
 
 ```text
 UNIQUE(event_id, destination)
+CHECK (status IN ('PENDING','PROCESSING','PUBLISHED','FAILED','DEAD_LETTER'))
 ```
 
 主要索引：
@@ -814,6 +867,9 @@ UNIQUE(event_id, destination)
 ```text
 (status, available_at)
 WHERE status IN ('PENDING', 'FAILED')
+
+(status, locked_at)
+WHERE status = 'PROCESSING'     # 过期租约回收
 ```
 
 ---

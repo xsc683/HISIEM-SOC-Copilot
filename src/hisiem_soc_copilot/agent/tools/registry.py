@@ -1,8 +1,14 @@
 """Tool Registry — the deterministic read-only allowlist.
 
-V1 only registers READ_ONLY tools (investigation-tool-contract.md §3). The model
-can never select an unregistered name. ``hisiem.get_alert_context`` is system-
-controlled (used by the graph hydrate node, never offered to the model).
+V1 only registers READ_ONLY tools (investigation-tool-contract.md §3), and the
+registry's model-selectable surface is EXACTLY the set the executor actually
+implements. ``hisiem.get_alert_context`` is system-controlled (the graph hydrate
+node calls the HISIEM get_alert directly) and is never offered to the model.
+
+Spec-defined but NOT-yet-implemented tools (entity activity, threat-intel,
+knowledge lookups) are cataloged separately (``FUTURE_CATALOG_TOOLS``) purely as
+documentation — they are NOT registered, so the model can never select a tool with
+no executor, schema, or policy backing it.
 """
 
 from __future__ import annotations
@@ -14,11 +20,19 @@ ToolCapability = Literal["READ_ONLY"]
 
 SYSTEM_CONTROLLED_TOOL = "hisiem.get_alert_context"
 
+# Exactly the tools the ToolExecutor implements (investigation-tool-contract.md §6).
 AGENT_SELECTABLE_TOOLS: frozenset[str] = frozenset(
     {
         "hisiem.search_events",
-        "hisiem.get_entity_activity",
         "hisiem.get_detection_rule",
+    }
+)
+
+# Spec'd but not-yet-implemented read tools. Kept as documentation/catalog only —
+# never registered, so a model can never select a tool without a real executor.
+FUTURE_CATALOG_TOOLS: frozenset[str] = frozenset(
+    {
+        "hisiem.get_entity_activity",
         "threat_intel.lookup_ip",
         "knowledge.retrieve_security_guidance",
         "knowledge.resolve_attack_technique",
@@ -66,8 +80,25 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {
-            name: ToolSpec(name=name, description=_tool_description(name))
-            for name in _REGISTERED_TOOLS
+            "hisiem.search_events": ToolSpec(
+                name="hisiem.search_events",
+                description=(
+                    "Search HISIEM events over a bounded window/conditions."
+                ),
+            ),
+            "hisiem.get_detection_rule": ToolSpec(
+                name="hisiem.get_detection_rule",
+                description=(
+                    "Context for a detection rule referenced by the alert."
+                ),
+            ),
+            SYSTEM_CONTROLLED_TOOL: ToolSpec(
+                name=SYSTEM_CONTROLLED_TOOL,
+                description=(
+                    "Authoritative alert context (system-controlled, not model-selectable)."
+                ),
+                model_selectable=False,
+            ),
         }
 
     def is_registered(self, tool_name: str) -> bool:
@@ -88,17 +119,3 @@ class ToolRegistry:
             for spec in self._tools.values()
             if spec.model_selectable
         )
-
-
-def _tool_description(name: str) -> str:
-    return {
-        "hisiem.get_alert_context": (
-            "Authoritative alert context (system-controlled, not model-selectable)."
-        ),
-        "hisiem.search_events": "Search HISIEM events over a bounded window/conditions.",
-        "hisiem.get_entity_activity": "Bounded activity for a known entity (IP/USER/HOST).",
-        "hisiem.get_detection_rule": "Context for a detection rule referenced by the alert.",
-        "threat_intel.lookup_ip": "External IP reputation lookup.",
-        "knowledge.retrieve_security_guidance": "Retrieve bounded security guidance.",
-        "knowledge.resolve_attack_technique": "Resolve a MITRE ATT&CK technique reference.",
-    }.get(name, "")

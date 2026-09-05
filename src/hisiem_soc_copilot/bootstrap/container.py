@@ -165,7 +165,7 @@ class Container:
         if self.hisiem_adapter is None:
             raise RuntimeError("container must be opened before use")
         return InvestigationCommandHandler(
-            unit_of_work=self.unit_of_work(),
+            unit_of_work_factory=self.unit_of_work_factory(),
             hisiem=self.hisiem_adapter,
             budget_limits=_budget_limits(self.settings),
         )
@@ -189,6 +189,7 @@ def _budget_limits(settings: Settings) -> BudgetLimits:
     return BudgetLimits(
         max_steps=b.max_steps,
         max_tool_calls=b.max_tool_calls,
+        max_llm_calls=b.max_llm_calls,
         max_llm_tokens=b.max_llm_tokens,
         max_duration_seconds=b.max_duration_seconds,
     )

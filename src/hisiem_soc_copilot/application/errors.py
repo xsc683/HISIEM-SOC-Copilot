@@ -11,6 +11,37 @@ class ApplicationError(Exception):
     code = "APPLICATION_ERROR"
 
 
+class IdempotencyConflictError(ApplicationError):
+    """Raised when an Idempotency-Key is reused for a DIFFERENT business request.
+
+    Same key must always mean the same logical operation; binding it to a different
+    source_alert_ref is a deterministic conflict (never a silent wrong replay).
+    """
+
+    code = "IDEMPOTENCY_CONFLICT"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class CommandReceiptConflictError(ApplicationError):
+    """Infrastructure-translated marker for a command_receipt scoped-unique conflict.
+
+    Raised by the UnitOfWork commit when the ``(tenant_id, command_type,
+    idempotency_key)`` unique constraint is violated by a CONCURRENT same-key
+    request. The investigation handler resolves it deterministically (reload the
+    winning receipt → same request: return the original aggregate; different
+    request: raise IdempotencyConflictError). It is caught before it can ever leak
+    to HTTP; mapping it to 409 here is a defensive backstop so a bug can never
+    surface a raw IntegrityError → 500.
+    """
+
+    code = "COMMAND_RECEIPT_CONFLICT"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class NotFoundError(ApplicationError):
     """Raised when a requested aggregate/read model does not exist."""
 
@@ -44,6 +75,8 @@ def to_http_error(exc: BaseException) -> tuple[int, str, str]:
     """
     if isinstance(exc, NotFoundError):
         return 404, exc.code, exc.args[0] if exc.args else "not found"
+    if isinstance(exc, (IdempotencyConflictError, CommandReceiptConflictError)):
+        return 409, exc.code, exc.args[0] if exc.args else "idempotency conflict"
     if isinstance(exc, DomainError):
         if exc.code == "UNTRUSTED_REQUEST":
             # Authentication/authorization boundary failures are 403, not client 400.

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from ...application.ports.durable import ToolInvocationRecord
 from ...application.ports.unit_of_work import UnitOfWork
@@ -31,15 +31,23 @@ async def record_started(
     *,
     tenant_id: str,
     investigation_id: UUID,
+    invocation_id: UUID,
     tool_name: str,
     idempotency_key: str,
     arguments: dict[str, Any],
     provider_request_id: str | None = None,
 ) -> None:
+    """Insert a RUNNING audit row with a STABLE invocation id.
+
+    ``invocation_id`` is the single identity that threads through the audit row
+    (``tool_invocation.id``), the executor's ``tool_call_id``, and
+    ``Evidence.source_tool_invocation_id``. It is deterministic for a given
+    (investigation, tool, candidate) so a crashed/replayed node reuses the same id.
+    """
     await uow.tool_invocations.add_started(
         tenant_id=tenant_id,
         record=ToolInvocationRecord(
-            id=uuid4(),
+            id=invocation_id,
             investigation_id=investigation_id,
             tool_name=tool_name,
             idempotency_key=idempotency_key,

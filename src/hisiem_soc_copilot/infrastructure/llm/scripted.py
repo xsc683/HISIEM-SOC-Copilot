@@ -11,7 +11,7 @@ only the candidate content the port allows.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from ...application.ports.model_provider import (
     AssessRequest,
@@ -19,8 +19,10 @@ from ...application.ports.model_provider import (
     PlanRequest,
 )
 from ...contracts.llm.types import (
+    AssessmentEvidenceRelation,
     AssessmentSummary,
     FindingCandidate,
+    HypothesisAssessmentCandidate,
     InvestigationPlan,
     NextStep,
     PlanStep,
@@ -28,6 +30,16 @@ from ...contracts.llm.types import (
 )
 
 _DEFAULT_GOAL = "Determine whether the SSH brute force escalated into a compromise"
+
+_RelationLiteral = Literal["SUPPORTS", "CONTRADICTS", "CONTEXT"]
+_ASSESS_RELATIONS: frozenset[str] = frozenset({"SUPPORTS", "CONTRADICTS", "CONTEXT"})
+
+
+def _relation_literal(value: str) -> _RelationLiteral:
+    """Normalize a scripted relation string to the contract Literal."""
+    if value in ("SUPPORTS", "CONTRADICTS", "CONTEXT"):
+        return value  # type: ignore[return-value]
+    return "CONTEXT"
 
 
 class ScriptedModelProvider:
@@ -60,6 +72,11 @@ class ScriptedModelProvider:
         else:
             self._final_decide = {"decision": "FINALIZE"}
         self._findings: list[str] = list(script.get("findings") or [])
+        # Structured per-hypothesis assessment script: {hypothesis_id: {status,
+        # reason, evidence_relations: [{evidence_id, relation}]}}.
+        self._assess_script: dict[str, dict[str, Any]] = dict(
+            script.get("assess") or {}
+        )
         self._verdict: dict[str, Any] = dict(
             script.get("verdict")
             or {
@@ -102,9 +119,33 @@ class ScriptedModelProvider:
 
     async def assess(self, request: AssessRequest) -> AssessmentSummary:
         self.calls.append("assess")
+        # Build a per-hypothesis structured assessment. The model grounds each
+        # hypothesis it assesses on evidence ids it was given; an unscripted
+        # hypothesis is left UNRESOLVED (never auto-supported).
+        assessments: list[HypothesisAssessmentCandidate] = []
+        for hyp in request.hypotheses:
+            hyp_id = str(hyp.get("id", ""))
+            scripted = self._assess_script.get(hyp_id)
+            if scripted is None:
+                continue  # the model produced no assessment for this hypothesis
+            relations = [
+                AssessmentEvidenceRelation(
+                    evidence_id=str(rel.get("evidence_id", "")),
+                    relation=_relation_literal(str(rel.get("relation", "CONTEXT"))),
+                )
+                for rel in scripted.get("evidence_relations") or []
+            ]
+            assessments.append(
+                HypothesisAssessmentCandidate(
+                    hypothesis_id=hyp_id,
+                    status=scripted.get("status", "UNRESOLVED"),
+                    reason_summary=str(scripted.get("reason") or "evidence-based assessment"),
+                    evidence_relations=relations,
+                )
+            )
         return AssessmentSummary(
             decision="FINALIZE",
-            reason="evidence review complete",
+            assessments=assessments,
             findings=[FindingCandidate(statement=f) for f in self._findings],
         )
 

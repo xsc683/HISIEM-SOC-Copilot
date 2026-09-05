@@ -106,7 +106,9 @@ async def run_idempotent_command[T](
         command_type=command_type,
         command_id=command_id,
     )
-    if await uow.command_receipts.exists(idempotency_key=key):
+    if await uow.command_receipts.exists(
+        tenant_id=tenant_id, command_type=command_type, idempotency_key=key
+    ):
         return await replay(investigation)
 
     outcome = await apply(investigation)

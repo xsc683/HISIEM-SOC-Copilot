@@ -63,11 +63,42 @@ class NextStep:
 
 
 @dataclass(frozen=True)
+class AssessmentEvidenceRelation:
+    """A semantic evidence↔hypothesis relation produced by the model (candidate).
+
+    ``evidence_id`` is the evidence's UUID; the relation is the model's judgment of
+    how that specific evidence bears on the specific hypothesis. The model may ONLY
+    cite evidence ids that exist in this investigation (schema validation + same-
+    investigation resolution reject anything else). Rule metadata or mere context
+    evidence is expressed as ``CONTEXT`` and must never be the sole ground for a
+    SUPPORTED/CONTRADICTED verdict.
+    """
+
+    evidence_id: str
+    relation: Literal["SUPPORTS", "CONTRADICTS", "CONTEXT"]
+
+
+@dataclass(frozen=True)
+class HypothesisAssessmentCandidate:
+    """The model's assessment of ONE hypothesis (structured, evidence-grounded).
+
+    status / relations are candidate semantics — the application layer validates
+    that the hypothesis belongs to the investigation and that every cited evidence
+    id resolves to evidence in the SAME investigation before persisting.
+    """
+
+    hypothesis_id: str
+    status: Literal["SUPPORTED", "CONTRADICTED", "UNRESOLVED"]
+    reason_summary: str
+    evidence_relations: list[AssessmentEvidenceRelation] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class AssessmentSummary:
-    """Whether evidence so far supports/contradicts/resolves the plan."""
+    """Per-hypothesis structured assessment of the evidence gathered so far."""
 
     decision: Literal["CONTINUE", "FINALIZE"]
-    reason: str
+    assessments: list[HypothesisAssessmentCandidate] = field(default_factory=list)
     findings: list[FindingCandidate] = field(default_factory=list)
     unresolved_evidence_gaps: list[str] = field(default_factory=list)
 

@@ -21,6 +21,7 @@ from ...domain.investigation.enums import (
     InvestigationPhase,
     VerdictDisposition,
 )
+from ...domain.investigation.value_objects import ExternalResourceRef
 
 CommandSource = Literal["USER", "ORCHESTRATOR", "SYSTEM"]
 
@@ -40,12 +41,15 @@ class _CommandBase:
 class StartAlertInvestigation:
     """Create (or return existing active) Investigation for one HISIEM Alert.
 
-    ``tenant_id`` and ``initiated_by`` are populated by the authenticated request
-    context (never from the request body / model).
+    ``source_alert_ref`` is the full external resource reference from the request:
+    ``provider`` must be ``hisiem`` and ``resource_type`` must be ``alert`` (V1
+    contract); ``address_id`` is what the HISIEM API actually uses to address the
+    alert. ``tenant_id`` and ``initiated_by`` are populated by the authenticated
+    request context (never from the request body / model).
     """
 
     tenant_id: str
-    source_alert_id: str
+    source_alert_ref: ExternalResourceRef
     initiated_by_subject: str
     initiated_by_display_name: str | None = None
     command_id: UUID = field(default_factory=uuid4)
@@ -154,7 +158,7 @@ class HypothesisAssessmentCandidate:
     hypothesis_id: UUID
     status: str
     reason_summary: str
-    evidence_relations: list[AssessmentEvidenceRelation]
+    evidence_relations: list[AssessmentEvidenceRelation] = field(default_factory=list)
 
 
 @dataclass(frozen=True, kw_only=True)

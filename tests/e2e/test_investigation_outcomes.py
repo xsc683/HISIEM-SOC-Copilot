@@ -70,8 +70,79 @@ def _start(
     return uows, inv
 
 
+class _OutcomeGroundedModel(ScriptedModelProvider):
+    """Scripted model whose assess grounds hypotheses + findings on real evidence.
+
+    ``findings`` are emitted ONLY with a real evidence citation (found by matching
+    ``summary`` against ``marker``), so a MALICIOUS/BENIGN disposition has the
+    grounded Finding the domain rules require before finalizing.
+    """
+
+    def __init__(
+        self, *, script: dict[str, Any], marker: str = "authentication_success"
+    ) -> None:
+        super().__init__(script=script)
+        self._marker = marker
+
+    async def assess(self, request: Any) -> Any:
+        from hisiem_soc_copilot.contracts.llm.types import (
+            AssessmentEvidenceRelation,
+            AssessmentSummary,
+            FindingCandidate,
+            HypothesisAssessmentCandidate,
+        )
+
+        evidence = request.evidence or []
+        match_id = next(
+            (
+                str(e["id"])
+                for e in evidence
+                if e.get("operation") == "search_events"
+                and self._marker in str(e.get("summary", ""))
+            ),
+            None,
+        )
+        assessments = []
+        for hyp in request.hypotheses or []:
+            if match_id:
+                assessments.append(
+                    HypothesisAssessmentCandidate(
+                        hypothesis_id=str(hyp["id"]),
+                        status="UNRESOLVED",
+                        reason_summary="evidence observed; verdict driven by findings",
+                        evidence_relations=[
+                            AssessmentEvidenceRelation(
+                                evidence_id=match_id, relation="CONTEXT"
+                            )
+                        ],
+                    )
+                )
+            else:
+                assessments.append(
+                    HypothesisAssessmentCandidate(
+                        hypothesis_id=str(hyp["id"]),
+                        status="UNRESOLVED",
+                        reason_summary="no matching evidence",
+                    )
+                )
+        findings = []
+        if match_id:
+            findings.append(
+                FindingCandidate(
+                    statement=(self._findings or ["observed evidence"])[0],
+                    evidence_citations=[match_id],
+                )
+            )
+        return AssessmentSummary(
+            decision="FINALIZE", assessments=assessments, findings=findings
+        )
+
+
 async def _run(
-    script: dict[str, Any], hisiem: FakeHisiem | None = None
+    script: dict[str, Any],
+    hisiem: FakeHisiem | None = None,
+    *,
+    model: ScriptedModelProvider | None = None,
 ) -> tuple[Investigation, InvestigationResult | None]:
     """Start RUNNING, compile the graph with the given script, and run to END."""
     uows, inv = _start(tenant_id="tenant-a")
@@ -83,7 +154,7 @@ async def _run(
     await uow.commit()
 
     hisiem = hisiem or FakeHisiem(alert_id="alert-x")
-    model = ScriptedModelProvider(script=script)
+    model = model or ScriptedModelProvider(script=script)
     runtime = GraphRuntime(
         uow_factory=uows,
         workflow_handler=InvestigationWorkflowHandler(unit_of_work_factory=uows),
@@ -127,7 +198,9 @@ async def test_inconclusive_when_no_evidence_and_model_finalizes() -> None:
 
 
 async def test_benign_when_success_needed_but_absent() -> None:
-    # The model looks for success, finds only failures, then FINALIZEs BENIGN.
+    # The model looks for success, finds only failures, then FINALIZEs BENIGN. The
+    # Finding is grounded on the observed event evidence (required before a BENIGN
+    # disposition may be finalized).
     script = {
         "plan_steps": {"search": "Search for a successful login"},
         "decide": [
@@ -156,7 +229,8 @@ async def test_benign_when_success_needed_but_absent() -> None:
             "confidence": 0.8,
         },
     }
-    completed, result = await _run(script)
+    model = _OutcomeGroundedModel(script=script, marker="authentication_success")
+    completed, result = await _run(script, model=model)
     assert result is not None
     assert result.verdict.disposition.value == "BENIGN"
 

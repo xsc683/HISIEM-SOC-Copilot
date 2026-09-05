@@ -45,10 +45,17 @@ class ActorRef:
 
 @dataclass(frozen=True)
 class BudgetLimits:
-    """Autonomy budget bounds applied to an investigation run."""
+    """Autonomy budget bounds applied to an investigation run.
+
+    These are the RUNTIME authority bounds the graph deterministically enforces.
+    ``max_llm_tokens`` is reserved for a real provider's token accounting (no fake
+    accounting is done today); ``max_llm_calls`` is the deterministically enforced
+    LLM-call ceiling in this round.
+    """
 
     max_steps: int = 20
     max_tool_calls: int = 30
+    max_llm_calls: int = 20
     max_llm_tokens: int = 20_000
     max_duration_seconds: int = 600
 
@@ -56,6 +63,7 @@ class BudgetLimits:
         return {
             "max_steps": self.max_steps,
             "max_tool_calls": self.max_tool_calls,
+            "max_llm_calls": self.max_llm_calls,
             "max_llm_tokens": self.max_llm_tokens,
             "max_duration_seconds": self.max_duration_seconds,
         }
