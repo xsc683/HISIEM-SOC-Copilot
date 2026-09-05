@@ -160,6 +160,33 @@ class AuthSettings(BaseSettings):
     trusted_context_provider: Literal["none", "header"] = "none"
 
 
+class EvaluationSettings(BaseSettings):
+    """GP-01 evaluation dataset materializer settings (E1-B.3/E1-B.4).
+
+    Safe defaults only — never secrets. The HISIEM control surface (base_url /
+    bearer token) is reused from :class:`HisiemSettings`; these settings only
+    cover the SSH TCP injection target and the local run-artifact directory.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="EVAL_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    # The SSH TCP syslog input the materializer writes to (E1-B.3 §2).
+    ssh_tcp_host: str = "127.0.0.1"
+    ssh_tcp_port: int = 5007
+    # Evaluation tenant id (the materializer resolves within this tenant).
+    tenant_id: str = "default"
+    # Directory holding mutable materialization.json + sealed manifest.json.
+    runs_dir: str = ".eval-runs"
+    # Bounded resolution deadline for event/alert polling (seconds).
+    resolve_deadline_seconds: int = 300
+    # Poll interval while waiting for events/alerts to appear (seconds).
+    poll_interval: float = 2.0
+
+
 class Settings(BaseSettings):
     """Aggregate settings root for Composition Root wiring."""
 
@@ -172,6 +199,7 @@ class Settings(BaseSettings):
     agent_budget: AgentBudgetSettings = Field(default_factory=AgentBudgetSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
+    evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
     app: ApplicationSettings = Field(default_factory=ApplicationSettings)
 
 

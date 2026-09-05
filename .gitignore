@@ -13,6 +13,9 @@ dist/
 # Environment
 .env
 
+# GP-01 evaluation run artifacts (mutable ledger + sealed manifest)
+.eval-runs/
+
 # IDE
 .idea/
 .vscode/
