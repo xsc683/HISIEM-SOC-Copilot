@@ -552,3 +552,113 @@ async def test_decide_candidate_passes_search_events_parser() -> None:
     # Keep the assertion on the search candidate path by checking evidence appeared.
     # (At least one decide request carried the bounded evidence context.)
     assert any_with_evidence
+
+
+async def test_decide_receives_bounded_evidence_of_this_investigation_only() -> None:
+    """The decide working context stays bounded AND tenant/investigation-isolated:
+    a decide request for investigation A never carries another investigation's
+    evidence, and never more than MAX_DECIDE_EVIDENCE_ITEMS rows even when A has
+    accumulated far more."""
+    from datetime import UTC, datetime, timedelta
+
+    from hisiem_soc_copilot.application.ports.model_provider import (
+        MAX_DECIDE_EVIDENCE_ITEMS,
+        MAX_DECIDE_EVIDENCE_SUMMARY_CHARS,
+    )
+    from hisiem_soc_copilot.domain.investigation.entities import Evidence, EvidenceSource
+    from hisiem_soc_copilot.domain.investigation.enums import EvidenceSourceType
+
+    uows, inv = _start(tenant_id="tenant-a")
+    uow = uows()
+    await uow.investigations.add(inv)
+    await uow.commit()
+    inv.start(actor=inv.initiated_by)
+    await uow.investigations.update(inv)
+    await uow.commit()
+
+    # A second investigation (same tenant) — its evidence must never leak into
+    # investigation A's decide working context.
+    other = Investigation.create(
+        id=uuid4(),
+        tenant_id="tenant-a",
+        source_alert_ref=ExternalResourceRef(
+            provider="hisiem", resource_type="alert", address_id="alert-other"
+        ),
+        initiated_by=ActorRef(subject_id="analyst", tenant_id="tenant-a"),
+        budget_limits=BudgetLimits(),
+    )
+    await uow.investigations.add(other)
+    await uow.commit()
+
+    now = datetime.now(UTC)
+
+    async def _seed(target: Investigation, count: int, prefix: str) -> None:
+        for i in range(count):
+            await uow.evidence.add(
+                Evidence(
+                    id=uuid4(),
+                    investigation_id=target.id,
+                    source=EvidenceSource(
+                        type=EvidenceSourceType.HISIEM_EVENT,
+                        provider="hisiem",
+                        operation="authentication_success",
+                    ),
+                    collected_at=now - timedelta(minutes=count - i),
+                    observation={},
+                    summary=f"{prefix}-{i}",
+                )
+            )
+
+    await _seed(inv, 60, "a")  # far more than the item cap
+    await _seed(other, 5, "other")
+    await uow.commit()
+
+    script = {
+        "plan_steps": {"search": "Search for a successful login"},
+        "decide": [{"decision": "FINALIZE"}],
+        "findings": [],
+        "verdict": {
+            "disposition": "INCONCLUSIVE",
+            "summary": "x",
+            "confidence": 0.2,
+            "uncertainty": "no decisive evidence",
+        },
+    }
+    spy = _DecideSpyModel(script=script)
+    hisiem = FakeHisiem(alert_id="alert-x")
+    runtime = GraphRuntime(
+        uow_factory=uows,
+        workflow_handler=InvestigationWorkflowHandler(unit_of_work_factory=uows),
+        model=spy,
+        executor=ToolExecutor(hisiem=hisiem),
+        normalizer=EvidenceNormalizer(),
+        registry=ToolRegistry(),
+        hisiem=hisiem,
+        tenant_id="tenant-a",
+    )
+    graph = build_investigation_graph(runtime)
+    await graph.ainvoke(
+        {"investigation_id": str(inv.id)}, thread_config(str(inv.id))
+    )
+
+    a_ids = {
+        str(row.id)
+        for row in await uow.evidence.list_by_investigation(
+            tenant_id="tenant-a", investigation_id=inv.id
+        )
+    }
+    other_ids = {
+        str(row.id)
+        for row in await uow.evidence.list_by_investigation(
+            tenant_id="tenant-a", investigation_id=other.id
+        )
+    }
+    assert spy.decide_requests
+    for request in spy.decide_requests:
+        assert len(request.evidence) <= MAX_DECIDE_EVIDENCE_ITEMS
+        for entry in request.evidence:
+            assert entry["evidence_id"] in a_ids  # never another investigation's row
+            assert entry["evidence_id"] not in other_ids
+            assert len(str(entry["summary"])) <= MAX_DECIDE_EVIDENCE_SUMMARY_CHARS
+    # 60 rows were persisted; the model context stayed under the item cap.
+    assert len(a_ids) >= 60

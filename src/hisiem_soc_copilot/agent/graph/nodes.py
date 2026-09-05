@@ -55,6 +55,7 @@ from ...application.ports.model_provider import (
     DecideNextRequest,
     PlanRequest,
     PreviousToolOutcome,
+    select_decide_evidence_context,
 )
 from ...contracts.llm.errors import (
     ModelConfigurationError,
@@ -436,11 +437,11 @@ async def decide_next(
     # Build the bounded working context from authoritative sources — a SHORT read
     # transaction that is CLOSED before the model consult (no DB transaction spans
     # the provider HTTP call). The model receives only bounded fields: real
-    # rule_id/detected_at/entity from the alert snapshot + persisted Evidence
-    # (evidence_id + operation + bounded summary) of THIS investigation — never raw
-    # ToolResults/Events, tenant/authorization data, or secrets.
-    evidence_ids: list[str] = []
-    evidence_context: list[dict[str, object]] = []
+    # rule_id/detected_at/entity from the alert snapshot + a BOUNDED, deterministic
+    # selection of this Investigation's persisted Evidence (evidence_id + operation
+    # + summary within the item/char budget) — never raw ToolResults/Events,
+    # tenant/authorization data, or secrets. Tenant + investigation scoping happens
+    # in this read; the pure selector bounds only the rows it is given.
     uow = runtime.new_unit_of_work()
     try:
         evidence_rows = await uow.evidence.list_by_investigation(
@@ -448,15 +449,8 @@ async def decide_next(
         )
     finally:
         await uow.close()
-    for ev in evidence_rows:
-        evidence_ids.append(str(ev.id))
-        evidence_context.append(
-            {
-                "evidence_id": str(ev.id),
-                "operation": ev.source.operation,
-                "summary": _evidence_line(ev),
-            }
-        )
+    evidence_context = select_decide_evidence_context(evidence_rows)
+    evidence_ids = [str(entry["evidence_id"]) for entry in evidence_context]
     alert_context = _decide_alert_context(dict(state.get("alert_context") or {}))
 
     # A provider outage/refusal degrades to a bounded finalize (converge) — never a

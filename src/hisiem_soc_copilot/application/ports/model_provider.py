@@ -11,6 +11,7 @@ be interpreted. Inputs are bounded working context objects; secrets never flow i
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Protocol
 
 from ...contracts.llm.types import (
@@ -20,6 +21,7 @@ from ...contracts.llm.types import (
     VerdictCandidate,
 )
 from ...contracts.tools.types import ModelToolSpec
+from ...domain.investigation.entities import Evidence
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,104 @@ class DecideNextRequest:
     # Bounded persisted evidence of THIS investigation: {evidence_id, operation,
     # summary} — never raw ToolResults/Events/full event.original/credentials.
     evidence: list[dict[str, object]] = field(default_factory=list)
+
+
+# Bounded deterministic working-context budget for DecideNextRequest.evidence.
+# Each summary is bounded on its own, but the COUNT of evidence rows appended is
+# not — a long-running investigation could hand the model an unbounded prompt.
+# All THREE limits apply at once: item count, total characters, and per-item
+# summary length. The selection is pure + deterministic (see
+# select_decide_evidence_context) so a given investigation always yields the same
+# bounded working context, independent of repository insertion order.
+MAX_DECIDE_EVIDENCE_ITEMS = 40
+MAX_DECIDE_EVIDENCE_TOTAL_CHARS = 12000
+MAX_DECIDE_EVIDENCE_SUMMARY_CHARS = 250
+
+
+def _bounded_evidence_summary(evidence: Evidence, limit: int) -> str:
+    """The single summary the model actually sees — never longer than ``limit``.
+
+    Truncation keeps the ellipsis inside the cap, so ``len(result) <= limit``
+    strictly matches the working-context budget (no hidden +1 for the marker).
+    """
+    line = evidence.summary or str(evidence.observation)
+    text = str(line).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def select_decide_evidence_context(
+    evidence_rows: list[Evidence],
+) -> list[dict[str, object]]:
+    """Deterministically bound persisted Evidence into the decide working context.
+
+    Returns newest-first-selected, chronologically-ordered ``{evidence_id,
+    operation, summary}`` entries within BOTH the item and total-character budget,
+    each summary bounded to MAX_DECIDE_EVIDENCE_SUMMARY_CHARS. Only bounded fields
+    ever reach the model — never raw ToolResults/Events/observation JSON. Selection
+    is deterministic and reproducible: sort the FULL list by newest collected time
+    (tie-broken by id), take newest-first within the caps, then restore
+    chronological order for the prompt. This is a pure selection over the rows it
+    is given — tenant/investigation scoping happens in the caller's repository
+    read, never here.
+    """
+    if not evidence_rows:
+        return []
+    # Deterministic newest-first over the FULL list (never trust insertion order).
+    ordered = sorted(
+        evidence_rows,
+        key=lambda e: (
+            _collected_timestamp(e),
+            str(e.id),
+        ),
+        reverse=True,
+    )
+    kept: list[Evidence] = []
+    total_chars = 0
+    for evidence in ordered:
+        summary = _bounded_evidence_summary(
+            evidence, MAX_DECIDE_EVIDENCE_SUMMARY_CHARS
+        )
+        if len(kept) >= MAX_DECIDE_EVIDENCE_ITEMS:
+            break
+        if total_chars > 0 and total_chars + len(summary) > MAX_DECIDE_EVIDENCE_TOTAL_CHARS:
+            break
+        total_chars += len(summary)
+        kept.append(evidence)
+    kept.sort(key=lambda e: (_collected_timestamp(e), str(e.id)))  # chronological
+    return [
+        {
+            "evidence_id": str(evidence.id),
+            "operation": evidence.source.operation,
+            "summary": _bounded_evidence_summary(
+                evidence, MAX_DECIDE_EVIDENCE_SUMMARY_CHARS
+            ),
+        }
+        for evidence in kept
+    ]
+
+
+def _collected_timestamp(evidence: Evidence) -> float:
+    """Floating epoch for deterministic ordering (never reversed by tz/naive mix)."""
+    dt = evidence.collected_at
+    try:
+        if dt.tzinfo is not None:
+            return dt.timestamp()
+    except (OverflowError, OSError, ValueError):
+        pass
+    return _naive_epoch(dt)
+
+
+def _naive_epoch(dt: datetime) -> float:
+    try:
+        return dt.replace(tzinfo=UTC).timestamp()
+    except (OverflowError, OSError, ValueError):
+        # datetime.min/max outside the platform epoch range (e.g. Windows) — the
+        # caller always persists real collected_at values, so this only guards an
+        # artificial boundary. Fall back to a plain ordinal so ordering stays
+        # stable and total.
+        return float(dt.toordinal())
 
 
 @dataclass(frozen=True)
