@@ -102,7 +102,9 @@ Typed settings live in `config.py` (pydantic-settings). Key env vars (see `.env.
 | `COPILOT_DATABASE_URL` | SQLAlchemy async URL for the `copilot` schema |
 | `LANGGRAPH_DATABASE_URL` | psycopg URL for the `langgraph_checkpoint` schema (`options=-csearch_path=...`) |
 | `HISIEM_BASE_URL` | HISIEM control API base URL |
-| `LLM_PROVIDER` | `null` in V1 (no real provider calls yet) |
+| `LLM_PROVIDER` | `scripted` (default, offline) or `openai_compatible` (Command Code API) |
+| `LLM_MODEL` | model name sent to the provider (`deepseek/deepseek-v4-flash`) |
+| `CMD_API_KEY` | API key env var read by the real provider (never a config default) |
 | `AGENT_MAX_STEPS` etc. | Agent autonomy budget bounds |
 
 ## API surface (V1 skeleton)

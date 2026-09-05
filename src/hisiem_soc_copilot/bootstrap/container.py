@@ -93,21 +93,39 @@ class Container:
     ) -> AsyncInvestigationGraphRunner:
         """Build the durable runner that executes one investigation's graph.
 
-        ``hisiem`` / ``model`` default to the real HISIEM HTTP adapter and the
-        deterministic scripted model; tests inject fakes to run the graph without
-        a live HISIEM.
+        ``hisiem`` defaults to the real HISIEM HTTP adapter; ``model`` defaults to
+        the provider selected by ``llm.provider`` (scripted for tests/offline, the
+        real OpenAI-compatible Command Code adapter when configured). Tests inject
+        fakes to run the graph without a live HISIEM or model API.
         """
         from ..agent.evidence.normalizer import EvidenceNormalizer
         from ..agent.graph.builder import build_investigation_graph
         from ..agent.graph.runtime import GraphRuntime
         from ..agent.tools.executor import ToolExecutor
         from ..agent.tools.registry import ToolRegistry
+        from ..infrastructure.llm.openai_compatible import OpenAICompatibleModelProvider
         from ..infrastructure.llm.scripted import ScriptedModelProvider
 
         uow_factory = self.unit_of_work_factory()
         workflow_handler = self.investigation_workflow_handler()
         hisiem_adapter = hisiem if hisiem is not None else self.hisiem()
-        model_provider = model if model is not None else ScriptedModelProvider()
+        model_provider = model
+        if model_provider is None:
+            # Provider selection lives ONLY in config/bootstrap/container — the graph
+            # never branches on the provider name.
+            llm = self.settings.llm
+            if llm.provider == "openai_compatible":
+                model_provider = OpenAICompatibleModelProvider(
+                    base_url=llm.base_url,
+                    model=llm.model,
+                    api_key_env=llm.api_key_env,
+                    timeout_seconds=llm.timeout_seconds,
+                    max_retries=llm.max_retries,
+                    zdr=llm.zdr,
+                    structured_output_mode=llm.structured_output_mode,
+                )
+            else:
+                model_provider = ScriptedModelProvider()
 
         def _runtime(tenant_id: str) -> GraphRuntime:
             return GraphRuntime(

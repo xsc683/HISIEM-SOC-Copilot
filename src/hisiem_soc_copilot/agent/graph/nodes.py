@@ -27,6 +27,7 @@ evidence.
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable
 from typing import Any
 from uuid import UUID
 
@@ -54,13 +55,17 @@ from ...application.ports.model_provider import (
     PlanRequest,
     PreviousToolOutcome,
 )
+from ...contracts.llm.errors import (
+    ModelConfigurationError,
+    ModelProviderError,
+)
 from ...contracts.llm.types import (
     FindingCandidate as ModelFindingCandidate,
 )
 from ...contracts.llm.types import (
     HypothesisAssessmentCandidate as ModelAssessmentCandidate,
 )
-from ...contracts.llm.types import NextStep, PlanStep
+from ...contracts.llm.types import PlanStep
 from ...contracts.tools.types import ToolCandidate
 from ...domain.investigation.content import compute_content_hash
 from ...domain.investigation.entities import Evidence
@@ -100,6 +105,24 @@ def _inv_key(inv_id: UUID, suffix: str) -> str:
     (application-commands...md §5).
     """
     return f"investigation:{inv_id}:{suffix}"
+
+
+async def _model_consult(coro: Awaitable[Any]) -> Any | None:
+    """Run ONE model consult; degrade deterministically on a provider outage.
+
+    A real model failure (unavailable / timeout / rate-limit / refusal / invalid
+    output) must NOT fail the investigation: the node applies its deterministic
+    fallback (default plan / converge / UNRESOLVED / INCONCLUSIVE) so the run ends
+    COMPLETED + INCONCLUSIVE. ``ModelConfigurationError`` is a deployment bug, not an
+    outage — it re-raises so the operator sees it (never silently defaulted).
+    """
+    try:
+        return await coro
+    except ModelConfigurationError:
+        raise
+    except ModelProviderError:
+        # Outage/refusal/malformed output → deterministic fallback, never FAILED.
+        return None
 
 
 def _deadline_passed(state: InvestigationGraphState) -> bool:
@@ -310,34 +333,35 @@ async def plan(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[st
     )
     budget = RuntimeBudget.from_state(state)
     alert: dict[str, Any] = dict(state.get("alert_context") or {})
-    # The plan consult consumes one LLM-call slot through the single budget
-    # authority. When no slot remains (a degraded replay), a system default plan is
-    # substituted deterministically — never an over-budget model call.
+    # Deterministic default plan: read the detection rule then run one bounded event
+    # search (a safe, useful system default). Used when the model cannot be consulted
+    # (no LLM-call slot / deadline passed) OR when a real model consult fails — an
+    # outage never fails the investigation.
+    plan_steps: list[PlanStep] = [
+        PlanStep(step_id="read_rule", objective=_DEFAULT_PLAN_STEP_RULE),
+        PlanStep(step_id="search_success", objective=_DEFAULT_PLAN_STEP_SEARCH),
+    ]
+    plan_goal = _DEFAULT_PLAN_GOAL
     if budget.can_call_llm():
         budget = budget.consume_llm_call()
-        model_plan = await runtime.model.plan(
-            PlanRequest(
-                investigation_id=_inv_str(state),
-                alert_summary=(
-                    f"{alert.get('title') or 'alert'} "
-                    f"(severity={alert.get('severity') or '?'}, "
-                    f"rule={alert.get('rule_name') or '?'}, "
-                    f"source_ip={alert.get('source_ip') or '?'})"
-                ),
-                tool_names=runtime.registry.model_selectable_names,
+        # A provider outage/refusal/malformed output degrades to the default plan.
+        model_plan = await _model_consult(
+            runtime.model.plan(
+                PlanRequest(
+                    investigation_id=_inv_str(state),
+                    alert_summary=(
+                        f"{alert.get('title') or 'alert'} "
+                        f"(severity={alert.get('severity') or '?'}, "
+                        f"rule={alert.get('rule_name') or '?'}, "
+                        f"source_ip={alert.get('source_ip') or '?'})"
+                    ),
+                    tool_names=runtime.registry.model_selectable_names,
+                )
             )
         )
-        plan_steps = model_plan.steps
-        plan_goal = model_plan.goal
-    else:
-        # Deterministic no-budget plan fallback: read the detection rule then run one
-        # bounded event search (a safe, useful system default; the model is not
-        # consulted).
-        plan_steps = [
-            PlanStep(step_id="read_rule", objective=_DEFAULT_PLAN_STEP_RULE),
-            PlanStep(step_id="search_success", objective=_DEFAULT_PLAN_STEP_SEARCH),
-        ]
-        plan_goal = _DEFAULT_PLAN_GOAL
+        if model_plan is not None:
+            plan_steps = model_plan.steps
+            plan_goal = model_plan.goal
     steps = [
         PlanStepCandidate(step_key=s.step_id, objective=s.objective, ordinal=i)
         for i, s in enumerate(plan_steps)
@@ -408,16 +432,26 @@ async def decide_next(
     budget = budget.consume_llm_call()
     evidence_ids = state.get("new_evidence_ids") or []
     outcome = _previous_outcome_of(state)
-    next_step: NextStep = await runtime.model.decide_next(
-        DecideNextRequest(
-            investigation_id=_inv_str(state),
-            iteration=int(state.get("iteration") or 0),
-            plan_goal="Investigate whether the alert indicates an account compromise",
-            evidence_summary=evidence_ids,
-            tool_names=runtime.registry.model_selectable_names,
-            previous_tool_outcome=outcome,
+    # A provider outage/refusal degrades to a bounded finalize (converge) — never a
+    # FAILED investigation just because the model was unavailable.
+    next_step = await _model_consult(
+        runtime.model.decide_next(
+            DecideNextRequest(
+                investigation_id=_inv_str(state),
+                iteration=int(state.get("iteration") or 0),
+                plan_goal="Investigate whether the alert indicates an account compromise",
+                evidence_summary=evidence_ids,
+                tool_names=runtime.registry.model_selectable_names,
+                previous_tool_outcome=outcome,
+            )
         )
     )
+    if next_step is None:
+        return {
+            "next_action": CONVERGE,
+            "assessment": "FINALIZE",
+            **budget.to_updates(),
+        }
     if (
         next_step.decision == "CONTINUE"
         and next_step.tool_name
@@ -782,18 +816,22 @@ async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[
     if budget.can_call_llm():
         budget = budget.consume_llm_call()
         # Give the model the actual hypothesis ids and per-id evidence so it can
-        # cite them precisely (candidate only — resolution happens below).
-        summary = await runtime.model.assess(
-            AssessRequest(
-                investigation_id=_inv_str(state),
-                hypotheses=[
-                    {"id": str(h.id), "statement": h.statement} for h in hypotheses
-                ],
-                evidence=[
-                    {"id": str(e.id), "summary": _evidence_line(e),
-                     "operation": e.source.operation}
-                    for e in evidence
-                ],
+        # cite them precisely (candidate only — resolution happens below). A
+        # provider outage/refusal degrades: hypotheses stay UNRESOLVED and no
+        # findings are produced (deterministic, never FAILED).
+        summary = await _model_consult(
+            runtime.model.assess(
+                AssessRequest(
+                    investigation_id=_inv_str(state),
+                    hypotheses=[
+                        {"id": str(h.id), "statement": h.statement} for h in hypotheses
+                    ],
+                    evidence=[
+                        {"id": str(e.id), "summary": _evidence_line(e),
+                         "operation": e.source.operation}
+                        for e in evidence
+                    ],
+                )
             )
         )
 
@@ -953,19 +991,25 @@ async def finalize_result(
     handler = runtime.workflow_handler
     budget = RuntimeBudget.from_state(state)
     verdict_candidate = None
+    consult_failed = False
     # The verdict consult never begins without a remaining LLM slot or once the
     # wall-clock deadline has passed: the graph deterministically finalizes the
     # available grounded facts as INCONCLUSIVE (COMPLETED, never FAILED) even when a
     # replay arrives late.
     if budget.can_call_llm():
         budget = budget.consume_llm_call()
-        verdict_candidate = await runtime.model.verdict(
-            AssessRequest(
-                investigation_id=_inv_str(state),
-                evidence_summary=state.get("new_evidence_ids") or [],
-                finding_candidates=[],
+        # A provider outage/refusal/malformed output degrades to INCONCLUSIVE with
+        # low confidence + explicit uncertainty (below) — never FAILED.
+        verdict_candidate = await _model_consult(
+            runtime.model.verdict(
+                AssessRequest(
+                    investigation_id=_inv_str(state),
+                    evidence_summary=state.get("new_evidence_ids") or [],
+                    finding_candidates=[],
+                )
             )
         )
+        consult_failed = verdict_candidate is None
     await handler.change_phase(
         ChangeInvestigationPhase(
             tenant_id=runtime.tenant_id,
@@ -1011,16 +1055,22 @@ async def finalize_result(
             ]
             result_key = _inv_key(inv_id, "result:INCONCLUSIVE")
     else:
-        # Bounded finalize: the verdict model call could not start — either the
-        # wall-clock deadline passed, or no LLM-call slot remained (low-budget
-        # fallback). In both cases the graph deterministically finalizes the
-        # available grounded facts INCONCLUSIVE with a low confidence and a clear
-        # "model-call budget exhausted"-style uncertainty (never FAILED).
+        # Bounded finalize: the verdict model call could not produce a candidate —
+        # the consult never started (deadline/no slot) OR the model call failed
+        # (provider outage/refusal/malformed output). The graph deterministically
+        # finalizes the available grounded facts INCONCLUSIVE with a low confidence
+        # and explicit uncertainty (never FAILED).
         if budget.deadline_exceeded:
             summary = "Investigation stopped at the runtime duration deadline"
             uncertainty = (
                 "The runtime duration deadline was reached before the model could "
                 "render a verdict"
+            )
+        elif consult_failed:
+            summary = "Investigation stopped because the model verdict call failed"
+            uncertainty = (
+                "The model provider did not return a usable verdict (unavailable, "
+                "refused, or invalid output); the investigation converged INCONCLUSIVE"
             )
         else:
             summary = "Investigation stopped before a model verdict was possible"

@@ -64,7 +64,15 @@ class HisiemSettings(BaseSettings):
 
 
 class LLMSettings(BaseSettings):
-    """Model provider settings (V1: no real provider calls yet)."""
+    """Model provider settings.
+
+    V1 default is ``scripted`` (deterministic fake, no network) so the graph and
+    tests run offline. Set ``llm.provider = openai_compatible`` (plus a CMD_API_KEY
+    in the environment) to instantiate the real OpenAI-compatible Command Code
+    adapter. Secrets are read ONLY from the environment variable named by
+    ``api_key_env`` — never from config defaults, git, prompts, domain/checkpoint
+    state, logs, or telemetry.
+    """
 
     model_config = SettingsConfigDict(
         env_prefix="LLM_",
@@ -72,11 +80,19 @@ class LLMSettings(BaseSettings):
         extra="ignore",
     )
 
-    provider: Literal["openai", "compatible", "null"] = "null"
-    model: str = Field(default="gpt-4o-mini")
-    api_key: str = Field(default="")
-    base_url: str | None = None
+    provider: Literal["scripted", "openai_compatible"] = "scripted"
+    model: str = Field(default="deepseek/deepseek-v4-flash")
+    base_url: str = Field(default="https://api.commandcode.ai/provider/v1")
+    # Name of the environment variable holding the API key. The secret itself is
+    # never a config default.
+    api_key_env: str = Field(default="CMD_API_KEY")
     timeout_seconds: float = Field(default=60.0)
+    max_retries: int = Field(default=2, ge=0)
+    # Command Code data-residency/zero-data-retention flag → ``x-cmd-zdr: 1``.
+    zdr: bool = Field(default=True)
+    # structured-output strategy: auto (probe json_schema → json_object → JSON-only),
+    # or pin json_schema / json_object / json_only.
+    structured_output_mode: str = Field(default="auto")
 
 
 class AgentBudgetSettings(BaseSettings):
