@@ -404,6 +404,8 @@ def _source_alert_payload(alert: ResolvedAlert) -> dict[str, Any]:
         payload["entity"] = alert.entity
     if alert.created_at:
         payload["created_at"] = _rfc3339_utc(alert.created_at, "source_alert.created_at")
+    if alert.timestamp:
+        payload["timestamp"] = _rfc3339_utc(alert.timestamp, "source_alert.timestamp")
     if alert.status:
         payload["status"] = alert.status
     return payload

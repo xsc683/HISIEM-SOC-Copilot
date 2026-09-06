@@ -8,19 +8,24 @@ dataset is structurally impossible (E1-B.4 §2).
 
 Immutability + idempotency (E1-B.4 §21): an existing target must byte-match the
 newly computed bytes for idempotent success; any difference is a
-:class:`ManifestSealConflict`. Writes are atomic (E1-B.4 §20): temp file in the
-same directory → flush + fsync → ``os.replace``. Pure filesystem work — no
-network, provider, or model I/O.
+:class:`ManifestSealConflict`. Pure filesystem work — no network, provider, or
+model I/O.
 
-Publication is CROSS-PROCESS first-writer-wins. When the final target is absent,
-it is claimed by an exclusive ``os.open(..., O_CREAT | O_EXCL)`` whose owning
-descriptor is the file's writer: exactly one concurrent process wins the claim and
-writes through that descriptor (flush + fsync) before closing it. Every loser
-re-reads the winning bytes and resolves idempotent-success (identical bytes) vs
-:class:`ManifestSealConflict` (different bytes) — a different immutable record is
-never overwritten, and no torn/partial JSON is ever observable at the final path
-(E1-B.4 §20). ``os.replace`` remains only for the legacy path where an atomic
-single-process temp-file write is preferred.
+Publication is CROSS-PROCESS first-writer-wins AND atomically visible. The final
+``manifest.json`` is ONLY ever created by an atomic ``os.replace`` of a fully
+written + fsynced temp file in the same directory — it can never be observed as a
+torn/partial JSON document (E1-B.4 §20). A separate ``<name>.seal.lock`` claim
+file gates the publication:
+
+- final absent → claim the lock file with ``O_CREAT | O_EXCL`` (owner token +
+  pid + created-at), then DOUBLE-CHECK the final path (another writer may have
+  completed while we waited for the lock), then atomically publish via temp +
+  fsync + ``os.replace``, then release the lock.
+- loser/contender → bounded wait for the lock with a stale-lock timeout; once the
+  final appears, resolve idempotent-success (identical bytes) vs
+  :class:`ManifestSealConflict` (different bytes).
+- a crash that leaves a stale lock is recovered after a bounded stale threshold
+  WITHOUT ever overwriting an already-published final manifest.
 """
 
 from __future__ import annotations
@@ -28,6 +33,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
+import time
 from pathlib import Path
 from typing import Any, Final
 
@@ -56,6 +63,16 @@ from .manifest import (
 # Temp-file suffix; kept in the SAME directory so os.replace stays atomic.
 _TMP_SUFFIX: Final = ".seal.tmp"
 
+# Lock-file suffix for the separate publication-claim file.
+_LOCK_SUFFIX: Final = ".seal.lock"
+
+# Bounded wait/poll/stale constants for cross-process first-writer-wins. These are
+# module-level (not Final) so tests may shrink the timeout/poll to keep adversarial
+# cases fast; production uses the documented defaults.
+SEAL_LOCK_WAIT_TIMEOUT_SECONDS: float = 10.0
+SEAL_LOCK_POLL_INTERVAL_SECONDS: float = 0.05
+SEAL_LOCK_STALE_AFTER_SECONDS: Final = 30.0
+
 # Backfill for the RunIdentity.watermark_source_ip on file verification. The
 # sealed schema intentionally does not persist the watermark control source (it is
 # a materializer-internal identity, never a scored semantic), so a verified
@@ -64,19 +81,12 @@ _TMP_SUFFIX: Final = ".seal.tmp"
 # violated by the rebuild.
 _WATERMARK_NOT_SEALED: Final = "watermark-not-sealed"
 
+# Test seam: invoked after the temp manifest has been fully written + fsynced but
+# BEFORE the atomic ``os.replace`` onto the final path. Defaults to a no-op; tests
+# that prove the final path is never observable as partial JSON (E1-B.4 §20 / §25)
+# install a hook that blocks here while a concurrent reader polls the final path.
+_AFTER_TEMP_WRITE_HOOK = None  # callable[[Path, Path], None] | None
 
-class _SealClaimedError(Exception):
-    """Internal: the exclusive-create claim on a seal target was lost.
-
-    Signifies another process created ``path`` between the absence check and the
-    O_EXCL claim (or claimed it first). Callers fall back to re-reading the
-    existing bytes to decide idempotent-success vs :class:`ManifestSealConflict`.
-    Not part of the public error taxonomy.
-    """
-
-    def __init__(self, path: str) -> None:
-        super().__init__(f"seal target was concurrently created: {path}")
-        self.path = path
 
 __all__ = [
     "ManifestSealer",
@@ -86,25 +96,136 @@ __all__ = [
 ]
 
 
+def _lock_path(target: Path) -> Path:
+    return target.with_name(target.name + _LOCK_SUFFIX)
+
+
+def _tmp_path(target: Path) -> Path:
+    return target.with_name(target.name + _TMP_SUFFIX)
+
+
+def _owner_token() -> str:
+    """A short, collision-resistant writer identity for the lock claim file."""
+    return f"{socket.gethostname()}:{os.getpid()}:{time.monotonic_ns():x}"
+
+
+def _read_lock_record(lock: Path) -> dict[str, Any] | None:
+    """Parse the lock claim record (owner + created_at), or None if absent/bad."""
+    try:
+        data = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lock_is_stale(lock: Path) -> bool:
+    """A lock is stale when it has outlived the bounded stale threshold.
+
+    The PRIMARY signal is the ``created_at`` recorded inside the lock (written by
+    the owner right after the exclusive-create). A lock with NO parseable record
+    (e.g. a crash between ``os.open`` and the record write) falls back to the file
+    mtime so a wedged target is still recoverable after the threshold — mtime is
+    never the sole signal for a well-formed lock.
+    """
+    record = _read_lock_record(lock)
+    if record is not None:
+        created = record.get("created_at")
+        if isinstance(created, (int, float)):
+            return (time.time() - created) > SEAL_LOCK_STALE_AFTER_SECONDS
+    try:
+        mtime = lock.stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() - mtime) > SEAL_LOCK_STALE_AFTER_SECONDS
+
+
+def _recover_stale_lock(lock: Path) -> None:
+    """Remove a STALE lock file, but NEVER if a final manifest already appeared.
+
+    Recovery only applies to a lock that has exceeded the stale threshold AND
+    whose final manifest is still absent. It never removes a lock whose owner is
+    actually mid-publication of a manifest (that would let two writers race the
+    final rename) — a lock younger than the stale threshold is left untouched.
+    """
+    if not lock.exists():
+        return
+    if not _lock_is_stale(lock):
+        return
+    # The final manifest must still be absent — never unlink a claim whose owner
+    # already published (the manifest is authoritative; the lock is just residue).
+    if not lock.name.endswith(_LOCK_SUFFIX):
+        return
+    final_name = lock.name[: -len(_LOCK_SUFFIX)]
+    if lock.with_name(final_name).exists():
+        return
+    with contextlib.suppress(OSError):
+        lock.unlink(missing_ok=True)
+
+
+def _acquire_lock(lock: Path, token: str) -> bool:
+    """Try to claim ``lock`` with ``O_CREAT | O_EXCL``; True if this caller won.
+
+    The record (owner token + created_at) is written through the owning descriptor
+    immediately after the exclusive-create. A crash between create and record
+    leaves an EMPTY lock file that reads as ``None`` and is therefore never judged
+    stale on its own — it will only be cleared once it passes the stale threshold
+    (created_at unreadable -> not stale -> a later real writer with the same target
+    will keep waiting; an operator may clean it, but the protocol stays safe).
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(lock, flags)
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        raise ManifestPersistenceError(
+            f"failed to claim seal lock {lock}: {exc}",
+        ) from exc
+    try:
+        record = json.dumps(
+            {"owner": token, "created_at": time.time()},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        _write_all(fd, record)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _release_lock(lock: Path, token: str) -> None:
+    """Remove ``lock`` ONLY if it still belongs to ``token`` (ownership check).
+
+    A stale-lock recovery may have removed this caller's claim and handed it to a
+    newer writer; releasing unconditionally would unlink the NEW holder's lock and
+    let a third writer race it. Compare the recorded owner before unlinking.
+    """
+    record = _read_lock_record(lock)
+    if record is None or record.get("owner") != token:
+        return  # not ours (anymore): never release another holder's claim
+    with contextlib.suppress(OSError):
+        lock.unlink(missing_ok=True)
+
+
 def _write_atomic(target: Path, data: bytes) -> None:
-    """Atomically write ``data`` to ``target`` (E1-B.4 §20).
+    """Atomically write ``data`` to ``target`` (E1-B.4 §20) via temp+rename.
 
     Temp file in target's directory → write → flush → fsync → os.replace, so the
     final path is never observed as a partially written JSON document. Directory
-    fsync is attempted best-effort where supported.
-
-    ``os.replace`` overwrites an existing destination, so this helper is only
-    invoked when no concurrent first-writer-wins claim is in play (it is not used
-    by :func:`seal_manifest`, which claims the final inode with ``O_EXCL`` and
-    writes through that descriptor; retained here as the documented atomic
-    single-process write primitive).
+    fsync is attempted best-effort where supported. This is the SOLE publication
+    primitive for the final manifest path — the final path only ever appears via an
+    atomic rename of a complete temp file.
     """
-    tmp = target.with_name(target.name + _TMP_SUFFIX)
+    tmp = _tmp_path(target)
     try:
         with open(tmp, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        hook = _AFTER_TEMP_WRITE_HOOK
+        if hook is not None:
+            hook(target, tmp)
         os.replace(tmp, target)
     except OSError as exc:
         with contextlib.suppress(OSError):
@@ -115,42 +236,49 @@ def _write_atomic(target: Path, data: bytes) -> None:
     _fsync_directory(target.parent)
 
 
-def _claim_and_write(target: Path, data: bytes) -> None:
-    """Atomically create ``target`` and write ``data`` through the owning fd.
+def _seal_absent(target: Path, data: bytes) -> None:
+    """First-writer-wins, atomic-visible publication for an absent final path.
 
-    The final path itself is opened with ``os.O_CREAT | os.O_EXCL | os.O_WRONLY``
-    (+ ``os.O_BINARY`` on Windows), so the kernel's exclusive-create is the
-    cross-process first-writer-wins gate: exactly one process claims the inode and
-    every concurrent claimant receives ``FileExistsError``. Bytes are flushed and
-    fsynced through that descriptor before it closes, so the final path is never
-    observed as a torn/partial JSON document (E1-B.4 §20).
+    Bounded contention loop (J §25):
 
-    No temp file or rename is involved — O_EXCL creation IS the atomic claim. The
-    claim can never clobber a different existing manifest because the open fails
-    (``FileExistsError``) if the path already exists; the caller decides
-    idempotent-success vs :class:`ManifestSealConflict` from the existing bytes.
+    1. try to claim ``<name>.seal.lock`` (O_CREAT|O_EXCL, owner token + created_at);
+    2. won the claim → double-check the final is STILL absent, then atomically
+       publish via temp+fsync+rename and release our own lock;
+    3. lost the claim → bounded-wait, recovering a STALE lock only when the final
+       is still absent; re-try the claim so the recovered holder publishes;
+    4. if the final ever appears (published by the winner) → compare bytes and
+       resolve idempotent-success vs :class:`ManifestSealConflict`.
+
+    On bounded timeout with no final and no acquirable lock, raise a typed
+    :class:`ManifestPersistenceError` (never a bare TimeoutError).
     """
-    try:
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-        fd = os.open(target, flags)
-    except FileExistsError as exc:
-        raise _SealClaimedError(str(target)) from exc
-    except OSError as exc:
-        raise ManifestPersistenceError(
-            f"failed to claim seal target {target}: {exc}",
-        ) from exc
-    try:
-        _write_all(fd, data)
-        os.fsync(fd)
-    except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.close(fd)
-            target.unlink(missing_ok=True)  # never leave a torn claimed inode
-        raise ManifestPersistenceError(
-            f"failed to write sealed manifest to {target}: {exc}",
-        ) from exc
-    os.close(fd)
-    _fsync_directory(target.parent)
+    lock = _lock_path(target)
+    token = _owner_token()
+    deadline = time.time() + SEAL_LOCK_WAIT_TIMEOUT_SECONDS
+    while True:
+        if target.exists():
+            _compare_with_target(target, data)
+            return
+        if _acquire_lock(lock, token):
+            try:
+                # Double-check AFTER acquiring the lock (J §25): a writer may have
+                # published while we waited for the claim — never overwrite it.
+                if target.exists():
+                    _compare_with_target(target, data)
+                    return
+                _write_atomic(target, data)
+                return
+            finally:
+                _release_lock(lock, token)
+        if time.time() >= deadline:
+            raise ManifestPersistenceError(
+                f"timed out after {SEAL_LOCK_WAIT_TIMEOUT_SECONDS}s waiting to "
+                f"publish sealed manifest {target} (concurrent sealer never "
+                "completed; lock not recoverable within the bounded window)"
+            )
+        # Bounded wait, recovering a stale lock only while the final is still absent.
+        _recover_stale_lock(lock)
+        time.sleep(SEAL_LOCK_POLL_INTERVAL_SECONDS)
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -176,7 +304,7 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _compare_with_target(target: Path, data: bytes) -> None:
-    """Resolve a claimed/observed existing target against ``data``.
+    """Resolve an observed existing target against ``data``.
 
     Reads the current bytes of ``target`` (which may now belong to a concurrent
     winner) and decides idempotent-success (identical bytes) vs
@@ -214,17 +342,20 @@ class ManifestSealer:
 def seal_manifest(manifest: SealedManifest, path: str | Path) -> SealedManifest:
     """Seal ``manifest`` to ``path`` immutably, atomically, cross-process.
 
-    Publication is first-writer-wins (E1-B.4 §20, §21):
+    Publication is first-writer-wins AND atomically visible (E1-B.4 §20, §21):
 
-    - ``path`` absent → the final inode is CLAIMED with an exclusive
-      ``O_CREAT | O_EXCL`` open and the bytes are written + fsynced through that
-      descriptor; a concurrent sealer that loses the claim re-reads the winner's
-      bytes instead of overwriting.
+    - ``path`` absent → the ``<name>.seal.lock`` claim file is acquired
+      (``O_CREAT | O_EXCL``); the final path is DOUBLE-CHECKED still absent; the
+      bytes are written to a same-directory temp file, flushed + fsynced, then
+      atomically ``os.replace``d onto the final path — so the final manifest can
+      never be observed as a torn/partial JSON document.
     - ``path`` exists with IDENTICAL bytes → idempotent success, whether it was
-      present before this call or claimed by a concurrent winner.
-    - ``path`` exists with DIFFERENT bytes (present before, or claimed by a
-      concurrent sealer of another manifest) → :class:`ManifestSealConflict`;
-      a different immutable record is never silently overwritten.
+      present before this call or published by a concurrent winner.
+    - ``path`` exists with DIFFERENT bytes (present before, or published by a
+      concurrent sealer of another manifest) → :class:`ManifestSealConflict`; a
+      different immutable record is never silently overwritten.
+    - a crashed winner leaves a STALE lock which is recovered after a bounded
+      stale threshold, but NEVER when a final manifest is already present (I/J).
 
     Returns the sealed ``manifest``.
     """
@@ -240,15 +371,13 @@ def seal_manifest(manifest: SealedManifest, path: str | Path) -> SealedManifest:
         raise ManifestPersistenceError(
             f"seal target directory does not exist: {target.parent}",
         )
-    try:
-        if target.exists():
-            _compare_with_target(target, data)
-            return manifest  # idempotent success
-        # Absent just now: race to claim the final inode exclusively. The winner
-        # writes the bytes; the loser re-reads the winner's bytes below.
-        _claim_and_write(target, data)
-    except _SealClaimedError:
-        _compare_with_target(target, data)  # decides idempotent vs conflict
+    if target.exists():
+        _compare_with_target(target, data)
+        return manifest  # idempotent success (no lock needed)
+    # Absent: first-writer-wins + atomic-visible publication under a claim lock.
+    # _seal_absent resolves idempotent-success vs ManifestSealConflict internally
+    # and raises a typed ManifestPersistenceError on a bounded-timeout with no final.
+    _seal_absent(target, data)
     return manifest
 
 
@@ -474,6 +603,7 @@ def _alert_from_json(obj: dict[str, Any], source: str) -> ResolvedAlert:
         rule_name=_optional_string(obj, "rule_name", source),
         entity=_optional_string(obj, "entity", source),
         created_at=_optional_string(obj, "created_at", source) or "",
+        timestamp=_optional_string(obj, "timestamp", source) or "",
         event_count=_int(obj.get("event_count", 0), source, "source_alert.event_count"),
         status=_optional_string(obj, "status", source) or "",
         related_event_refs=refs,

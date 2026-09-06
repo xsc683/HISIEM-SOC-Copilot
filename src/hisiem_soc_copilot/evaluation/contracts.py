@@ -276,6 +276,7 @@ class ResolvedAlert:
     created_at: str
     event_count: int
     status: str
+    timestamp: str = ""  # alert @timestamp (event-time window end), never created_at
     related_event_refs: list[RelatedEventRef] = field(default_factory=list)
 
     @property
@@ -327,6 +328,13 @@ class MaterializationDraft:
     # regenerated at seal time. Lives only in the mutable ledger — no sealed
     # manifest schema change.
     verified_at: str = ""
+    # Frozen processing-time lower bound for alert freshness, set ONCE when this
+    # run's live materialization begins (the draft checkpoint right after binding).
+    # ``alert.created_at`` (processing-time) is only ever compared against THIS
+    # bound — never against the F1/W1 event-time window. A resume reuses the
+    # persisted value; it is NEVER re-derived from ``datetime.now()``, so stale-
+    # alert protection does not drift across a resume. Empty string = disabled.
+    alert_processing_not_before: str = ""
 
 
 @dataclass(frozen=True)

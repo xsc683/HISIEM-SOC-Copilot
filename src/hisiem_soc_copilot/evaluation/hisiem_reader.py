@@ -121,16 +121,43 @@ def _parse_ts_tolerant(value: str | None) -> datetime | None:
         return None
 
 
-def _alert_in_window(alert: FoundAlert, from_: datetime, to: datetime) -> bool:
-    """True only if the alert's ``created_at`` parses and lies within [from_, to].
+def _alert_in_event_time_scope(
+    alert: FoundAlert, event_time_from: datetime, event_time_to: datetime
+) -> bool:
+    """True only if the alert's event-time ``@timestamp`` lies in the scope.
 
-    An old same-source alert OUTSIDE the current-run materialization window is
-    never a candidate; an unparseable ``created_at`` is treated as out-of-scope.
+    The event-time scope is the GP-01 detection window (F1..W1 bounding box). A
+    candidate qualifies ONLY on its ``@timestamp`` (alert ``@timestamp`` = Flink
+    window-end / event-time, verified against ``WindowRuleFunction.buildAlert``).
+
+    ``alert.created_at`` (processing-time, ≈ when the alert was produced) is NEVER
+    compared to this event-time scope. A missing/unparseable ``@timestamp`` is
+    treated as NOT bound to this run's event-time window (never selected) — the
+    provider must expose ``@timestamp`` for event-time binding to be provable.
     """
+    bound = _parse_ts_tolerant(alert.timestamp)
+    if bound is None:
+        return False
+    return event_time_from <= bound <= event_time_to
+
+
+def _alert_processing_not_before(
+    alert: FoundAlert, processing_time_not_before: datetime | None
+) -> bool:
+    """Optional processing-time freshness: ``alert.created_at`` must not predate
+    the frozen run processing-time lower bound.
+
+    ``created_at`` is only ever compared against THIS materialization run's
+    processing-time boundary (frozen once and persisted on the draft ledger for
+    resume), never against the F1/W1 event-time window. A missing/unparseable
+    ``created_at`` fails the freshness check (cannot be proven fresh).
+    """
+    if processing_time_not_before is None:
+        return True  # freshness check disabled
     created = _parse_ts_tolerant(alert.created_at)
     if created is None:
         return False
-    return from_ <= created <= to
+    return created >= processing_time_not_before
 
 
 def _matches_run_alert(alert: FoundAlert, rule_id: str, attack_source_ip: str) -> bool:
@@ -188,6 +215,20 @@ class FoundAlert:
     with; it is NEVER inferred from ``alert.id`` / ``business_id``. ``business_id``
     carries the provider's own ``alert.id`` as display/correlation metadata only
     (hisiem-integration-contract.md §4).
+
+    Two DISTINCT time clocks are preserved and MUST NEVER fall back to each other
+    (verified against the reference SIEM ``WindowRuleFunction.buildAlert``):
+
+    ``timestamp``
+        the alert's ``@timestamp`` = the Flink detection-window END (event-time).
+        It is the window-close instant, part of the deterministic ES ``_id``
+        (``sha1(rule_id|entity|@timestamp)``), and is the ONLY field the GP-01
+        candidate selection may compare against the event-time detection window.
+
+    ``created_at``
+        ``alert.created_at`` = ``Instant.now()`` when the alert was produced
+        (processing-time). It is NOT event time and must never be compared to the
+        F1/W1 event-time scope.
     """
 
     address_id: str
@@ -197,6 +238,7 @@ class FoundAlert:
     severity: str | None = None
     status: str | None = None
     created_at: str | None = None
+    timestamp: str | None = None  # alert @timestamp (event-time window end)
     risk_score: float | None = None
     entity: str | None = None
     source_ip: str | None = None
@@ -295,6 +337,11 @@ def map_found_alert(raw: dict[str, Any]) -> FoundAlert | None:
         severity=_first(payload, "alert.severity", "severity"),
         status=_first(payload, "alert.status", "status"),
         created_at=_first(payload, "alert.created_at", "created_at"),
+        # The alert's own ES ``@timestamp`` (event-time window end). The reference
+        # SIEM sets this on the alert document itself, distinct from
+        # ``alert.created_at`` (processing time). Read verbatim from the payload;
+        # it is NEVER synthesized from ``created_at`` (E1-B.3 §14 / correctness).
+        timestamp=_opt(payload.get("@timestamp")),
         risk_score=_float(_first(payload, "alert.risk_score", "risk_score")),
         entity=_first(payload, "alert.entity", "entity"),
         source_ip=_first(payload, "source.ip", "source_ip"),
@@ -493,23 +540,30 @@ class HisiemEvaluationReader:
         self,
         *,
         attack_source_ip: str,
-        from_: datetime,
-        to: datetime,
+        event_time_from: datetime,
+        event_time_to: datetime,
         deadline: datetime,
         interval: float = 2.0,
         stable_reads: int = 3,
+        processing_time_not_before: datetime | None = None,
     ) -> ResolvedAlert:
         """Bounded poll for a STABLE, unambiguous HISIEM alert (E1-B.3 §14, §15).
 
-        Candidate selection is bounded to the CURRENT-RUN materialization window
-        ``[from_, to]``: an alert is a candidate only if its rule_id matches GP-01,
-        its entity/source is the attack source, AND its ``created_at`` falls inside
-        the window. An OLD same-source alert OUTSIDE the window is never selected.
+        Candidate selection is bounded to the CURRENT-RUN event-time scope
+        ``[event_time_from, event_time_to]``: an alert is a candidate only if its
+        rule_id matches GP-01, its entity/source is the attack source, AND its
+        ``@timestamp`` (alert event-time / Flink window-end) falls inside the
+        scope. ``alert.created_at`` (processing-time) is NEVER compared to this
+        event-time scope; when ``processing_time_not_before`` is supplied it is
+        only used as an OPTIONAL freshness lower bound against the frozen run
+        processing boundary. An OLD same-source alert OUTSIDE the scope is never
+        selected.
 
-        After a single in-window candidate is found it is re-read by its real
-        ``_id`` (``get_alert``) and RE-VERIFIED against the same rule/entity/time
-        constraints — the list item is never trusted on its own. Ambiguity is NEVER
-        resolved by newest/highest-risk/first.
+        After a single in-scope candidate is found it is re-read by its real
+        ``_id`` (``get_alert``) and RE-VERIFIED against the SAME
+        rule/entity/event-time-scope (and freshness, when enabled) constraints —
+        the list item is never trusted on its own. Ambiguity is NEVER resolved by
+        newest/highest-risk/first.
 
         Stability barrier (§15): the first visible alert may still be dedup-updating
         inside the detection pipeline, so the SAME candidate must present an
@@ -525,27 +579,30 @@ class HisiemEvaluationReader:
                 a
                 for a in alerts
                 if _matches_run_alert(a, _GP01_RULE_ID, attack_source_ip)
-                and _alert_in_window(a, from_, to)
+                and _alert_in_event_time_scope(a, event_time_from, event_time_to)
+                and _alert_processing_not_before(a, processing_time_not_before)
             ]
             if len(candidates) > 1:
                 raise AmbiguousSourceAlertError(
                     f"alert resolution found {len(candidates)} candidate alerts in "
-                    f"[{_rfc3339_utc(from_)}, {_rfc3339_utc(to)}] for attack source "
-                    f"{attack_source_ip}; expected exactly one"
+                    f"[{_rfc3339_utc(event_time_from)}, {_rfc3339_utc(event_time_to)}] "
+                    f"for attack source {attack_source_ip}; expected exactly one"
                 )
             selected: FoundAlert | None = None
             if len(candidates) == 1:
-                # Re-verify the in-window candidate against the SAME constraints
+                # Re-verify the in-scope candidate against the SAME constraints
                 # before trusting it (E1-B.3 §14): read the alert detail by its real
-                # addressing ``_id`` and confirm rule/entity/time-scope AGAIN. The
-                # list item alone is never trusted — the authoritative detail read
-                # must pass, otherwise this round yields no candidate.
+                # addressing ``_id`` and confirm rule/entity/event-time-scope (and
+                # freshness, when enabled) AGAIN. The list item alone is never
+                # trusted — the authoritative detail read must pass, otherwise this
+                # round yields no candidate.
                 detail = await self.get_alert(candidates[0].address_id)
                 if (
                     detail is not None
                     and detail.address_id == candidates[0].address_id
                     and _matches_run_alert(detail, _GP01_RULE_ID, attack_source_ip)
-                    and _alert_in_window(detail, from_, to)
+                    and _alert_in_event_time_scope(detail, event_time_from, event_time_to)
+                    and _alert_processing_not_before(detail, processing_time_not_before)
                 ):
                     selected = detail
             if selected is None:
@@ -677,6 +734,7 @@ def _to_resolved_alert(alert: FoundAlert) -> ResolvedAlert:
         rule_name=alert.rule_name,
         entity=alert.entity or alert.source_ip,
         created_at=alert.created_at or "",
+        timestamp=alert.timestamp or "",
         event_count=alert.event_count or 0,
         status=alert.status or "",
         related_event_refs=[

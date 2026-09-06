@@ -19,7 +19,8 @@ from hisiem_soc_copilot.evaluation.contracts import (
 )
 from hisiem_soc_copilot.evaluation.hisiem_reader import (
     HisiemEvaluationReader,
-    _alert_in_window,
+    _alert_in_event_time_scope,
+    _alert_processing_not_before,
     _map_found_event,  # noqa: PLC2701
     _matches_run_alert,
     map_found_alert,
@@ -144,24 +145,36 @@ def _alert_payload(
     *,
     address_id: str,
     rule_id: str = _RULE_ID,
-    created_at: str,
+    created_at: str | None = None,
+    timestamp: str | None = None,
     event_count: int = 5,
     status: str = "OPEN",
 ) -> dict:
-    """One list-endpoint alert item (map_found_alert envelope shape)."""
-    return {
+    """One list-endpoint alert item (map_found_alert envelope shape).
+
+    Mirrors the real HISIEM alert document: top-level ``@timestamp`` (event-time
+    window end) is distinct from ``alert.created_at`` (processing-time). Callers
+    may set either independently to drive the event-time/freshness split tests.
+    """
+    payload: dict[str, object] = {
         "_id": address_id,
         "_index": "siem-alerts-gp01",
         "alert": {
             "id": f"biz-{address_id}",
             "rule_id": rule_id,
             "rule_name": "SSH Brute Force",
-            "created_at": created_at,
             "deduplicated_count": event_count,
             "status": status,
         },
         "source": {"ip": _ATTACK_SOURCE},
     }
+    if created_at is not None:
+        cast_alert = payload["alert"]
+        assert isinstance(cast_alert, dict)
+        cast_alert["created_at"] = created_at
+    if timestamp is not None:
+        payload["@timestamp"] = timestamp
+    return payload
 
 
 def _alert_detail_payload(payload: dict) -> dict:
@@ -170,28 +183,94 @@ def _alert_detail_payload(payload: dict) -> dict:
     return payload
 
 
-def test_alert_in_window_true_only_for_parsed_in_scope_created_at() -> None:
+def test_event_time_scope_binds_only_on_alert_timestamp() -> None:
+    """Event-time binding uses the alert ``@timestamp`` (window end), NEVER
+    ``created_at`` (processing time)."""
     scope_from = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
     scope_to = datetime(2026, 9, 5, 12, 6, 0, tzinfo=UTC)
-    in_window = map_found_alert(
-        _alert_payload(address_id="es-in", created_at="2026-09-05T12:03:00Z")
+    # In-scope @timestamp (window end inside the F1..W1 bounding box) is selected
+    # EVEN when created_at is recent (the blocker regression).
+    recent = map_found_alert(
+        _alert_payload(
+            address_id="es-in",
+            timestamp="2026-09-05T12:03:00Z",
+            created_at="2026-09-05T12:05:59Z",
+        )
     )
-    assert in_window is not None
-    assert _alert_in_window(in_window, scope_from, scope_to) is True
-    old = map_found_alert(_alert_payload(address_id="es-old", created_at="2026-09-01T09:00:00Z"))
+    assert recent is not None
+    assert _alert_in_event_time_scope(recent, scope_from, scope_to) is True
+    # Same-source alert whose @timestamp is OUTSIDE the current-run event-time
+    # scope is NOT selected even when created_at sits inside the window.
+    old = map_found_alert(
+        _alert_payload(
+            address_id="es-old",
+            timestamp="2026-09-01T09:00:00Z",
+            created_at="2026-09-05T12:03:00Z",
+        )
+    )
     assert old is not None
-    assert _alert_in_window(old, scope_from, scope_to) is False  # outside [from_, to]
-    unparseable = map_found_alert(_alert_payload(address_id="es-un", created_at="not-a-timestamp"))
-    assert unparseable is not None
-    assert _alert_in_window(unparseable, scope_from, scope_to) is False  # safe: never selected
+    assert _alert_in_event_time_scope(old, scope_from, scope_to) is False
+    # An unparseable / missing @timestamp is NOT bound (never selected): a missing
+    # @timestamp must not be silently substituted with created_at.
+    missing_ts = map_found_alert(
+        _alert_payload(address_id="es-missing-ts", created_at="2026-09-05T12:03:00Z")
+    )
+    assert missing_ts is not None
+    assert missing_ts.timestamp is None
+    assert _alert_in_event_time_scope(missing_ts, scope_from, scope_to) is False
+    bad_ts = map_found_alert(
+        _alert_payload(
+            address_id="es-bad",
+            timestamp="not-a-timestamp",
+            created_at="2026-09-05T12:03:00Z",
+        )
+    )
+    assert bad_ts is not None
+    assert _alert_in_event_time_scope(bad_ts, scope_from, scope_to) is False
+
+
+def test_processing_freshness_uses_created_at_only_against_run_bound() -> None:
+    """created_at (processing-time) is only compared to the frozen run lower bound,
+    never to the event-time window."""
+    run_bound = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    fresh = map_found_alert(
+        _alert_payload(
+            address_id="es-fresh",
+            timestamp="2026-09-05T12:03:00Z",
+            created_at="2026-09-05T12:02:00Z",
+        )
+    )
+    assert fresh is not None
+    assert _alert_processing_not_before(fresh, run_bound) is True
+    stale = map_found_alert(
+        _alert_payload(
+            address_id="es-stale",
+            timestamp="2026-09-05T12:03:00Z",
+            created_at="2026-09-05T11:00:00Z",
+        )
+    )
+    assert stale is not None
+    assert _alert_processing_not_before(stale, run_bound) is False
+    # Missing created_at cannot be proven fresh.
+    no_created = map_found_alert(
+        _alert_payload(address_id="es-nc", timestamp="2026-09-05T12:03:00Z")
+    )
+    assert no_created is not None
+    assert _alert_processing_not_before(no_created, run_bound) is False
+    # Disabled freshness check passes anything.
+    assert _alert_processing_not_before(no_created, None) is True
 
 
 def test_matches_run_alert_requires_rule_and_attack_entity() -> None:
-    own = map_found_alert(_alert_payload(address_id="es-own", created_at="2026-09-05T12:03:00Z"))
+    own = map_found_alert(
+        _alert_payload(address_id="es-own", timestamp="2026-09-05T12:03:00Z")
+    )
     assert own is not None
     assert _matches_run_alert(own, _RULE_ID, _ATTACK_SOURCE) is True
     other_rule = map_found_alert(
-        _alert_payload(address_id="es-x", created_at="2026-09-05T12:03:00Z", rule_id="rule-other")
+        _alert_payload(
+            address_id="es-x", timestamp="2026-09-05T12:03:00Z", rule_id="rule-other"
+        )
     )
     assert other_rule is not None
     assert _matches_run_alert(other_rule, _RULE_ID, _ATTACK_SOURCE) is False
@@ -228,19 +307,23 @@ def _stub_reader(alerts: list[dict]) -> HisiemEvaluationReader:
     )
 
 
-async def test_alert_candidate_ignores_old_same_source_alert_outside_window() -> None:
-    """D (§12): an OLD same-source alert OUTSIDE the current-run [from_, to] window
-    must NOT be selected — the poll keeps waiting until no candidate is stable, so
-    it raises AlertResolutionTimeout rather than judging a new run "same as old"."""
-    from_, to = _scope()
-    old_alert = _alert_payload(address_id="es-old", created_at="2026-09-01T09:00:00Z")
+async def test_alert_candidate_ignores_old_same_source_alert_outside_event_scope() -> None:
+    """B (§25): an OLD same-source alert whose ``@timestamp`` is OUTSIDE the
+    current-run event-time scope must NOT be selected even when ``created_at`` is
+    recent — the poll keeps waiting and raises AlertResolutionTimeout."""
+    event_from, event_to = _scope()
+    old_alert = _alert_payload(
+        address_id="es-old",
+        timestamp="2026-09-01T09:00:00Z",  # event-time outside the run scope
+        created_at="2026-09-05T12:03:00Z",  # processing-time would look "recent"
+    )
     reader = _stub_reader([old_alert])
     try:
         with pytest.raises(AlertResolutionTimeout):
             await reader.wait_for_alert(
                 attack_source_ip=_ATTACK_SOURCE,
-                from_=from_,
-                to=to,
+                event_time_from=event_from,
+                event_time_to=event_to,
                 deadline=datetime.now(UTC) - timedelta(seconds=1),  # already expired
                 interval=0.001,
                 stable_reads=3,
@@ -249,42 +332,142 @@ async def test_alert_candidate_ignores_old_same_source_alert_outside_window() ->
         await reader.close()
 
 
-async def test_alert_candidate_selects_single_in_window_stable_alert() -> None:
-    """D's positive counterpart: a single in-window alert is selected once stable."""
-    from_, to = _scope()
-    in_alert = _alert_payload(address_id="es-current", created_at="2026-09-05T12:03:00Z")
+async def test_alert_candidate_accepts_recent_alert_in_event_time_scope() -> None:
+    """A (§25) — the blocker regression: F1/W1 event time is several minutes in the
+    past, the alert's ``@timestamp`` (window end) is INSIDE the event-time scope,
+    and ``created_at`` (processing-time) is NOW. The candidate MUST be accepted."""
+    event_from, event_to = _scope()
+    in_alert = _alert_payload(
+        address_id="es-current",
+        timestamp="2026-09-05T12:03:00Z",  # event-time inside the F1/W1 scope
+        created_at="2026-09-05T12:05:59Z",  # processing-time == now-ish
+    )
     reader = _stub_reader([in_alert])
     try:
         resolved = await reader.wait_for_alert(
             attack_source_ip=_ATTACK_SOURCE,
-            from_=from_,
-            to=to,
+            event_time_from=event_from,
+            event_time_to=event_to,
             deadline=datetime.now(UTC) + timedelta(seconds=10),
             interval=0.001,
             stable_reads=2,
         )
         assert resolved.address_id == "es-current"
         assert resolved.rule_id == _RULE_ID
+        assert resolved.timestamp == "2026-09-05T12:03:00Z"
     finally:
         await reader.close()
 
 
-async def test_alert_candidate_two_in_window_same_source_is_ambiguous() -> None:
-    """E (§12): two alerts INSIDE the window for the SAME source → the reader MUST
+async def test_alert_missing_event_timestamp_is_not_selectable() -> None:
+    """C (§25): an alert with NO ``@timestamp`` must NOT pass event-time binding —
+    the parser must not silently substitute ``created_at``. The poll keeps waiting
+    and times out rather than selecting an event-time-unprovable alert."""
+    event_from, event_to = _scope()
+    no_ts = _alert_payload(
+        address_id="es-no-ts", created_at="2026-09-05T12:03:00Z"  # no @timestamp
+    )
+    reader = _stub_reader([no_ts])
+    try:
+        with pytest.raises(AlertResolutionTimeout):
+            await reader.wait_for_alert(
+                attack_source_ip=_ATTACK_SOURCE,
+                event_time_from=event_from,
+                event_time_to=event_to,
+                deadline=datetime.now(UTC) - timedelta(seconds=1),
+                interval=0.001,
+                stable_reads=2,
+            )
+    finally:
+        await reader.close()
+
+
+async def test_alert_detail_drift_outside_event_scope_is_rejected() -> None:
+    """D (§25): a list item whose ``@timestamp`` is in scope but whose DETAIL read
+    by the real ``_id`` returns an ``@timestamp`` OUTSIDE the scope must be
+    rejected/reset — the authoritative detail re-read wins."""
+    event_from, event_to = _scope()
+    # list item: in-scope @timestamp; detail: out-of-scope @timestamp.
+    list_item = _alert_payload(
+        address_id="es-drift",
+        timestamp="2026-09-05T12:03:00Z",
+        created_at="2026-09-05T12:04:00Z",
+    )
+    drifted_detail = _alert_payload(
+        address_id="es-drift",
+        timestamp="2026-09-05T09:00:00Z",  # OUTSIDE event-time scope
+        created_at="2026-09-05T12:04:00Z",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/alerts":
+            return httpx.Response(200, json={"items": [list_item]})
+        return httpx.Response(200, json=_alert_detail_payload(drifted_detail))
+
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    reader = HisiemEvaluationReader(
+        tenant_id="tenant-a",
+        base_url="http://hisiem.test",
+        bearer_token="",
+        client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
+    )
+    try:
+        with pytest.raises(AlertResolutionTimeout):
+            await reader.wait_for_alert(
+                attack_source_ip=_ATTACK_SOURCE,
+                event_time_from=event_from,
+                event_time_to=event_to,
+                deadline=datetime.now(UTC) - timedelta(seconds=1),
+                interval=0.001,
+                stable_reads=2,
+            )
+    finally:
+        await reader.close()
+
+
+async def test_alert_created_at_older_than_run_processing_bound_is_rejected() -> None:
+    """E (§25): with processing freshness enabled, an alert whose ``@timestamp`` is
+    in event-time scope but whose ``created_at`` predates the frozen run processing
+    lower bound is rejected as stale (never silently bound by event time)."""
+    event_from, event_to = _scope()
+    run_bound = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    stale = _alert_payload(
+        address_id="es-stale",
+        timestamp="2026-09-05T12:03:00Z",  # event-time in scope
+        created_at="2026-09-05T11:00:00Z",  # created BEFORE the run processing bound
+    )
+    reader = _stub_reader([stale])
+    try:
+        with pytest.raises(AlertResolutionTimeout):
+            await reader.wait_for_alert(
+                attack_source_ip=_ATTACK_SOURCE,
+                event_time_from=event_from,
+                event_time_to=event_to,
+                deadline=datetime.now(UTC) - timedelta(seconds=1),
+                interval=0.001,
+                stable_reads=2,
+                processing_time_not_before=run_bound,
+            )
+    finally:
+        await reader.close()
+
+
+async def test_alert_two_in_event_scope_same_source_is_ambiguous() -> None:
+    """Two alerts INSIDE the event-time scope for the SAME source → the reader MUST
     raise AmbiguousSourceAlertError — ambiguity is never resolved by newest/risk."""
-    from_, to = _scope()
+    event_from, event_to = _scope()
     reader = _stub_reader(
         [
-            _alert_payload(address_id="es-c1", created_at="2026-09-05T12:03:00Z"),
-            _alert_payload(address_id="es-c2", created_at="2026-09-05T12:04:00Z"),
+            _alert_payload(address_id="es-c1", timestamp="2026-09-05T12:03:00Z"),
+            _alert_payload(address_id="es-c2", timestamp="2026-09-05T12:04:00Z"),
         ]
     )
     try:
         with pytest.raises(AmbiguousSourceAlertError):
             await reader.wait_for_alert(
                 attack_source_ip=_ATTACK_SOURCE,
-                from_=from_,
-                to=to,
+                event_time_from=event_from,
+                event_time_to=event_to,
                 deadline=datetime.now(UTC) + timedelta(seconds=10),
                 interval=0.001,
                 stable_reads=3,

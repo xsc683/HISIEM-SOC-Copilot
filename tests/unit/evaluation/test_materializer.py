@@ -150,12 +150,20 @@ class FakeReader:
         self,
         *,
         attack_source_ip: str,
-        from_: datetime,
-        to: datetime,
+        event_time_from: datetime,
+        event_time_to: datetime,
         deadline: datetime,
         interval: float = 2.0,
+        processing_time_not_before: datetime | None = None,
     ) -> ResolvedAlert:
-        del attack_source_ip, from_, to, deadline, interval
+        del (
+            attack_source_ip,
+            event_time_from,
+            event_time_to,
+            deadline,
+            interval,
+            processing_time_not_before,
+        )
         if self.alert is None:
             raise RuntimeError("FakeReader has no canned alert")
         return self.alert
@@ -312,6 +320,42 @@ async def test_preflight_happy_path() -> None:
     assert materializer.draft.state == MaterializationState.PREFLIGHTED.value
     assert materializer.draft.injected == []
     assert materializer.draft.rendered == []
+    # Preflight freezes the alert processing-time freshness bound once.
+    assert materializer.draft.alert_processing_not_before != ""
+
+
+async def test_preflight_freeze_is_once_and_resume_reuses_persisted_bound() -> None:
+    """E (§25): the alert processing-time lower bound is frozen ONCE on the first
+    live preflight and a resume REUSES the persisted value — it is never re-derived
+    from now(), so stale-alert protection does not drift across a resume."""
+    materializer = _materializer(reader=_reader_with_resolved())
+    await materializer.preflight(rule=_rule(), reachable=True)
+    assert materializer.draft.state == MaterializationState.PREFLIGHTED.value
+    frozen = materializer.draft.alert_processing_not_before
+    assert frozen != ""
+
+    # Simulate a persisted draft resumed much later (ledger rehydrated). The frozen
+    # bound must survive and be reused, NOT replaced by a fresh now().
+    from hisiem_soc_copilot.evaluation.ledger import dump_draft, load_draft_text
+
+    draft_text = dump_draft(materializer.draft)
+    resumed_draft = load_draft_text(
+        draft_text, run_id=materializer.draft.run_id, scenario_id="gp-01", tenant_id="tenant-a"
+    )
+    resumed = Gp01Materializer(
+        run_id=resumed_draft.run_id,
+        tenant_id=resumed_draft.tenant_id,
+        scenario=_scenario(),
+        identity=resumed_draft.identity,
+        time_plan=resumed_draft.time_plan,
+        injector=FakeInjector(),
+        reader=_reader_with_resolved(resumed_draft.run_id),
+        draft=resumed_draft,
+    )
+    # A resumed preflight would be a NEW state transition — but resolve_alert reads
+    # the persisted bound. Verify the resume draft retains the frozen bound exactly.
+    assert resumed.draft.alert_processing_not_before == frozen
+    assert resumed.draft.state == MaterializationState.PREFLIGHTED.value
 
 
 # ---------------------------------------------------------------------------
@@ -712,18 +756,20 @@ async def test_run_collision_no_existing_events_preflight_passes() -> None:
     assert materializer.draft.rendered == []
 
 
-async def test_run_collision_aligned_existing_events_allow_reconcile() -> None:
-    """B: prior events ALIGNED to this run's committed F1..F5 instants (the SAME
-    run already injected) → preflight succeeds; reconciliation is allowed and no
-    duplicate injection is performed."""
+async def test_run_collision_aligned_events_fresh_draft_refuses_duplicate() -> None:
+    """K (correctness-round §25): provider events ALIGNED to this run's committed
+    F1..F5 instants exist, but the CURRENT draft carries NO authoritative injection
+    ledger → preflight MUST refuse with zero writes (the draft cannot prove it owns
+    those provider events; injecting again would duplicate them)."""
     reader = _reader_with_resolved()
     reader.collision_events = _aligned_collision_events("mat-run-1")
     injector = FakeInjector()
     materializer = _materializer(run_id="mat-run-1", injector=injector, reader=reader)
-    await materializer.preflight(rule=_rule(), reachable=True)
-    assert materializer.draft.state == MaterializationState.PREFLIGHTED.value
-    await materializer.inject_events()
-    assert injector.roles() == ["F1", "F2", "F3", "F4", "F5", "S1", "W1"]
+    with pytest.raises(RunIdentityCollision) as exc_info:
+        await materializer.preflight(rule=_rule(), reachable=True)
+    assert "authoritative injection ledger is absent" in str(exc_info.value)
+    assert materializer.draft.state == MaterializationState.NEW.value
+    assert injector.attempts == []  # zero TCP writes
 
 
 async def test_run_collision_conflicting_events_raise_identity_collision() -> None:
@@ -740,16 +786,40 @@ async def test_run_collision_conflicting_events_raise_identity_collision() -> No
     assert injector.attempts == []  # nothing was ever written
 
 
-async def test_run_collision_same_run_reconcile_never_duplicates_injection() -> None:
-    """§12 resume-safety after an aligned collision: the reconciling materializer
-    must NOT re-inject the already-attempted aligned events (the CLI's inject
-    gating already skipped the inject window on resume)."""
-    reader = _reader_with_resolved()
-    reader.collision_events = _aligned_collision_events("mat-run-1")
-    injector = FakeInjector()
-    materializer = _materializer(run_id="mat-run-1", injector=injector, reader=reader)
+async def test_run_collision_resume_with_persisted_ledger_reconciles_zero_writes() -> None:
+    """L (correctness-round §25): provider events ALIGNED to this run's F1..F5
+    instants exist AND the resumed draft carries an authoritative ``injected``
+    ledger proving prior attempts → the resume reconciles with ZERO duplicate
+    writes. A resume never re-runs preflight (the draft is no longer NEW); it
+    reuses the persisted ledger, and ``inject_events()`` is a no-op because every
+    role is already recorded as attempted."""
+    # Build a run whose draft ALREADY records all injected attempts (EVENTS_INJECTED).
+    reader = _reader_with_resolved("mat-run-1")
+    materializer = _materializer(run_id="mat-run-1", reader=reader)
     await materializer.preflight(rule=_rule(), reachable=True)
-    # Inject once — the aligned collisions exist, and this run's inject window is
-    # legal-from PREFLIGHTED; the events are injected exactly once.
+    materializer.render_events()
     await materializer.inject_events()
-    assert injector.roles() == ["F1", "F2", "F3", "F4", "F5", "S1", "W1"]
+    assert materializer.draft.state == MaterializationState.EVENTS_INJECTED.value
+    assert len(materializer.draft.injected) == 7
+    persisted = materializer.draft
+
+    # Resume over the SAME persisted draft: the provider already holds aligned
+    # events for this identity, but the authoritative ledger authorizes reconcile.
+    reader2 = _reader_with_resolved("mat-run-1")
+    reader2.collision_events = _aligned_collision_events("mat-run-1")
+    injector2 = FakeInjector()
+    resumed = Gp01Materializer(
+        run_id=persisted.run_id,
+        tenant_id=persisted.tenant_id,
+        scenario=_scenario(),
+        identity=persisted.identity,
+        time_plan=persisted.time_plan,
+        injector=injector2,
+        reader=reader2,
+        draft=persisted,
+    )
+    # Resume path (mirrors the CLI): the draft is EVENTS_INJECTED, so inject_events
+    # is a NO-OP — zero new writes even though aligned provider events exist.
+    await resumed.inject_events()
+    assert injector2.roles() == []  # zero duplicate writes
+    assert resumed.draft.state == MaterializationState.EVENTS_INJECTED.value

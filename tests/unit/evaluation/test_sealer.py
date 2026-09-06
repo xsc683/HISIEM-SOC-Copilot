@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from hisiem_soc_copilot.evaluation.errors import (
     ManifestCanonicalizationError,
     ManifestIntegrityError,
     ManifestNotVerifiedError,
+    ManifestPersistenceError,
     ManifestSchemaError,
     ManifestSealConflict,
     OracleIsolationViolation,
@@ -606,3 +608,178 @@ def test_concurrent_seal_identical_manifests_both_succeed(tmp_path: Path) -> Non
     sealed = verify_sealed_manifest(path)  # schema + integrity valid
     assert sealed.run.run_id == "run-same-x"
     assert sealed.sealed_at == shared_sealed_at
+
+
+# ---------------------------------------------------------------------------
+# §20/§25 — atomically-visible publication + stale-lock recovery (correctness round
+# §25, cases F-J). H/I/J are exercised with real threads + real os calls (the lock
+# file + atomic rename semantics are identical across threads and processes); F/G
+# above already prove real multi-process contention with subprocesses.
+# ---------------------------------------------------------------------------
+
+
+def test_reader_never_observes_partial_final_manifest(tmp_path: Path) -> None:
+    """H (§25): while a writer is blocked between its temp-file write and the atomic
+    rename, a concurrent reader must NEVER observe a partial ``manifest.json`` —
+    the final path is either absent or the complete winner bytes."""
+    import threading
+
+    from hisiem_soc_copilot.evaluation import sealer as sealer_mod
+
+    path = tmp_path / "manifest.json"
+    manifest = _build(_verified(run_id="atomic-h"))
+    data = to_json(manifest).encode("utf-8")
+
+    released = threading.Event()
+    entered_hook = threading.Event()
+
+    def hook(target: Path, tmp: Path) -> None:
+        del target, tmp
+        entered_hook.set()
+        released.wait(timeout=10)
+
+    original_hook = sealer_mod._AFTER_TEMP_WRITE_HOOK  # noqa: SLF001
+    sealer_mod._AFTER_TEMP_WRITE_HOOK = hook  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        worker = threading.Thread(target=seal_manifest, args=(manifest, path))
+        worker.start()
+        assert entered_hook.wait(timeout=10), "writer never reached the temp-write hook"
+        # While the writer is paused AFTER the temp file is complete but BEFORE the
+        # atomic rename, the final manifest.json must NOT exist — a concurrent
+        # reader can never observe a partial final document.
+        assert not path.exists(), "final manifest.json appeared before the atomic rename"
+        released.set()
+        worker.join(timeout=10)
+    finally:
+        sealer_mod._AFTER_TEMP_WRITE_HOOK = original_hook  # type: ignore[assignment]  # noqa: SLF001
+
+    # After the rename the final is the complete valid winner manifest.
+    sealed = verify_sealed_manifest(path)
+    assert sealed.run.run_id == "atomic-h"
+    assert path.read_bytes() == data
+
+
+def test_stale_lock_recovered_and_does_not_overwrite_present_final(tmp_path: Path) -> None:
+    """I (§25): a lock left by a crashed writer (final absent) is recoverable after
+    the stale threshold; a subsequent sealer succeeds. Recovery never overwrites a
+    final that has already appeared."""
+    path = tmp_path / "manifest.json"
+    lock = tmp_path / "manifest.json.seal.lock"
+    manifest = _build(_verified(run_id="stale-i"))
+
+    # Simulate a crashed writer: create the lock with an OLD created_at.
+    import json as _json
+
+    lock.write_text(
+        _json.dumps({"owner": "crashed-pid", "created_at": time.time() - 9999}),
+        encoding="utf-8",
+    )
+    assert lock.exists()
+    assert not path.exists()
+
+    # A new sealer recovers the stale lock and publishes.
+    seal_manifest(manifest, path)
+    sealed = verify_sealed_manifest(path)
+    assert sealed.run.run_id == "stale-i"
+    assert not lock.exists(), "the stale lock should be released after publication"
+
+    # Recovery never overwrites an already-present final: pre-create a lock whose
+    # final already holds a DIFFERENT manifest, then a sealer must CONFLICT.
+    path.unlink()
+    manifest_a = _build(_verified(run_id="stale-i-a"))
+    manifest_b = _build(_verified(run_id="stale-i-b"))
+    seal_manifest(manifest_a, path)
+    lock.write_text(
+        _json.dumps({"owner": "crashed-pid-2", "created_at": time.time() - 9999}),
+        encoding="utf-8",
+    )
+    # Even with a stale lock present, the sealer sees the final first and conflicts
+    # rather than recovering the lock and overwriting.
+    with pytest.raises(ManifestSealConflict):
+        seal_manifest(manifest_b, path)
+    assert verify_sealed_manifest(path).run.run_id == "stale-i-a"
+
+
+def test_double_check_after_lock_does_not_overwrite_new_final(tmp_path: Path) -> None:
+    """J (§25): a sealer that waits on a held lock, then acquires it AFTER another
+    writer published, must re-check the final and compare (idempotent/conflict)
+    instead of blindly overwriting the manifest that appeared while it waited."""
+    import threading
+
+    from hisiem_soc_copilot.evaluation import sealer as sealer_mod
+
+    path = tmp_path / "manifest.json"
+    manifest_a = _build(_verified(run_id="dc-a"))
+    manifest_b = _build(_verified(run_id="dc-b"))
+    lock = tmp_path / "manifest.json.seal.lock"
+
+    # B (sealer) starts, observes the final ABSENT, and is about to claim the lock.
+    results: list[Exception | None] = []
+
+    def sealer_b() -> None:
+        try:
+            seal_manifest(manifest_b, path)
+            results.append(None)
+        except Exception as exc:  # noqa: BLE001 - capture the typed outcome
+            results.append(exc)
+
+    # Hold the lock first so B cannot acquire it immediately.
+    holder_release = threading.Event()
+    holder_won = threading.Event()
+
+    def holder() -> None:
+        # Acquire the lock the same way the sealer does.
+        token = sealer_mod._owner_token()  # noqa: SLF001
+        acquired = sealer_mod._acquire_lock(lock, token)  # noqa: SLF001
+        holder_won.set()
+        if not acquired:
+            return
+        # While holding the lock, A publishes the final manifest via a direct
+        # atomic write (simulating a writer that won the claim before B).
+        sealer_mod._write_atomic(path, to_json(manifest_a).encode("utf-8"))  # noqa: SLF001
+        holder_release.wait(timeout=10)
+        sealer_mod._release_lock(lock, token)  # noqa: SLF001
+
+    holder_thread = threading.Thread(target=holder)
+    holder_thread.start()
+    assert holder_won.wait(timeout=10), "holder never acquired the lock"
+
+    b_thread = threading.Thread(target=sealer_b)
+    b_thread.start()
+    # Let B spin waiting for the lock, then release the holder (A already published).
+    time.sleep(0.2)
+    holder_release.set()
+    holder_thread.join(timeout=10)
+    b_thread.join(timeout=10)
+
+    assert len(results) == 1
+    # B must NOT overwrite A: B's bytes differ, so B reports a conflict and A's
+    # manifest survives.
+    assert isinstance(results[0], ManifestSealConflict)
+    assert verify_sealed_manifest(path).run.run_id == "dc-a"
+
+
+def test_losers_wait_bounded_and_raise_typed_error_on_hung_holder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J (§25): a contender whose lock holder never completes (and is never stale
+    within the bounded wait) must raise a typed ManifestPersistenceError — never a
+    bare TimeoutError, and never an infinite wait."""
+    from hisiem_soc_copilot.evaluation import sealer as sealer_mod
+
+    monkeypatch.setattr(sealer_mod, "SEAL_LOCK_WAIT_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(sealer_mod, "SEAL_LOCK_POLL_INTERVAL_SECONDS", 0.02)
+
+    path = tmp_path / "manifest.json"
+    manifest = _build(_verified(run_id="hung-j"))
+
+    lock = tmp_path / "manifest.json.seal.lock"
+    # created_at far in the FUTURE -> never stale within the bounded wait.
+    lock.write_text(
+        json.dumps({"owner": "hung-holder", "created_at": time.time() + 60}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestPersistenceError):
+        seal_manifest(manifest, path)
+    assert not path.exists()  # nothing was published by the hung holder

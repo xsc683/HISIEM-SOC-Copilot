@@ -113,6 +113,7 @@ def _alert_to_dict(alert: ResolvedAlert) -> dict[str, Any]:
         "rule_name": alert.rule_name,
         "entity": alert.entity,
         "created_at": alert.created_at,
+        "timestamp": alert.timestamp,
         "event_count": alert.event_count,
         "status": alert.status,
         "related_event_refs": [
@@ -144,6 +145,7 @@ def dump_draft(draft: MaterializationDraft) -> str:
         "resolved_alert": _alert_to_dict(draft.resolved_alert) if draft.resolved_alert else None,
         "failure": draft.failure,
         "verified_at": draft.verified_at,
+        "alert_processing_not_before": draft.alert_processing_not_before,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -191,6 +193,7 @@ def load_draft_text(
         resolved_alert=_alert_from(alert_raw) if isinstance(alert_raw, dict) else None,
         failure=_opt_str(data.get("failure")),
         verified_at=str(data.get("verified_at") or ""),
+        alert_processing_not_before=str(data.get("alert_processing_not_before") or ""),
     )
 
 
@@ -309,6 +312,7 @@ def _alert_from(item: dict[str, Any]) -> ResolvedAlert:
         rule_name=_opt_str(item.get("rule_name")),
         entity=_opt_str(item.get("entity")),
         created_at=str(item.get("created_at") or ""),
+        timestamp=str(item.get("timestamp") or ""),
         event_count=int(item.get("event_count") or 0),
         status=str(item.get("status") or ""),
         related_event_refs=refs,

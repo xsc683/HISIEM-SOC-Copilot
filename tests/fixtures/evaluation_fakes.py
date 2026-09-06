@@ -107,6 +107,10 @@ def source_alert(
         created_at="2026-09-05T12:00:10Z",
         event_count=event_count,
         status="OPEN",
+        # alert @timestamp (event-time window end): falls inside the canned plan's
+        # F1/W1 event-time scope (plan anchored at fixed_now 2026-09-05T12:00:00Z,
+        # F1..S1 within the window, W1 ~7 min later). Distinct from created_at.
+        timestamp="2026-09-05T12:00:08Z",
     )
 
 

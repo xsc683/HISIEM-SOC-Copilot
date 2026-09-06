@@ -172,7 +172,20 @@ class Gp01Materializer:
         # reconciliation/resume (allowed); a DIFFERENT run on the same identity is
         # a typed collision. Both checks run before any state transition/write.
         await self._check_run_collision()
+        # Freeze the processing-time freshness lower bound ONCE for a fresh run
+        # (empty bound = not yet frozen). A resume keeps the persisted value; it is
+        # never re-derived from now(), so stale-alert protection does not drift.
+        self._freeze_alert_processing_not_before()
         self._set_state(MaterializationState.PREFLIGHTED)
+
+    def _freeze_alert_processing_not_before(self) -> None:
+        """Freeze ``alert_processing_not_before`` the first time preflight runs on
+        a fresh draft. Alert ``created_at`` (processing-time) is only ever compared
+        against this frozen run boundary — never the F1/W1 event-time window. A
+        resume reuses the persisted value; never re-derives now()."""
+        if self._draft.alert_processing_not_before:
+            return  # already frozen on a prior live run / persisted draft
+        self._draft.alert_processing_not_before = _iso_now()
 
     def _validate_time_plan(self) -> None:
         """E1-B.3 §10.5: validate the bound plan's past/detection-window/year
@@ -233,10 +246,23 @@ class Gp01Materializer:
         reused/derived the same attack source:
 
         - no matching events            -> fresh run, proceed;
-        - matching events aligned to    -> the SAME run (a reconciliation/resume),
-          this run's F1..F5 instants       proceed WITHOUT re-injecting;
+        - matching events aligned to    -> the provider already holds THIS run's
+          this run's F1..F5 instants       events. Whether that authorizes a
+          + draft carries an                resume/reconcile (zero duplicate
+            authoritative injection          writes) or is a refused collision
+            ledger (``injected``             depends on the LOCAL draft:
+            non-empty)                       see below;
         - matching events NOT aligned   -> a DIFFERENT run on the same identity ->
           to this run's F1..F5 instants    raise ``RunIdentityCollision``.
+
+        Blocker (correctness round): provider-aligned events prove the PROVIDER
+        resources exist — they do NOT prove the CURRENT mutable draft has safely
+        completed its injection stage. A fresh draft (no ``injected`` records) must
+        therefore NOT proceed to ``inject_events`` just because aligned events
+        exist: it cannot prove it owns them, and injecting again would duplicate
+        writes. Only a draft whose authoritative ``injected`` ledger records prior
+        injection attempts may reconcile (zero new writes for already-attempted
+        roles).
         """
         f1 = self._time_plan.events["F1"]
         w1 = self._time_plan.events["W1"]
@@ -266,17 +292,30 @@ class Gp01Materializer:
                 if abs((ts - instant).total_seconds()) <= _RESOLVE_WINDOW_SECONDS:
                     aligned += 1
                     break
-        if aligned > 0:
-            return  # the SAME run already injected — the CLI's inject gating avoids a re-inject
-        # Matching events that align to NONE of this run's committed F1..F5
-        # instants: a different run that reused/derived this exact attack identity.
-        raise RunIdentityCollision(
-            f"preflight found {len(existing)} existing authentication_failure events "
-            f"for source={self._identity.attack_source_ip!r} user={self._identity.user_name!r} "
-            f"host={self._identity.host_name!r} that align to none of this run's "
-            "committed F1..F5 instants — a different run appears to reuse this "
-            "identity; refusing to write"
-        )
+        if aligned == 0:
+            # Matching events that align to NONE of this run's committed F1..F5
+            # instants: a different run that reused/derived this exact attack
+            # identity.
+            raise RunIdentityCollision(
+                f"preflight found {len(existing)} existing authentication_failure "
+                f"events for source={self._identity.attack_source_ip!r} "
+                f"user={self._identity.user_name!r} host={self._identity.host_name!r} "
+                "that align to none of this run's committed F1..F5 instants — a "
+                "different run appears to reuse this identity; refusing to write"
+            )
+        # Aligned provider events exist. Only an authoritative LOCAL injection
+        # ledger proves THIS draft already attempted these roles; a fresh/partial
+        # draft must not blindly inject again (duplicate-write blocker).
+        if not self._draft.injected:
+            raise RunIdentityCollision(
+                "aligned provider events exist but the local authoritative "
+                "injection ledger is absent; refusing duplicate injection "
+                "(re-run with the same run_id + persisted draft to reconcile, or "
+                "use a NEW run_id for a genuinely fresh run)"
+            )
+        # The draft records prior injection attempts -> resume/reconcile is safe:
+        # the caller's inject gate skips already-attempted roles, so no duplicate
+        # writes occur.
 
     # -- render + inject ---------------------------------------------------
 
@@ -477,14 +516,24 @@ class Gp01Materializer:
         if self._draft.resolved_alert is not None:
             self._set_state(MaterializationState.ALERT_RESOLVED)
             return
+        # Event-time scope (E1-B.3 §6): the detection window [F1-1m, W1+1m] is the
+        # alert's ``@timestamp`` (event-time / window-end) binding box. ``created_at``
+        # (processing-time) is a SEPARATE clock and is only used as the optional
+        # freshness lower bound the draft froze when THIS materialization began.
         window_from = self._time_plan.events["F1"] - timedelta(minutes=1)
         window_to = self._time_plan.events["W1"] + timedelta(minutes=1)
+        processing_not_before = (
+            _utc_dt(self._draft.alert_processing_not_before)
+            if self._draft.alert_processing_not_before
+            else None
+        )
         resolved = await self._reader.wait_for_alert(
             attack_source_ip=self._identity.attack_source_ip,
-            from_=window_from,
-            to=window_to,
+            event_time_from=window_from,
+            event_time_to=window_to,
             deadline=deadline,
             interval=interval,
+            processing_time_not_before=processing_not_before,
         )
         self._draft.resolved_alert = resolved
         self._set_state(MaterializationState.ALERT_RESOLVED)
