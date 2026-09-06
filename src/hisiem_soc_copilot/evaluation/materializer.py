@@ -127,6 +127,7 @@ class Gp01Materializer:
             bound=True,
             identity=identity,
             time_plan=time_plan,
+            alert_processing_not_before=_iso_now(),
         )
 
     @property
@@ -181,10 +182,14 @@ class Gp01Materializer:
         self._set_state(MaterializationState.PREFLIGHTED)
 
     def _freeze_alert_processing_not_before(self) -> None:
-        """Freeze ``alert_processing_not_before`` the first time preflight runs on
-        a fresh draft. Alert ``created_at`` (processing-time) is only ever compared
-        against this frozen run boundary — never the F1/W1 event-time window. A
-        resume reuses the persisted value; never re-derives now()."""
+        """Freeze ``alert_processing_not_before`` for a fresh draft.
+
+        For a fresh run the bound is set at construction (before any preflight
+        HTTP I/O), so it always predates any alert the run's OWN injection can
+        create — a sub-second preflight delay must not push the bound past a
+        window that closed during injection. This method is a belt-and-suspenders
+        fallback for a draft rehydrated with an empty bound (legacy/partial
+        ledger). A resume reuses the persisted value; never re-derives now()."""
         if self._draft.alert_processing_not_before:
             return  # already frozen on a prior live run / persisted draft
         self._draft.alert_processing_not_before = _iso_now()

@@ -485,6 +485,34 @@ def test_processing_freshness_uses_created_at_only_against_run_bound() -> None:
     assert _alert_processing_not_before(no_created, None) is True
 
 
+def test_processing_freshness_tolerates_subsecond_clock_skew() -> None:
+    """An alert a run's OWN injected events created can carry a ``created_at`` a
+    fraction of a second BEFORE the host froze the bound (the detection engine and
+    materializer clocks are different processes). A small tolerance must accept it;
+    a genuinely stale alert (minutes old) is still excluded."""
+    bound = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
+    # created_at 200 ms before the bound: legitimately this run's, accepted.
+    skew = map_found_alert(
+        _flat_alert_payload(
+            address_id="es-skew",
+            created_at="2026-09-05T11:59:59.800Z",  # 200 ms before bound
+            timestamp="2026-09-05T12:03:00Z",
+        )
+    )
+    assert skew is not None
+    assert _alert_processing_not_before(skew, bound) is True
+    # created_at 2 minutes before the bound: genuinely stale, still excluded.
+    stale2 = map_found_alert(
+        _flat_alert_payload(
+            address_id="es-stale2",
+            created_at="2026-09-05T11:58:00Z",
+            timestamp="2026-09-05T12:03:00Z",
+        )
+    )
+    assert stale2 is not None
+    assert _alert_processing_not_before(stale2, bound) is False
+
+
 def test_matches_run_alert_requires_rule_and_attack_entity() -> None:
     own = map_found_alert(
         _alert_payload(address_id="es-own", timestamp="2026-09-05T12:03:00Z")

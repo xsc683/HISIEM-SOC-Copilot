@@ -324,6 +324,21 @@ async def test_preflight_happy_path() -> None:
     assert materializer.draft.alert_processing_not_before != ""
 
 
+async def test_freshness_bound_frozen_at_construction_before_preflight() -> None:
+    """The alert processing-time lower bound is frozen at MATERIALIZER
+    CONSTRUCTION (before any preflight HTTP I/O), so it always predates a window
+    that closes during the run's own injection. Regression: a sub-second preflight
+    delay must not push the bound past an alert the run's own events create."""
+    materializer = _materializer(reader=_reader_with_resolved())
+    # Bound is set the moment the materializer (and its fresh draft) is built —
+    # well before preflight runs its rule/collision I/O.
+    bound = materializer.draft.alert_processing_not_before
+    assert bound != ""
+    # A later preflight must NOT move the bound forward (freeze is once).
+    await materializer.preflight(rule=_rule(), reachable=True)
+    assert materializer.draft.alert_processing_not_before == bound
+
+
 async def test_preflight_freeze_is_once_and_resume_reuses_persisted_bound() -> None:
     """E (§25): the alert processing-time lower bound is frozen ONCE on the first
     live preflight and a resume REUSES the persisted value — it is never re-derived

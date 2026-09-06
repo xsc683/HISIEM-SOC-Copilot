@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -58,6 +58,14 @@ _PAGE_SIZE = 200
 
 # The committed GP-01 detection rule the materializer resolves against.
 _GP01_RULE_ID = "rule-ssh-brute-force-001"
+
+# Clock-skew tolerance (seconds) for the alert processing-time freshness bound.
+# The detection engine's ``created_at`` and the materializer host's frozen bound
+# come from two different processes; their clocks can differ by a sub-second
+# margin, so an alert a run's OWN events created can carry a ``created_at`` a
+# fraction of a second before the bound. A small tolerance accepts those while
+# still excluding genuinely stale alerts (minutes+ old).
+_ALERT_FRESHNESS_TOLERANCE_SECONDS = 5.0
 
 
 def _opt(value: Any) -> str | None:
@@ -161,22 +169,34 @@ def _alert_in_event_time_scope(
 
 
 def _alert_processing_not_before(
-    alert: FoundAlert, processing_time_not_before: datetime | None
+    alert: FoundAlert,
+    processing_time_not_before: datetime | None,
+    *,
+    tolerance_seconds: float = _ALERT_FRESHNESS_TOLERANCE_SECONDS,
 ) -> bool:
     """Optional processing-time freshness: ``alert.created_at`` must not predate
-    the frozen run processing-time lower bound.
+    the frozen run processing-time lower bound by more than a small clock-skew
+    tolerance.
 
-    ``created_at`` is only ever compared against THIS materialization run's
-    processing-time boundary (frozen once and persisted on the draft ledger for
-    resume), never against the F1/W1 event-time window. A missing/unparseable
-    ``created_at`` fails the freshness check (cannot be proven fresh).
+    ``created_at`` (the detection engine's ``Instant.now()`` when a window closed)
+    and the run's frozen bound (the materializer host's clock) are produced by two
+    different processes whose clocks can disagree by a sub-second margin. An alert
+    that a run's OWN injected events created can therefore carry a ``created_at`` a
+    fraction of a second BEFORE the host froze the bound. A small tolerance accepts
+    those while still excluding genuinely stale alerts (minutes+ old), whose
+    ``created_at`` falls far below the bound. ``created_at`` is only ever compared
+    against THIS materialization run's processing-time boundary (frozen once and
+    persisted on the draft ledger for resume), never against the F1/W1 event-time
+    window. A missing/unparseable ``created_at`` fails the freshness check (cannot
+    be proven fresh).
     """
     if processing_time_not_before is None:
         return True  # freshness check disabled
     created = _parse_ts_tolerant(alert.created_at)
     if created is None:
         return False
-    return created >= processing_time_not_before
+    tolerance = timedelta(seconds=tolerance_seconds)
+    return created + tolerance >= processing_time_not_before
 
 
 def _matches_run_alert(alert: FoundAlert, rule_id: str, attack_source_ip: str) -> bool:
