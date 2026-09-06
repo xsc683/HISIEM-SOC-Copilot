@@ -34,13 +34,16 @@ _ALLOWED_FRAGMENTS = frozenset(
         # stdlib
         "__future__",
         "asyncio",
+        "collections",
         "contextlib",
         "dataclasses",
         "datetime",
         "enum",
+        "fcntl",  # POSIX advisory publication lock (platform-branched in sealer)
         "hashlib",
         "ipaddress",
         "json",
+        "msvcrt",  # Windows advisory publication lock (platform-branched in sealer)
         "os",
         "pathlib",
         "socket",

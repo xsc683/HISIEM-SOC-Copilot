@@ -5,7 +5,8 @@ No network / provider / model I/O: drives ManifestBuilder + sealer over a
 draft rejection, byte-determinism, tamper detection, no-overwrite immutability,
 W1 evidence isolation, NaN/Infinity rejection, the oracle-free launch projection,
 and CROSS-PROCESS first-writer-wins seal concurrency (E1-B.4 §20/§21) exercised
-with REAL subprocesses.
+with REAL subprocesses under the kernel-backed advisory publication lock (stable
+guard file; crash-release via process death).
 """
 
 from __future__ import annotations
@@ -354,7 +355,8 @@ def test_launch_projection_contains_only_launch_fields() -> None:
 # §20/§21 — CROSS-PROCESS first-writer-wins seal concurrency (E1-B.4 correctness
 # round). REAL worker subprocesses (not threads / asyncio / multiprocessing
 # shared-memory), launched via subprocess.run against the venv interpreter, so
-# the atomic O_CREAT|O_EXCL claim is exercised across independent processes.
+# the kernel-backed advisory lock on the stable guard file is exercised across
+# independent processes.
 # ---------------------------------------------------------------------------
 
 
@@ -376,8 +378,8 @@ def _spawn_workers(
     JSON-encoded list of positional argv entries to that spec. All workers are
     Popen'd first and parked on a release barrier (a sentinel file whose absence
     they spin on) so every process reaches the seal gate before any is released —
-    guaranteeing genuinely CONTENDED O_EXCL claims, not merely serialized seals.
-    stdout/stderr are captured as text.
+    guaranteeing genuinely CONTENDED kernel-lock acquisition, not merely serialized
+    seals. stdout/stderr are captured as text.
     """
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)  # hermetic: no ambient test-path leakage
@@ -484,7 +486,8 @@ manifest = build_manifest(
 expected = to_json(manifest).encode("utf-8")
 
 # Park on the release barrier: bounded spin (no unbounded wall-clock sleep) until
-# the parent has spawned every worker, so the O_EXCL claims below genuinely race.
+# the parent has spawned every worker, so the advisory-lock acquisitions below
+# genuinely race.
 import os as _os
 import time as _time
 
@@ -611,10 +614,11 @@ def test_concurrent_seal_identical_manifests_both_succeed(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# §20/§25 — atomically-visible publication + stale-lock recovery (correctness round
-# §25, cases F-J). H/I/J are exercised with real threads + real os calls (the lock
-# file + atomic rename semantics are identical across threads and processes); F/G
-# above already prove real multi-process contention with subprocesses.
+# §20/§25 — kernel-backed publication lock: atomic visibility + crash release +
+# double-check-after-lock (correctness round §25, cases F-J). H/I/J are exercised
+# with real threads + real os calls where the protocol is identical across threads
+# and processes; the crash-release + contention cases use REAL subprocesses (the
+# kernel, not a thread scheduler, arbitrates lock lifetime).
 # ---------------------------------------------------------------------------
 
 
@@ -659,51 +663,11 @@ def test_reader_never_observes_partial_final_manifest(tmp_path: Path) -> None:
     assert path.read_bytes() == data
 
 
-def test_stale_lock_recovered_and_does_not_overwrite_present_final(tmp_path: Path) -> None:
-    """I (§25): a lock left by a crashed writer (final absent) is recoverable after
-    the stale threshold; a subsequent sealer succeeds. Recovery never overwrites a
-    final that has already appeared."""
-    path = tmp_path / "manifest.json"
-    lock = tmp_path / "manifest.json.seal.lock"
-    manifest = _build(_verified(run_id="stale-i"))
-
-    # Simulate a crashed writer: create the lock with an OLD created_at.
-    import json as _json
-
-    lock.write_text(
-        _json.dumps({"owner": "crashed-pid", "created_at": time.time() - 9999}),
-        encoding="utf-8",
-    )
-    assert lock.exists()
-    assert not path.exists()
-
-    # A new sealer recovers the stale lock and publishes.
-    seal_manifest(manifest, path)
-    sealed = verify_sealed_manifest(path)
-    assert sealed.run.run_id == "stale-i"
-    assert not lock.exists(), "the stale lock should be released after publication"
-
-    # Recovery never overwrites an already-present final: pre-create a lock whose
-    # final already holds a DIFFERENT manifest, then a sealer must CONFLICT.
-    path.unlink()
-    manifest_a = _build(_verified(run_id="stale-i-a"))
-    manifest_b = _build(_verified(run_id="stale-i-b"))
-    seal_manifest(manifest_a, path)
-    lock.write_text(
-        _json.dumps({"owner": "crashed-pid-2", "created_at": time.time() - 9999}),
-        encoding="utf-8",
-    )
-    # Even with a stale lock present, the sealer sees the final first and conflicts
-    # rather than recovering the lock and overwriting.
-    with pytest.raises(ManifestSealConflict):
-        seal_manifest(manifest_b, path)
-    assert verify_sealed_manifest(path).run.run_id == "stale-i-a"
-
-
 def test_double_check_after_lock_does_not_overwrite_new_final(tmp_path: Path) -> None:
-    """J (§25): a sealer that waits on a held lock, then acquires it AFTER another
-    writer published, must re-check the final and compare (idempotent/conflict)
-    instead of blindly overwriting the manifest that appeared while it waited."""
+    """J (§25): a sealer that waits on a held kernel lock, then acquires it AFTER
+    another writer published, must re-check the final and compare (idempotent/
+    conflict) instead of blindly overwriting the manifest that appeared while it
+    waited."""
     import threading
 
     from hisiem_soc_copilot.evaluation import sealer as sealer_mod
@@ -711,9 +675,8 @@ def test_double_check_after_lock_does_not_overwrite_new_final(tmp_path: Path) ->
     path = tmp_path / "manifest.json"
     manifest_a = _build(_verified(run_id="dc-a"))
     manifest_b = _build(_verified(run_id="dc-b"))
-    lock = tmp_path / "manifest.json.seal.lock"
 
-    # B (sealer) starts, observes the final ABSENT, and is about to claim the lock.
+    # B (sealer) starts, observes the final ABSENT, and is about to acquire the lock.
     results: list[Exception | None] = []
 
     def sealer_b() -> None:
@@ -723,26 +686,32 @@ def test_double_check_after_lock_does_not_overwrite_new_final(tmp_path: Path) ->
         except Exception as exc:  # noqa: BLE001 - capture the typed outcome
             results.append(exc)
 
-    # Hold the lock first so B cannot acquire it immediately.
+    # Hold the kernel lock first so B cannot acquire it immediately.
     holder_release = threading.Event()
     holder_won = threading.Event()
 
     def holder() -> None:
-        # Acquire the lock the same way the sealer does.
-        token = sealer_mod._owner_token()  # noqa: SLF001
-        acquired = sealer_mod._acquire_lock(lock, token)  # noqa: SLF001
+        handle = sealer_mod._open_guard(path)  # noqa: SLF001
+        try:
+            while not sealer_mod._try_lock_nb(handle):  # noqa: SLF001
+                time.sleep(0.01)
+        except Exception:  # noqa: BLE001 - never let the holder thread die silently
+            handle.close()
+            raise
         holder_won.set()
-        if not acquired:
-            return
-        # While holding the lock, A publishes the final manifest via a direct
-        # atomic write (simulating a writer that won the claim before B).
-        sealer_mod._write_atomic(path, to_json(manifest_a).encode("utf-8"))  # noqa: SLF001
-        holder_release.wait(timeout=10)
-        sealer_mod._release_lock(lock, token)  # noqa: SLF001
+        try:
+            # While holding the lock, A publishes the final manifest via a direct
+            # atomic write (simulating a writer that won the publication before B).
+            sealer_mod._write_atomic(  # noqa: SLF001
+                path, to_json(manifest_a).encode("utf-8")
+            )
+            holder_release.wait(timeout=10)
+        finally:
+            sealer_mod._release_lock(handle)  # noqa: SLF001
 
     holder_thread = threading.Thread(target=holder)
     holder_thread.start()
-    assert holder_won.wait(timeout=10), "holder never acquired the lock"
+    assert holder_won.wait(timeout=10), "holder never acquired the kernel lock"
 
     b_thread = threading.Thread(target=sealer_b)
     b_thread.start()
@@ -762,9 +731,10 @@ def test_double_check_after_lock_does_not_overwrite_new_final(tmp_path: Path) ->
 def test_losers_wait_bounded_and_raise_typed_error_on_hung_holder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """J (§25): a contender whose lock holder never completes (and is never stale
-    within the bounded wait) must raise a typed ManifestPersistenceError — never a
-    bare TimeoutError, and never an infinite wait."""
+    """J (§25): a contender whose kernel-lock holder never completes within the
+    bounded wait must raise a typed ManifestPersistenceError — never a bare
+    TimeoutError/OSError, and never an infinite wait. There is no stale-lease
+    recovery to unbind a hung holder; the bounded nonblocking wait is the backstop."""
     from hisiem_soc_copilot.evaluation import sealer as sealer_mod
 
     monkeypatch.setattr(sealer_mod, "SEAL_LOCK_WAIT_TIMEOUT_SECONDS", 0.3)
@@ -773,13 +743,142 @@ def test_losers_wait_bounded_and_raise_typed_error_on_hung_holder(
     path = tmp_path / "manifest.json"
     manifest = _build(_verified(run_id="hung-j"))
 
-    lock = tmp_path / "manifest.json.seal.lock"
-    # created_at far in the FUTURE -> never stale within the bounded wait.
-    lock.write_text(
-        json.dumps({"owner": "hung-holder", "created_at": time.time() + 60}),
-        encoding="utf-8",
-    )
+    # Hold the kernel lock in THIS process so the sealer cannot acquire it within
+    # the bounded window — a real (os-level) lock holder that never releases.
+    holder_handle = sealer_mod._open_guard(path)  # noqa: SLF001
+    while not sealer_mod._try_lock_nb(holder_handle):  # noqa: SLF001
+        time.sleep(0.01)
+    try:
+        with pytest.raises(ManifestPersistenceError):
+            seal_manifest(manifest, path)
+        assert not path.exists()  # nothing was published by the hung holder
+    finally:
+        sealer_mod._release_lock(holder_handle)  # noqa: SLF001
+    # After the holder releases, the SAME sealer succeeds — the guard is reusable.
+    seal_manifest(manifest, path)
+    assert verify_sealed_manifest(path).run.run_id == "hung-j"
+    assert tmp_path / "manifest.json.seal.lock"  # guard persists (never deleted)
 
-    with pytest.raises(ManifestPersistenceError):
-        seal_manifest(manifest, path)
-    assert not path.exists()  # nothing was published by the hung holder
+
+def _hermetic_env(barrier: str | None) -> dict[str, str]:
+    """A PYTHONPATH-clean env for subprocess workers; the release barrier is set
+    only when supplied."""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("_SEAL_BARRIER", None)
+    if barrier is not None:
+        env["_SEAL_BARRIER"] = barrier
+    return env
+
+
+# Crash worker: acquires the kernel lock on the guard and then dies WITHOUT ever
+# unlocking or closing the handle (os._exit never runs finally/atexit). Only the
+# kernel can release the lock — at process death. exit code 7 signals the crash.
+_CRASH_WORKER = r"""
+import os
+import sys
+import time
+from pathlib import Path as _Path
+
+from hisiem_soc_copilot.evaluation import sealer as sealer_mod
+
+target = _Path(sys.argv[1])
+
+_barrier = os.environ.get("_SEAL_BARRIER")
+if _barrier:
+    for _ in range(10_000):
+        if os.path.exists(_barrier):
+            break
+        time.sleep(0.0005)
+
+handle = sealer_mod._open_guard(target)
+while not sealer_mod._try_lock_nb(handle):
+    time.sleep(0.001)
+print("LOCKED", flush=True)
+os._exit(7)  # noqa: PLR1722 - deliberate hard crash; never unlock/close
+"""
+
+
+def test_crash_releases_lock_and_next_sealer_succeeds(tmp_path: Path) -> None:
+    """Kernel lock lifetime (no stale-timeout, no ABA): a writer that CRASHES while
+    holding the publication lock releases it when its process dies; the next sealer
+    (in THIS process) immediately acquires the freed lock and publishes."""
+    path = tmp_path / "manifest.json"
+    manifest = _build(_verified(run_id="crash-k"))
+
+    crash = subprocess.run(
+        [_subprocess_python(), "-c", _CRASH_WORKER, str(path)],
+        capture_output=True,
+        text=True,
+        env=_hermetic_env(barrier=None),
+    )
+    assert crash.returncode == 7, f"crash worker must os._exit(7); got {crash!r}"
+    assert "LOCKED" in crash.stdout, f"holder never locked; got {crash!r}"
+
+    # The stable guard persists (never deleted by crash recovery) and the crashed
+    # holder never published a final manifest.
+    guard = tmp_path / "manifest.json.seal.lock"
+    assert guard.exists(), "the stable guard file must persist after a crash"
+    assert not path.exists(), "crashed holder must not have published a final"
+
+    # The SAME process now acquires the freed kernel lock and publishes. There is no
+    # stale lease/record to wait out — the kernel released the lock at process exit.
+    seal_manifest(manifest, path)
+    assert verify_sealed_manifest(path).run.run_id == "crash-k"
+
+
+def test_kernel_lock_blocks_second_process_until_holder_releases(
+    tmp_path: Path,
+) -> None:
+    """Two REAL processes contend on one kernel lock: while the holder keeps it, a
+    second process's seal can neither acquire the lock nor publish; only after the
+    holder releases (or dies) does the contender proceed. This proves the sealer
+    serializes publication across processes through the OS lock — the ABA window of
+    the old lock-file unlink protocol is gone."""
+    path = tmp_path / "manifest.json"
+    shared_sealed_at = "2026-09-05T12:01:30Z"
+
+    # Worker A: seal different-bytes manifest in a subprocess, racing the local
+    # holder. It must wait out its bounded window (no stale-lock recovery can free
+    # our live hold) and report a typed error — NOT publish over us.
+    from hisiem_soc_copilot.evaluation import sealer as sealer_mod
+
+    sealer_mod.SEAL_LOCK_WAIT_TIMEOUT_SECONDS = 0.4  # type: ignore[assignment]
+    sealer_mod.SEAL_LOCK_POLL_INTERVAL_SECONDS = 0.02  # type: ignore[assignment]
+    try:
+        handle = sealer_mod._open_guard(path)  # noqa: SLF001
+        while not sealer_mod._try_lock_nb(handle):  # noqa: SLF001
+            time.sleep(0.01)
+        try:
+            contender = subprocess.run(
+                [
+                    _subprocess_python(),
+                    "-c",
+                    _WORKER_SCRIPT,
+                    str(path),
+                    "contend",
+                    "x",
+                    shared_sealed_at,
+                    json.dumps({"alert": {"address_id": "es-doc-contend"}}),
+                ],
+                capture_output=True,
+                text=True,
+                env=_hermetic_env(barrier=None),
+            )
+            assert contender.returncode == 3, (
+                f"contender must time out while we hold the lock; got {contender!r}"
+            )
+            assert "ManifestPersistenceError" in contender.stderr
+            assert not path.exists(), (
+                "contender must never publish while the lock is held elsewhere"
+            )
+        finally:
+            sealer_mod._release_lock(handle)  # noqa: SLF001
+    finally:
+        sealer_mod.SEAL_LOCK_WAIT_TIMEOUT_SECONDS = 10.0  # type: ignore[assignment]
+        sealer_mod.SEAL_LOCK_POLL_INTERVAL_SECONDS = 0.05  # type: ignore[assignment]
+
+    # Once the holder releases, the SAME contender input publishes cleanly — the
+    # guard was never deleted and the lock is reusable across processes.
+    seal_manifest(_build(_verified(run_id="contend-final")), path)
+    assert verify_sealed_manifest(path).run.run_id == "contend-final"
