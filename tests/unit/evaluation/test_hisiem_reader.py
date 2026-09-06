@@ -373,6 +373,40 @@ def _alert_detail_payload(payload: dict) -> dict:
     return payload
 
 
+def test_map_found_alert_event_count_wins_over_deduplicated_count() -> None:
+    """The real HISIEM brute-force alert doc carries BOTH ``event_count`` (the true
+    aggregated failure count) and ``alert.deduplicated_count`` (the suppression-
+    merge count, which is 1 even for a 5-failure alert). The mapper MUST read
+    ``event_count`` so the GP-01 threshold check sees the real failure count."""
+    payload = _flat_alert_payload(
+        address_id="es-real-both",
+        event_count=5,
+    )
+    # Append the suppression-merge count exactly as the reference SIEM does.
+    payload["alert.deduplicated_count"] = 1
+    alert = map_found_alert(payload)
+    assert alert is not None
+    assert alert.event_count == 5
+
+
+def test_map_found_alert_falls_back_to_deduplicated_count_when_event_count_absent() -> None:
+    """When the provider exposes ONLY ``alert.deduplicated_count`` (legacy/nested
+    shape), the mapper falls back to it rather than dropping the count entirely."""
+    payload = {
+        "_id": "es-dedup-only",
+        "alert": {
+            "id": "biz-dedup-only",
+            "rule_id": _RULE_ID,
+            "rule_name": "SSH Brute Force",
+            "deduplicated_count": 5,
+        },
+        "source": {"ip": _ATTACK_SOURCE},
+    }
+    alert = map_found_alert(payload)
+    assert alert is not None
+    assert alert.event_count == 5
+
+
 def test_event_time_scope_binds_only_on_alert_timestamp() -> None:
     """Event-time binding uses the alert ``@timestamp`` (window end), NEVER
     ``created_at`` (processing time)."""

@@ -366,7 +366,15 @@ def map_found_alert(raw: dict[str, Any]) -> FoundAlert | None:
         source_ip=_first(payload, "source.ip", "source_ip"),
         user_name=_first(payload, "user.name", "user_name"),
         host_name=_first(payload, "host.name", "host_name"),
-        event_count=_int(_first(payload, "alert.deduplicated_count", "event_count")),
+        # ``event_count`` is the alert's true aggregated failure count (the
+        # reference SIEM WindowRuleFunction sets it to the matched window size).
+        # ``alert.deduplicated_count`` is the SUPPRESSION-merge count (how many
+        # overlapping sliding windows were folded into one ES doc) and is NOT the
+        # failure count — a brute-force alert with dedup=1 can still hold 5
+        # failures. Read ``event_count`` FIRST so the GP-01 threshold check sees
+        # the real count, and only fall back to ``deduplicated_count`` when the
+        # true count field is absent.
+        event_count=_int(_first(payload, "event_count", "alert.deduplicated_count")),
         related_events=related,
     )
 
