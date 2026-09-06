@@ -35,6 +35,11 @@ from .contracts import (
     AmbiguousEventError,
     AmbiguousSourceAlertError,
     EventResolutionTimeout,
+    HISIEMNotReadyError,
+    HISIEMReadinessAuthError,
+    HISIEMReadinessContractMismatchError,
+    HISIEMUnavailableError,
+    PreflightError,
     RelatedEventRef,
     ResolvedAlert,
     ResolvedEvent,
@@ -43,8 +48,10 @@ from .contracts import (
 
 _PROVIDER = "hisiem"
 
-# Reachability probe endpoint (E1-B.3 §10.1).
-_READY_PATH = "/api/health"
+# Reachability probe endpoint (E1-B.3 §10.1). The real HISIEM control-api exposes
+# Spring Boot actuator health at /actuator/health (permitAll), NOT /api/health.
+# Narrow readiness contract: HTTP 200 AND body.status == "UP".
+_READY_PATH = "/actuator/health"
 
 # Bounded page size for log-search and list-alerts (list endpoint max 200).
 _PAGE_SIZE = 200
@@ -411,15 +418,70 @@ class HisiemEvaluationReader:
     def base_url(self) -> str:
         return self._base_url
 
-    async def ping(self) -> bool:
-        """Reachability probe against the HISIEM control surface (E1-B.3 §10.1)."""
+    async def readiness(self) -> None:
+        """Probe the control surface with the NARROW readiness contract.
+
+        Requires HTTP 200 AND ``body.status == "UP"``. A failure raises a TYPED
+        readiness error (E1-B.3 §10.1) so a preflight never mis-reports a contract
+        or auth problem as a generic unreachable:
+
+        - connection refused / timeout  → :class:`HISIEMUnavailableError`
+        - HTTP 401/403                  → :class:`HISIEMReadinessAuthError`
+        - HTTP 404                      → :class:`HISIEMReadinessContractMismatchError`
+        - HTTP 503, or status != "UP"   → :class:`HISIEMNotReadyError`
+
+        The materializer readiness check deliberately does NOT depend on
+        /api/data-health (heavy business health) or component-level details.
+        """
         try:
             response = await self._client.get(
                 _READY_PATH, headers={"X-Tenant-ID": self._tenant_id}
             )
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            raise HISIEMUnavailableError(
+                f"HISIEM control surface unreachable at {_READY_PATH}: "
+                f"{exc.__class__.__name__}"
+            ) from exc
+        if response.status_code == 401 or response.status_code == 403:
+            raise HISIEMReadinessAuthError(
+                f"HISIEM readiness probe at {_READY_PATH} returned "
+                f"HTTP {response.status_code} (auth rejected)"
+            )
+        if response.status_code == 404:
+            raise HISIEMReadinessContractMismatchError(
+                f"HISIEM readiness endpoint {_READY_PATH} does not exist "
+                f"(HTTP 404); control-api contract mismatch"
+            )
+        if response.status_code == 503 or response.status_code >= 500:
+            raise HISIEMNotReadyError(
+                f"HISIEM readiness probe at {_READY_PATH} returned "
+                f"HTTP {response.status_code}"
+            )
+        if response.status_code != 200:
+            raise HISIEMReadinessContractMismatchError(
+                f"HISIEM readiness probe at {_READY_PATH} returned unexpected "
+                f"HTTP {response.status_code}"
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise HISIEMReadinessContractMismatchError(
+                f"HISIEM readiness endpoint {_READY_PATH} returned a non-JSON body"
+            ) from exc
+        if not isinstance(body, dict) or body.get("status") != "UP":
+            raise HISIEMNotReadyError(
+                f"HISIEM readiness at {_READY_PATH} is not UP "
+                f"(body={body!r})"
+            )
+
+    async def ping(self) -> bool:
+        """Compatibility bool reachability probe (200+UP). Prefer ``readiness()``
+        for the typed error taxonomy; this swallows the typed failures."""
+        try:
+            await self.readiness()
+            return True
+        except PreflightError:
             return False
-        return response.status_code < 500
 
     async def get_rule_contract(self, rule_id: str) -> RuleContract | None:
         """Read the RAW rule payload and keep threshold/window/keyField/condition.

@@ -139,8 +139,10 @@ async def _materialize_run(
             reader=reader,
         )
         rule = await reader.get_rule_contract(GP01_RULE_ID)
-        reachable = await reader.ping()
-        await materializer.preflight(rule=rule, reachable=reachable)
+        # Typed readiness (200 + body.status==UP) surfaces UNAVAILABLE/AUTH_ERROR/
+        # CONTRACT_MISMATCH/NOT_READY precisely instead of a generic bool.
+        await reader.readiness()
+        await materializer.preflight(rule=rule, reachable=True)
         _checkpoint(ledger_path, materializer)
         materializer.render_events()
         _checkpoint(ledger_path, materializer)

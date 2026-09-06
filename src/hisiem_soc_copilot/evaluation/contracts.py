@@ -458,6 +458,30 @@ class RuleContractMismatch(PreflightError):
     code = "RULE_CONTRACT_MISMATCH"
 
 
+class HISIEMUnavailableError(PreflightError):
+    """Control surface connection refused / timed out (E1-B.3 §10.1)."""
+
+    code = "HISIEM_UNAVAILABLE"
+
+
+class HISIEMNotReadyError(PreflightError):
+    """Control surface reachable but not ready (HTTP 503, or body.status != UP)."""
+
+    code = "HISIEM_NOT_READY"
+
+
+class HISIEMReadinessContractMismatchError(PreflightError):
+    """The readiness endpoint returned an unexpected shape (e.g. HTTP 404)."""
+
+    code = "HISIEM_READINESS_CONTRACT_MISMATCH"
+
+
+class HISIEMReadinessAuthError(PreflightError):
+    """The readiness probe was rejected by the control surface (401/403)."""
+
+    code = "HISIEM_READINESS_AUTH_ERROR"
+
+
 class RunIdentityCollision(PreflightError):
     code = "RUN_IDENTITY_COLLISION"
 
@@ -611,6 +635,10 @@ __all__ = [
     "InvalidMaterializationTransition",
     "RuleContractMismatch",
     "RunIdentityCollision",
+    "HISIEMUnavailableError",
+    "HISIEMNotReadyError",
+    "HISIEMReadinessContractMismatchError",
+    "HISIEMReadinessAuthError",
     "EventInjectionError",
     "InjectionOutcomeIndeterminate",
     "EventResolutionTimeout",

@@ -16,6 +16,10 @@ import pytest
 from hisiem_soc_copilot.evaluation.contracts import (
     AlertResolutionTimeout,
     AmbiguousSourceAlertError,
+    HISIEMNotReadyError,
+    HISIEMReadinessAuthError,
+    HISIEMReadinessContractMismatchError,
+    HISIEMUnavailableError,
 )
 from hisiem_soc_copilot.evaluation.hisiem_reader import (
     HisiemEvaluationReader,
@@ -61,6 +65,161 @@ def test_map_rule_contract_keeps_preflight_fields() -> None:
 def test_map_rule_contract_maps_non_dict_to_none() -> None:
     assert map_rule_contract(None) is None
     assert map_rule_contract("not-a-dict") is None
+
+
+# ---------------------------------------------------------------------------
+# §10.1 — readiness probe against /actuator/health (narrow 200+status==UP)
+# ---------------------------------------------------------------------------
+
+
+def _readiness_reader(response: httpx.Response) -> HisiemEvaluationReader:
+    """A real HisiemEvaluationReader whose transport returns ONE canned response
+    for the readiness endpoint (no network)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response
+
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    return HisiemEvaluationReader(
+        tenant_id="tenant-a",
+        base_url="http://hisiem.test",
+        bearer_token="",
+        client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
+    )
+
+
+async def test_readiness_passes_on_200_up() -> None:
+    """200 {status: UP} → readiness() returns None (ready)."""
+    reader = _readiness_reader(httpx.Response(200, json={"status": "UP"}))
+    try:
+        await reader.readiness()  # must not raise
+    finally:
+        await reader.close()
+
+
+async def test_readiness_passes_ignoring_component_details() -> None:
+    """Readiness must NOT depend on component/db/kafka/flink details — a 200 with
+    {status: UP} plus extra detail keys is still ready."""
+    reader = _readiness_reader(
+        httpx.Response(
+            200,
+            json={
+                "status": "UP",
+                "components": {"postgresql": {"status": "DOWN"}},
+            },
+        )
+    )
+    try:
+        await reader.readiness()  # must not raise
+    finally:
+        await reader.close()
+
+
+async def test_readiness_503_down_is_not_ready() -> None:
+    """503 (or any status != UP) → typed HISIEMNotReadyError."""
+    reader = _readiness_reader(httpx.Response(503, json={"status": "DOWN"}))
+    try:
+        with pytest.raises(HISIEMNotReadyError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_200_but_body_not_up_is_not_ready() -> None:
+    """200 but body.status != "UP" → typed HISIEMNotReadyError (narrow contract)."""
+    reader = _readiness_reader(httpx.Response(200, json={"status": "DOWN"}))
+    try:
+        with pytest.raises(HISIEMNotReadyError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_404_is_contract_mismatch() -> None:
+    """404 (endpoint absent) → typed HISIEMReadinessContractMismatchError, NOT a
+    generic unreachable/timeout."""
+    reader = _readiness_reader(httpx.Response(404, json={}))
+    try:
+        with pytest.raises(HISIEMReadinessContractMismatchError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_401_is_auth_error() -> None:
+    reader = _readiness_reader(httpx.Response(401, json={}))
+    try:
+        with pytest.raises(HISIEMReadinessAuthError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_403_is_auth_error() -> None:
+    reader = _readiness_reader(httpx.Response(403, json={}))
+    try:
+        with pytest.raises(HISIEMReadinessAuthError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_transport_error_is_unavailable() -> None:
+    """Connection refused / timeout → typed HISIEMUnavailableError."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    reader = HisiemEvaluationReader(
+        tenant_id="tenant-a",
+        base_url="http://hisiem.test",
+        bearer_token="",
+        client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
+    )
+    try:
+        with pytest.raises(HISIEMUnavailableError):
+            await reader.readiness()
+    finally:
+        await reader.close()
+
+
+async def test_readiness_hits_actuator_health_not_data_health() -> None:
+    """The readiness probe must call /actuator/health and NEVER /api/data-health
+    (heavy business health is not the reader readiness contract)."""
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return httpx.Response(200, json={"status": "UP"})
+
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    reader = HisiemEvaluationReader(
+        tenant_id="tenant-a",
+        base_url="http://hisiem.test",
+        bearer_token="",
+        client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
+    )
+    try:
+        await reader.readiness()
+    finally:
+        await reader.close()
+    assert requested == ["/actuator/health"]
+    assert "/api/data-health" not in requested
+
+
+async def test_ping_swallows_typed_readiness_failures() -> None:
+    """ping() (bool compat) returns False on a typed readiness failure instead of
+    raising."""
+    reader = _readiness_reader(httpx.Response(404, json={}))
+    try:
+        assert await reader.ping() is False
+    finally:
+        await reader.close()
+    up_reader = _readiness_reader(httpx.Response(200, json={"status": "UP"}))
+    try:
+        assert await up_reader.ping() is True
+    finally:
+        await up_reader.close()
 
 
 def test_map_found_alert_address_id_never_from_alert_id() -> None:

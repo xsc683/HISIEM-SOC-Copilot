@@ -60,6 +60,8 @@ _RESOLVE_WINDOW_SECONDS = 3
 class PreflightProbe(Protocol):
     """Reachability probe for preflight (E1-B.3 §10.1)."""
 
+    async def readiness(self) -> None: ...
+
     async def ping(self) -> bool: ...
 
 
@@ -613,8 +615,8 @@ async def materialize(
         reader=reader,
     )
     rule = await reader.get_rule_contract(GP01_RULE_ID)
-    reachable = await reader.ping()
-    await materializer.preflight(rule=rule, reachable=reachable)
+    await reader.readiness()
+    await materializer.preflight(rule=rule, reachable=True)
     materializer.render_events()
     deadline = now + timedelta(seconds=deadline_seconds)
     await materializer.inject_events()

@@ -109,8 +109,8 @@ async def test_live_gp01_materialize_resolve_verify_seal(hisiem_reachable: bool)
             reader=reader,
         )
         rule = await reader.get_rule_contract(scenario.rule_id)
-        reachable = await reader.ping()
-        await materializer.preflight(rule=rule, reachable=reachable)
+        await reader.readiness()  # typed: UNAVAILABLE/AUTH/CONTRACT/NOT_READY
+        await materializer.preflight(rule=rule, reachable=True)
         materializer.render_events()
         deadline = now + timedelta(seconds=ev.resolve_deadline_seconds)
         await materializer.inject_events()
