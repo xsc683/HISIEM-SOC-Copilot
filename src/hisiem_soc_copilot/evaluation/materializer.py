@@ -48,7 +48,7 @@ from .contracts import (
 from .hisiem_reader import HisiemEvaluationReader, RuleContract
 from .identity import derive_event_process_id, derive_run_identity
 from .injector import WRITE_STATUS_CONNECTION_ERROR, WRITE_STATUS_INDETERMINATE, EventInjector
-from .time_plan import build_event_time_plan
+from .time_plan import W1_MAX_FUTURE_SKEW_SECONDS, build_event_time_plan
 
 # Event-time isolation for resolution. F1..F5 are spaced 10 s apart (and S1 20 s
 # after F5) and the parser sets @timestamp to the rendered wall-clock second, so a
@@ -204,9 +204,22 @@ class Gp01Materializer:
                 f"bound time plan is missing wall-clock entries for: "
                 f"{[logical.role for logical in missing]}"
             )
-        now = _now_utc()
-        if max(wall.values()) >= now:
-            raise PreflightError("bound time plan is not fully in the past when injection starts")
+        now = self._time_plan.built_at
+        # Role-aware pastness (E1-B.3 §6 / watermark-aligned): ground-truth F1..S1
+        # must be strictly in the past; W1 is the WATERMARK-CONTROL window-advance
+        # event and is EXPECTED to be (boundedly) in the future. Only W1 may be
+        # future. The events dict is UTC; wall is Asia/Shanghai local.
+        semantic_roles = [
+            logical.role
+            for logical in GP01_LOGICAL_DATASET
+            if logical.classification != "WATERMARK_CONTROL"
+        ]
+        for role in semantic_roles:
+            if events[role] >= now:
+                raise PreflightError(
+                    f"bound time plan has ground-truth role {role} at {events[role].isoformat()} "
+                    "not strictly in the past when injection starts"
+                )
         # The SSH syslog form carries no year; the parser auto-completes it, so all
         # roles must share ONE local wall-clock year (E1-B.3 §6, §10.5).
         roles = [
@@ -230,11 +243,20 @@ class Gp01Materializer:
             )
         if events["S1"] <= max_failure:
             raise PreflightError("bound time plan has S1 not strictly after the last failure")
-        # W1 advances detection past the window-close boundary (E1-B.3 §6).
-        window_close = f1 + timedelta(minutes=GP01_RULE_WINDOW_MINUTES)
-        if events["W1"] <= window_close:
+        # W1 must be FUTURE and boundedly skewed: it advances Flink's watermark
+        # across the next detection-window boundary (E1-B.3 §6 / watermark-aligned).
+        w1 = events["W1"]
+        if w1 <= now:
             raise PreflightError(
-                "bound time plan has W1 before the detection-window close boundary"
+                "bound time plan has W1 not in the future; the watermark-advance "
+                "event must close the detection window"
+            )
+        skew = (w1 - now).total_seconds()
+        if skew > W1_MAX_FUTURE_SKEW_SECONDS:
+            raise PreflightError(
+                "bound time plan has W1 future skew "
+                f"({skew:.0f}s) beyond the bounded horizon "
+                f"({W1_MAX_FUTURE_SKEW_SECONDS}s)"
             )
 
     async def _check_run_collision(self) -> None:

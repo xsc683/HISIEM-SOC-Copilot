@@ -59,6 +59,7 @@ def _plan_to_dict(plan: EventTimePlan) -> dict[str, Any]:
         "anchor_local": _rfc3339(plan.anchor_local),
         "events": {role: _rfc3339(dt) for role, dt in plan.events.items()},
         "wall_clock": {role: _rfc3339(dt) for role, dt in plan.wall_clock.items()},
+        "built_at": _rfc3339(plan.built_at),
     }
 
 
@@ -219,10 +220,12 @@ def _plan_from_dict(raw: dict[str, Any]) -> EventTimePlan:
                 out[str(role)] = _dt(value)
         return out
 
+    built_at_raw = raw.get("built_at")
     return EventTimePlan(
         anchor_local=_dt(raw.get("anchor_local")),
         events=_clock(raw.get("events")),
         wall_clock=_clock(raw.get("wall_clock")),
+        built_at=_dt(built_at_raw) if built_at_raw else _dt(raw.get("anchor_local")),
     )
 
 

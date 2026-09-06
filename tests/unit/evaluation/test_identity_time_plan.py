@@ -83,11 +83,39 @@ def test_s1_strictly_after_last_failure() -> None:
     assert plan.success_time() < _NOW
 
 
-def test_w1_after_window_close_and_past() -> None:
+def test_failures_and_s1_near_now_past() -> None:
+    """F1..F5 and S1 are NEAR-NOW past events (mirroring the reference simulator's
+    NOW-1..NOW-5): each is strictly before now and within the bounded history."""
     plan = _plan()
-    window_close = plan.failure_window_start() + _FIVE_MIN
-    assert plan.watermark_time() > window_close
-    assert plan.watermark_time() < _NOW
+    for role in GP01_FAILURE_ROLES + ("S1",):
+        assert plan.events[role] < _NOW
+        assert (_NOW - plan.events[role]) <= timedelta(seconds=90)
+
+
+def test_w1_is_next_window_boundary_plus_15_future() -> None:
+    """W1 = next 300 s boundary + 15 s, which is AFTER now (future): it advances
+    Flink's watermark across the real detection-window boundary (reference
+    simulator strategy). W1 is the ONLY future role."""
+    plan = _plan()
+    epoch_now = int(_NOW.astimezone(UTC).timestamp())
+    expected = ((epoch_now // 300) + 1) * 300 + 15
+    assert int(plan.watermark_time().timestamp()) == expected
+    assert plan.watermark_time() > _NOW  # W1 is future
+    # W1 distinct control identity is rendered separately (covered in the syslog
+    # identity tests below); here only the time-placement is asserted.
+
+
+def test_only_w1_may_be_future() -> None:
+    plan = _plan()
+    for role in ("F1", "F2", "F3", "F4", "F5", "S1"):
+        assert plan.events[role] < _NOW
+    assert plan.events["W1"] > _NOW
+
+
+def test_w1_future_skew_is_bounded() -> None:
+    plan = _plan()
+    skew = (plan.watermark_time() - _NOW).total_seconds()
+    assert 0 < skew <= 5 * 60 + 15
 
 
 def test_wall_clock_is_shanghai_local() -> None:
@@ -97,10 +125,10 @@ def test_wall_clock_is_shanghai_local() -> None:
     assert plan.wall_clock["F1"] == anchor_utc.astimezone(_SHANGHAI)
 
 
-def test_all_instants_past_for_every_role() -> None:
+def test_watermark_wall_clock_keeps_utc_instant() -> None:
     plan = _plan()
-    for role in ("F1", "F5", "S1", "W1"):
-        assert plan.events[role] < _NOW
+    # W1's local wall clock converts back to the SAME future UTC instant.
+    assert plan.wall_clock["W1"].astimezone(UTC) == plan.events["W1"]
 
 
 def test_w1_rendered_with_distinct_source_and_user() -> None:
@@ -135,10 +163,11 @@ def test_w1_rendered_with_distinct_source_and_user() -> None:
 
 
 def test_year_boundary_crossing_is_rejected() -> None:
-    # 2026-12-31T16:05 UTC = 2027-01-01T00:05 Asia/Shanghai. With a 10-minute
-    # history offset the anchor lands 2026-12-31 23:55 local while W1 lands
-    # 2027-01-01 00:02 local — the plan spans two wall-clock years → refused.
-    straddling_now = datetime(2026, 12, 31, 16, 5, 0, tzinfo=UTC)
+    # now = 2026-12-31T16:00:00Z = 2027-01-01T00:00:00 Asia/Shanghai. The 90s
+    # history offset pushes the F1 anchor onto 31 Dec local while W1 (next
+    # boundary + 15s) lands on 1 Jan local — the plan straddles two wall-clock
+    # years → refused.
+    straddling_now = datetime(2026, 12, 31, 16, 0, 0, tzinfo=UTC)
     assert straddling_now.astimezone(_SHANGHAI).year == 2027
     with pytest.raises(EventPlanCrossesYearBoundary) as exc:
         _plan(straddling_now)
@@ -146,9 +175,21 @@ def test_year_boundary_crossing_is_rejected() -> None:
 
 
 def test_year_boundary_local_midnight_crossing_is_rejected() -> None:
-    # A "now" at local 00:04 on 1 Jan: the 10-minute history offset pushes F1 back
-    # to 31 Dec local, so the plan straddles the year and is refused.
-    local_midnight_plus = datetime(2027, 1, 1, 0, 4, 0, tzinfo=_SHANGHAI)
-    assert local_midnight_plus.astimezone(UTC).year == 2026  # still prior year UTC
+    # A "now" 30 s into 1 Jan local: the 90s history offset pushes F1 back to
+    # 31 Dec local, so the plan straddles the year and is refused.
+    local_midnight_plus = datetime(2027, 1, 1, 0, 0, 30, tzinfo=_SHANGHAI)
     with pytest.raises(EventPlanCrossesYearBoundary):
         _plan(local_midnight_plus)
+
+
+def test_no_ten_minute_backdated_plan_is_possible() -> None:
+    """Regression: the OLD 10-minute-late-event plan (F1 anchored ~600 s in the
+    past) is impossible now — F1..S1 sit within the bounded near-now history, so a
+    plan whose failures are a full 10 minutes old can never be built."""
+    plan = _plan()
+    for role in GP01_FAILURE_ROLES + ("S1",):
+        age = (_NOW - plan.events[role]).total_seconds()
+        assert age < 90, f"{role} is {age:.0f}s old — must be near-now (<90s)"
+    # A caller cannot request a large history anymore (there is no such knob).
+    with pytest.raises(TypeError):
+        build_event_time_plan(now=_NOW, safe_history_offset_seconds=600)  # type: ignore[call-arg]

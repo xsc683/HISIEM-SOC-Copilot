@@ -474,6 +474,54 @@ async def test_verify_requires_all_semantic_events_resolved() -> None:
         materializer.verify()
 
 
+async def test_resolve_w1_queries_future_event_time_scope() -> None:
+    """W1 is a FUTURE event-time watermark-control role; the resolver's search
+    window for W1 must extend into the future (NOT be capped at wall-clock now),
+    so a future-@timestamp W1 doc is resolvable."""
+    from hisiem_soc_copilot.evaluation.materializer import _RESOLVE_WINDOW_SECONDS
+
+    plan = build_event_time_plan(now=_NOW)
+    assert plan.events["W1"] > _NOW  # sanity: W1 is future under the new plan
+
+    captured: dict[str, tuple[datetime, datetime]] = {}
+
+    class CapturingReader(FakeReader):
+        async def wait_for_event(
+            self,
+            *,
+            logical_role: str,
+            from_: datetime,
+            to: datetime,
+            conditions: list[dict],
+            deadline: datetime,
+            interval: float = 2.0,
+        ) -> ResolvedEvent:
+            captured[logical_role] = (from_, to)
+            event = self.resolved_events.get(logical_role)
+            if event is None:
+                raise RuntimeError(f"no canned event for {logical_role}")
+            return event
+
+    reader = _reader_with_resolved()
+    capturing = CapturingReader(
+        rule=reader.rule,
+        alert=reader.alert,
+        resolved_events=reader.resolved_events,
+    )
+    materializer = _materializer(reader=capturing)
+    await materializer.preflight(rule=_rule(), reachable=True)
+    materializer.render_events()
+    await materializer.inject_events()
+    await materializer.resolve_events(deadline=_NOW + timedelta(seconds=30), interval=0.01)
+
+    w1_from, w1_to = captured["W1"]
+    # The W1 search window is centered on W1's FUTURE instant (± resolve window)
+    # and its `to` is strictly in the future — never clamped to wall-clock now.
+    assert w1_to > _NOW
+    assert abs((w1_to - plan.events["W1"]).total_seconds()) <= _RESOLVE_WINDOW_SECONDS
+    assert w1_from > _NOW
+
+
 def test_verify_offline_happy_path() -> None:
     """DatasetVerifier over the canned resolved set passes every invariant."""
     identity = derive_run_identity("mat-run-1")

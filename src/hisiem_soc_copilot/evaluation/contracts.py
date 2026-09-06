@@ -156,17 +156,23 @@ EVENT_PLAN_CROSSES_YEAR_BOUNDARY = "EVENT_PLAN_CROSSES_YEAR_BOUNDARY"
 
 @dataclass(frozen=True)
 class EventTimePlan:
-    """Past-bound timestamps per logical role in ``Asia/Shanghai`` wall time.
+    """Past/future-bound timestamps per logical role in ``Asia/Shanghai`` wall time.
 
     ``anchor_local`` is the base wall clock (timezone-aware, Asia/Shanghai). Each
     role has an RFC3339 UTC instant (the provider ingests/returns RFC3339 UTC) and
     a local wall-clock datetime used to render the (year-less) syslog line the
     parser re-interprets in the configured timezone.
+
+    ``built_at`` is the UTC reference instant the plan was derived from. It is
+    persisted so a later preflight/validation can deterministically re-check the
+    role-aware past/future invariants against the SAME reference the builder used
+    (never a drifting wall-clock now on resume).
     """
 
     anchor_local: datetime
     events: dict[str, datetime]  # role -> RFC3339 UTC instant (deterministic)
     wall_clock: dict[str, datetime]  # role -> Asia/Shanghai local wall clock
+    built_at: datetime  # UTC reference instant the plan was derived from
 
     def failure_window_start(self) -> datetime:
         return self.events["F1"]
