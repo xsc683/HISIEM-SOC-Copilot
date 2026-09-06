@@ -69,8 +69,20 @@ def _opt(value: Any) -> str | None:
 
 
 def _first(raw: dict[str, Any], *paths: str) -> str | None:
-    """Read the first non-empty dotted path from a flattened HISIEM source."""
+    """Read the first non-empty value along any of ``paths``.
+
+    Handles BOTH the real HISIEM FLAT ECS shape (a single literal key whose name
+    contains dots, e.g. ``"alert.rule_id"``) and the legacy nested shape
+    (``raw["alert"]["rule_id"]``). For each path the LITERAL dotted key is tried
+    first, then the nested traversal.
+    """
     for path in paths:
+        # Real SIEM control-api returns FLAT dotted keys (alert.rule_id is one key).
+        literal = raw.get(path)
+        literal_value = _opt(literal)
+        if literal_value is not None:
+            return literal_value
+        # Legacy / offline-test nested shape: walk the dot-separated segments.
         node: Any = raw
         for part in path.split("."):
             if not isinstance(node, dict):
@@ -539,12 +551,21 @@ class HisiemEvaluationReader:
         The list endpoint only supports status+size server-side filtering (no
         rule/entity/time filter), so candidates are returned and the caller
         filters by rule_id + attack entity + bounded time (E1-B.3 §14).
+
+        The REAL HISIEM ``GET /api/alerts`` returns a bare top-level JSON array of
+        flat ECS alert docs (each carries the ES ``_id``). A legacy
+        ``{"items": [...]}`` envelope is also tolerated so offline tests and older
+        fixtures keep working.
         """
         params: dict[str, str | int] = {"size": min(size, 200)}
         if status is not None and status != "":
             params["status"] = status
-        response = await self._request("GET", "/api/alerts", params=params)
-        items = response.get("items") if response is not None else None
+        raw = await self._request_raw("GET", "/api/alerts", params=params)
+        if raw is None:
+            return []
+        items: object = raw
+        if isinstance(raw, dict):
+            items = raw.get("items")
         if not isinstance(items, list):
             return []
         alerts: list[FoundAlert] = []
@@ -691,14 +712,19 @@ class HisiemEvaluationReader:
                 )
             await asyncio.sleep(interval)
 
-    async def _request(
+    async def _request_raw(
         self,
         method: str,
         url: str,
         *,
         json: dict[str, object] | None = None,
         params: dict[str, str | int] | None = None,
-    ) -> dict[str, Any] | None:
+    ) -> object | None:
+        """Issue a request and return the parsed JSON body of ANY shape.
+
+        404 → None. Transport/HTTP/JSON failures raise the typed
+        :class:`ExternalServiceError` (never a bare httpx/ValueError).
+        """
         from ..application.errors import ExternalServiceError
 
         headers = {"X-Tenant-ID": self._tenant_id}
@@ -720,16 +746,57 @@ class HisiemEvaluationReader:
                 code=f"HTTP_{response.status_code}",
             )
         try:
-            body = response.json()
+            parsed: object = response.json()
+            return parsed
         except ValueError as exc:
             raise ExternalServiceError(
                 "HISIEM returned a non-JSON body",
                 service="hisiem",
                 code="INVALID_RESPONSE",
             ) from exc
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, str | int] | None = None,
+    ) -> dict[str, Any] | None:
+        from ..application.errors import ExternalServiceError
+
+        body = await self._request_raw(method, url, json=json, params=params)
+        if body is None:
+            return None
         if not isinstance(body, dict):
             raise ExternalServiceError(
                 "HISIEM returned a non-object JSON body",
+                service="hisiem",
+                code="INVALID_RESPONSE",
+            )
+        return body
+
+    async def _request_list(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, str | int] | None = None,
+    ) -> list[Any]:
+        """Issue a request that MUST yield a top-level JSON array.
+
+        The real HISIEM list endpoint (``GET /api/alerts``) returns a bare array
+        (each item a flat ECS alert doc), NOT an ``{"items": [...]}`` envelope.
+        A top-level array is the contract; anything else is a typed failure.
+        """
+        from ..application.errors import ExternalServiceError
+
+        body = await self._request_raw(method, url, params=params)
+        if body is None:
+            return []
+        if not isinstance(body, list):
+            raise ExternalServiceError(
+                "HISIEM list endpoint returned a non-array JSON body",
                 service="hisiem",
                 code="INVALID_RESPONSE",
             )

@@ -336,6 +336,37 @@ def _alert_payload(
     return payload
 
 
+def _flat_alert_payload(
+    *,
+    address_id: str,
+    rule_id: str = _RULE_ID,
+    created_at: str | None = None,
+    timestamp: str | None = None,
+    event_count: int = 5,
+    status: str = "open",
+    source_ip: str = _ATTACK_SOURCE,
+) -> dict:
+    """One REAL HISIEM alert doc: FLAT dotted ECS keys, NOT nested.
+
+    Mirrors the actual control-api ``/api/alerts`` document: top-level ``_id``
+    (the real ES doc id), ``@timestamp``, and flat dotted keys ``alert.rule_id``,
+    ``alert.created_at``, ``source.ip``, etc.
+    """
+    payload: dict[str, object] = {
+        "_id": address_id,
+        "@timestamp": timestamp or "2026-09-05T12:03:00Z",
+        "alert.id": f"biz-{address_id}",
+        "alert.rule_id": rule_id,
+        "alert.rule_name": "SSH Brute Force",
+        "alert.created_at": created_at or "2026-09-05T12:05:00Z",
+        "alert.status": status,
+        "event_count": event_count,
+        "source.ip": source_ip,
+        "event.action": "authentication_failure",
+    }
+    return payload
+
+
 def _alert_detail_payload(payload: dict) -> dict:
     """The alert-detail GET returns the SAME address; map_found_alert reads the
     top-level ``_id`` and flattens under ``alert.*`` — reuse the list payload."""
@@ -464,6 +495,35 @@ def _stub_reader(alerts: list[dict]) -> HisiemEvaluationReader:
         bearer_token="",
         client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
     )
+
+
+async def test_list_alerts_accepts_bare_array_real_shape() -> None:
+    """The REAL HISIEM /api/alerts returns a bare top-level array of FLAT dotted
+    docs. list_alerts must map them (address_id from the real _id) instead of
+    raising 'non-object JSON body'."""
+    flat = _flat_alert_payload(address_id="es-flat-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/alerts":
+            return httpx.Response(200, json=[flat])
+        return httpx.Response(404, json={})
+
+    transport = httpx.MockTransport(handler)  # type: ignore[arg-type]
+    reader = HisiemEvaluationReader(
+        tenant_id="tenant-a",
+        base_url="http://hisiem.test",
+        bearer_token="",
+        client=httpx.AsyncClient(transport=transport, base_url="http://hisiem.test"),
+    )
+    try:
+        alerts = await reader.list_alerts()
+    finally:
+        await reader.close()
+    assert len(alerts) == 1
+    assert alerts[0].address_id == "es-flat-1"  # real ES _id
+    assert alerts[0].rule_id == _RULE_ID
+    assert alerts[0].source_ip == _ATTACK_SOURCE
+    assert alerts[0].timestamp == "2026-09-05T12:03:00Z"
 
 
 async def test_alert_candidate_ignores_old_same_source_alert_outside_event_scope() -> None:
