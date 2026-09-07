@@ -25,7 +25,8 @@ class DatabaseSettings(BaseSettings):
     )
 
     database_url: str = Field(
-        default="postgresql+psycopg://copilot:copilot@127.0.0.1:5432/copilot"
+        # Local-dev contract: 5433 is Copilot's PostgreSQL (5432 is HISIEM's).
+        default="postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
     )
 
 
@@ -39,7 +40,8 @@ class LangGraphSettings(BaseSettings):
     )
 
     database_url: str = Field(
-        default="postgresql+psycopg://copilot:copilot@127.0.0.1:5432/copilot"
+        # Local-dev contract: 5433 is Copilot's PostgreSQL (5432 is HISIEM's).
+        default="postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
     )
     schema_name: str = Field(
         default="langgraph_checkpoint", validation_alias="schema"

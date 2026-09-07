@@ -12,6 +12,8 @@ dist/
 
 # Environment
 .env
+.env.local
+.env.*.local
 
 # GP-01 evaluation run artifacts (mutable ledger + sealed manifest)
 .eval-runs/

@@ -31,7 +31,7 @@ _TRUNCATE = ("outbox_message", "domain_event", "command_receipt", "investigation
 def _settings() -> Settings:
     s = Settings()
     s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5432/copilot"
+        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
     )
     return s
 

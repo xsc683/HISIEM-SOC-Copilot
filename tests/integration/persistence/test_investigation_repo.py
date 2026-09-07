@@ -32,7 +32,7 @@ from hisiem_soc_copilot.infrastructure.persistence.unit_of_work import (
 def _settings() -> Settings:
     s = Settings()
     s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5432/copilot"
+        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
     )
     return s
 
