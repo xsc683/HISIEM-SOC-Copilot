@@ -18,6 +18,9 @@ dist/
 # GP-01 evaluation run artifacts (mutable ledger + sealed manifest)
 .eval-runs/
 
+# Local runtime scratch (control-api / copilot-api host-process logs)
+.runtime/
+
 # IDE
 .idea/
 .vscode/
