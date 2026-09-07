@@ -49,7 +49,10 @@ def test_rejects_nonlocal_host() -> None:
         validate_copilot_db_url(url)
 
 
-def test_rejects_missing_url() -> None:
+def test_rejects_missing_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate from any ambient COPILOT_DATABASE_URL so "no URL configured" truly
+    # means the env var is absent (works both when a DB is up and when it is not).
+    monkeypatch.delenv("COPILOT_DATABASE_URL", raising=False)
     with pytest.raises(WrongDatabaseTargetError):
         validate_copilot_db_url(None)
 
