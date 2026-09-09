@@ -1,4 +1,4 @@
-"""GP-01 evaluation CLI — materialize / resume / seal / prepare (E1-B.3 §25).
+"""GP-01 evaluation CLI — materialize / resume / seal / prepare / execute.
 
 Commands:
     python -m hisiem_soc_copilot.evaluation.cli materialize GP-01
@@ -6,12 +6,23 @@ Commands:
     python -m hisiem_soc_copilot.evaluation.cli seal <run_id>
     python -m hisiem_soc_copilot.evaluation.cli prepare GP-01
     python -m hisiem_soc_copilot.evaluation.cli verify-manifest <run_id>
+    python -m hisiem_soc_copilot.evaluation.cli execute <run_id>
 
 ``prepare GP-01`` is a convenience that runs materialize -> resolve -> verify ->
 seal, but materialization and sealing remain separate internal contracts. Run
 artifacts live under ``<runs_dir>/gp-01/<run_id>/materialization.json`` (mutable
 recovery ledger) and ``manifest.json`` (immutable sealed evaluation artifact) —
 never one file, never committed to Git.
+
+``execute <run_id>`` is E1-C1: it drives one SEALED GP-01 manifest through the
+REAL production investigation pipeline (real HISIEM + real Copilot Postgres +
+real LangGraph checkpoint + real domain/outbox/runner code) with an explicit
+SCRIPTED model, and persists the Evaluation Execution Record under
+``<executions_dir>/gp-01/<run_id>/<execution_id>/execution.json``. The manifest
+must verify and be authoritative (clean code revision); otherwise the run fails
+closed with NO investigation. The CLI is the operator's only sanctioned door to
+the execution harness — the evaluation package itself never imports production
+infrastructure.
 """
 
 from __future__ import annotations
@@ -266,6 +277,19 @@ async def _prepare(settings: EvaluationSettings, hisiem: HisiemSettings) -> None
     print(f"prepared run {draft.run_id} (dir={run_dir})")
 
 
+async def _execute_run(dataset_run_id: str) -> int:
+    """E1-C1: run one sealed GP-01 dataset through the REAL production pipeline.
+
+    Delegates to the execution harness (the sanctioned bridge that owns the
+    production Container). The harness fails closed: a manifest that does not
+    verify or is not authoritative never starts an investigation. Returns 0 only
+    when the execution COMPLETED.
+    """
+    from ..evaluation_harness import execute_cli
+
+    return await execute_cli(dataset_run_id=dataset_run_id)
+
+
 def _build_settings() -> tuple[EvaluationSettings, HisiemSettings]:
     from ..config import get_settings
 
@@ -322,6 +346,9 @@ async def _dispatch(argv: list[str]) -> int:
         await _prepare(settings, hisiem)
         return 0
 
+    if command == "execute":
+        return await _execute_run(target)
+
     print(f"unknown command {command!r}")
     return 2
 
@@ -368,6 +395,9 @@ def _load_verified_from_draft(
 
 
 def main() -> int:
+    from ..evaluation_harness.runtime import install_selector_loop_policy
+
+    install_selector_loop_policy()
     try:
         return asyncio.run(_dispatch(sys.argv[1:]))
     except FileNotFoundError as exc:

@@ -17,6 +17,8 @@ dist/
 
 # GP-01 evaluation run artifacts (mutable ledger + sealed manifest)
 .eval-runs/
+# E1-C1 evaluation execution records (mutable operational artifacts)
+.eval-executions/
 
 # Local runtime scratch (control-api / copilot-api host-process logs)
 .runtime/

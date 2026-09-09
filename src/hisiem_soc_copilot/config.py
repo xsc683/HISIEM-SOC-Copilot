@@ -183,6 +183,8 @@ class EvaluationSettings(BaseSettings):
     tenant_id: str = "default"
     # Directory holding mutable materialization.json + sealed manifest.json.
     runs_dir: str = ".eval-runs"
+    # Directory holding Evaluation Execution Records (.eval-executions/gp-01/...).
+    executions_dir: str = ".eval-executions"
     # Bounded resolution deadline for event/alert polling (seconds).
     resolve_deadline_seconds: int = 300
     # Poll interval while waiting for events/alerts to appear (seconds).
