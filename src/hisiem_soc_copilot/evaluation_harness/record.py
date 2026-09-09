@@ -4,7 +4,7 @@ One Evaluation Execution is one operator-invoked run of the REAL production
 investigation pipeline against a sealed GP-01 manifest. The execution record is
 the durable, mutable operational artifact describing that run:
 
-- schema_version ``evaluation-execution/v1``
+- schema_version ``evaluation-execution/v2``
 - dataset identity (scenario/dataset_run_id/manifest sha256 + code revision)
 - the ONLY projection of the manifest a production investigation sees
   (provider / resource_type / address_id / business_id)
@@ -14,6 +14,12 @@ the durable, mutable operational artifact describing that run:
 - evidence/finding/hypothesis counts
 - execution_status (CREATED → RUNNING → COMPLETED | FAILED) and, on failure, a
   bounded failure category/type/message.
+
+Schema evolution: v1 records (which conflated dataset/execution provenance into
+a single ``copilot_*`` pair) are NOT silently re-parsed as v2.
+:meth:`EvaluationExecutionRecord.from_payload` validates ``schema_version`` and
+raises :class:`ExecutionSchemaError` for a missing / v1 / unknown version — no
+silent fallback. Old v1 runtime artifacts are never auto-deleted.
 
 The record NEVER contains oracle data, dataset events/control events, or secrets
 — structurally: the dataclass has no fields for them, and ``to_payload`` only
@@ -35,13 +41,24 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-EXECUTION_SCHEMA_VERSION = "evaluation-execution/v1"
+EXECUTION_SCHEMA_VERSION = "evaluation-execution/v2"
 
 # Directory name under which an execution's mutable artifact file lives.
 _EXECUTION_ARTIFACT = "execution.json"
 
 # Bounded diagnostic message length — failures never dump full exceptions/state.
 _MAX_FAILURE_MESSAGE_CHARS = 600
+
+
+class ExecutionSchemaError(ValueError):
+    """A persisted execution payload carries an unsupported/legacy schema version.
+
+    Raised by :meth:`EvaluationExecutionRecord.from_payload` when
+    ``schema_version`` is missing, a legacy ``evaluation-execution/v1``, or any
+    other version this reader does not understand. There is deliberately NO silent
+    compatibility fallback: a v1 artifact is never interpreted as v2 with default
+    empty provenance fields.
+    """
 
 
 class ExecutionStatus(StrEnum):
@@ -171,12 +188,18 @@ class EvaluationExecutionRecord:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> EvaluationExecutionRecord:
+        schema_version = payload.get("schema_version")
+        if schema_version != EXECUTION_SCHEMA_VERSION:
+            raise ExecutionSchemaError(
+                f"unsupported execution schema {schema_version!r}; this reader "
+                f"only accepts {EXECUTION_SCHEMA_VERSION}"
+            )
         launch = payload.get("launch_ref") or {}
         result = payload.get("result") or {}
         failure = payload.get("failure") or {}
         status = ExecutionStatus(str(payload.get("execution_status", "CREATED")))
         return cls(
-            schema_version=str(payload.get("schema_version", EXECUTION_SCHEMA_VERSION)),
+            schema_version=EXECUTION_SCHEMA_VERSION,
             execution_id=str(payload.get("execution_id", "")),
             scenario_id=str(payload.get("scenario_id", "")),
             dataset_run_id=str(payload.get("dataset_run_id", "")),

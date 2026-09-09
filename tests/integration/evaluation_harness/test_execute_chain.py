@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
@@ -30,9 +31,13 @@ from hisiem_soc_copilot.application.commands.investigation import StartAlertInve
 from hisiem_soc_copilot.bootstrap.container import Container
 from hisiem_soc_copilot.config import Settings
 from hisiem_soc_copilot.domain.investigation.value_objects import ExternalResourceRef
+from hisiem_soc_copilot.evaluation_harness import harness as harness_mod
 from hisiem_soc_copilot.evaluation_harness.harness import (
     CAT_ACTIVE_INVESTIGATION_EXISTS,
+    CAT_BINDING_MISSING,
+    CAT_CHECKPOINT_MISSING,
     CAT_DRIVE_FAILED,
+    CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT,
     execute_execution,
 )
 from hisiem_soc_copilot.evaluation_harness.record import (
@@ -275,11 +280,15 @@ async def test_active_investigation_collision_fails_closed(real_env) -> None:
 async def test_drive_exception_terminalizes_and_no_secret(real_env, monkeypatch) -> None:
     settings, engine, factory, container = real_env
     hisiem = FakeHisiem(alert_id="es-doc-0001")
-    secret = "SUPERSECRET1234"
+    secrets = [
+        "Bearer abc-secret-token",
+        "postgresql://user:password@host/db",
+        "CMD_API_KEY=secret123",
+    ]
 
     class _RaisingDispatcher:
         async def drain_once(self) -> int:
-            raise RuntimeError(f"boom database password={secret}")
+            raise RuntimeError(f"boom {'; '.join(secrets)}")
 
     monkeypatch.setattr(
         container,
@@ -293,21 +302,173 @@ async def test_drive_exception_terminalizes_and_no_secret(real_env, monkeypatch)
         hisiem=hisiem,
         execution_code=_EXECUTION_CODE,
     )
-    # Start succeeded (an investigation row exists) but the drive threw → the
-    # record must be a terminal FAILED artifact, never left RUNNING.
+    # Start succeeded (an investigation row exists) but the drive threw BEFORE the
+    # runner ever persisted an OrchestrationBinding → the record must be a terminal
+    # FAILED artifact (never left RUNNING) with investigation_id present and
+    # thread_id NULL (no binding was observed — never fabricate inv:<id>).
     assert await _investigation_count(factory) == 1
     assert record.investigation_id is not None
+    assert record.thread_id is None
     assert record.execution_status == ExecutionStatus.FAILED
     assert record.failure.category == CAT_DRIVE_FAILED
     assert record.failure.failure_type == "RuntimeError"
 
-    # The raw exception message (which contained the fake secret) was NOT persisted.
+    # The raw exception message (which contained the fake secrets) was NOT persisted.
     artifact = execution_artifact_path(
         settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
     )
     assert artifact.is_file()
     payload = artifact.read_text(encoding="utf-8")
-    assert secret not in payload
+    for secret in secrets:
+        assert secret not in payload
     restored = read_record(artifact)
     assert restored.execution_status == ExecutionStatus.FAILED
     assert restored.failure.category == CAT_DRIVE_FAILED
+    assert restored.thread_id is None
+
+
+async def _investigation_status(factory, investigation_id: str) -> str | None:
+    async with factory() as session:
+        return (
+            await session.execute(
+                text("SELECT status FROM copilot.investigation WHERE id=:iid"),
+                {"iid": UUID(investigation_id)},
+            )
+        ).scalar()
+
+
+async def test_concurrent_foreign_winner_ownership_conflict(
+    real_env, monkeypatch
+) -> None:
+    """§7-F: the Evaluation precheck sees NONE; a competing command then creates the
+    Investigation; the Evaluation production start CONVERGES on that foreign winner.
+    The post-start ownership proof (real command-receipt authority) must detect that
+    this execution does not exclusively own the returned aggregate →
+    EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT, fail closed, and leave the foreign
+    Investigation untouched (no cancel / reuse / second investigation)."""
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+    container.hisiem_adapter = hisiem
+    foreign_id: dict[str, str] = {}
+
+    async def _precheck_then_foreign_wins(
+        c: Container, tenant_id: str, external_ref: ExternalResourceRef
+    ) -> bool:
+        # The harness precheck observed NO active investigation at its instant; a
+        # CONCURRENT competing command (real production handler + real receipt
+        # semantics — only the interleaving point is injected) now wins the create.
+        competing = c.investigation_command_handler()
+        inv = await competing.start_alert_investigation(
+            StartAlertInvestigation(
+                tenant_id=tenant_id,
+                source_alert_ref=external_ref,
+                initiated_by_subject="foreign-caller",
+                initiated_by_display_name="Foreign Caller",
+                idempotency_key="foreign:competing:start",
+            )
+        )
+        foreign_id["id"] = str(inv.id)
+        return False  # this execution's precheck genuinely saw none
+
+    monkeypatch.setattr(
+        harness_mod, "_active_investigation_exists", _precheck_then_foreign_wins
+    )
+
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT
+    # The start returned the foreign winner (a real observed fact), but the record
+    # never fabricated a thread and the foreign aggregate was never driven/reused.
+    assert record.investigation_id == foreign_id["id"]
+    assert record.thread_id is None
+    assert record.investigation_status is None
+    # Exactly ONE investigation exists (the foreign one), still in its CREATED
+    # state — untouched by this execution.
+    assert await _investigation_count(factory) == 1
+    assert await _investigation_status(factory, foreign_id["id"]) == "CREATED"
+    artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
+    )
+    restored = read_record(artifact)
+    assert restored.failure.category == CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT
+
+
+async def test_binding_missing_fails_closed(real_env, monkeypatch) -> None:
+    """§7-D/§13: the investigation COMPLETES for real, but no OrchestrationBinding
+    can be observed → ORCHESTRATION_BINDING_MISSING, execution FAILED, thread_id NULL,
+    secret-safe artifact."""
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+    secret = "Bearer abc-secret-token"
+
+    async def _no_binding(c: Container, tenant_id: str, investigation_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(harness_mod, "_observed_binding_thread", _no_binding)
+
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_BINDING_MISSING
+    assert record.investigation_id is not None
+    assert record.thread_id is None
+    # The real runner DID drive it to COMPLETED — the harness refused to mark the
+    # execution COMPLETED without an observed binding.
+    assert await _investigation_status(factory, record.investigation_id) == "COMPLETED"
+    artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
+    )
+    payload = artifact.read_text(encoding="utf-8")
+    assert secret not in payload
+    assert "ORCHESTRATION_BINDING_MISSING" in payload
+
+
+async def test_checkpoint_missing_fails_closed(real_env, monkeypatch) -> None:
+    """§7-D: COMPLETED domain state + binding exists + checkpoint missing → the
+    harness must NOT record COMPLETED → CHECKPOINT_MISSING, execution FAILED. The
+    observed thread is still recorded (it came from the repository), and the real
+    checkpointer genuinely holds state — only the harness's observation is forced
+    to report missing so the final gate is what is under test."""
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+
+    async def _no_checkpoint(langgraph_settings: Any, thread_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(harness_mod, "_checkpoint_has_thread", _no_checkpoint)
+
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_CHECKPOINT_MISSING
+    assert record.investigation_id is not None
+    # thread_id WAS repository-observed (binding existed) before the checkpoint gate.
+    assert record.thread_id is not None
+    assert await _investigation_status(factory, record.investigation_id) == "COMPLETED"
+    # The real LangGraph checkpoint genuinely exists for the observed thread.
+    await _assert_checkpoint_observed(settings, record.thread_id)
+    # The observed thread equals the persisted binding.
+    async with factory() as session:
+        bound_thread = (
+            await session.execute(
+                text(
+                    "SELECT thread_id FROM copilot.orchestration_binding "
+                    "WHERE investigation_id=:iid"
+                ),
+                {"iid": UUID(record.investigation_id)},
+            )
+        ).scalar()
+    assert bound_thread == record.thread_id

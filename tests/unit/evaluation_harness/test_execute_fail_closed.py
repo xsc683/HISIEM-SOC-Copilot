@@ -11,6 +11,7 @@ from pathlib import Path
 
 from hisiem_soc_copilot.bootstrap.container import Container
 from hisiem_soc_copilot.config import Settings
+from hisiem_soc_copilot.evaluation_harness import harness as harness_mod
 from hisiem_soc_copilot.evaluation_harness.harness import (
     CAT_ACTIVE_INVESTIGATION_EXISTS,
     CAT_DATASET_IDENTITY_MISMATCH,
@@ -208,3 +209,68 @@ async def test_active_investigation_category_is_exposed(tmp_path: Path) -> None:
     """The active-collision category constant is exported (its DB-driven behaviour
     is covered by the real-Postgres integration test)."""
     assert CAT_ACTIVE_INVESTIGATION_EXISTS == "ACTIVE_INVESTIGATION_EXISTS"
+
+
+# ---------------------------------------------------------------------------
+# §7-H: secret safety — injected fake credentials in exception messages must
+# NEVER reach the persisted execution.json (bounded category/type/fixed message).
+# ---------------------------------------------------------------------------
+
+_SECRET_BLOB = (
+    "Bearer abc-secret-token postgresql://user:password@host/db CMD_API_KEY=secret123"
+)
+
+
+async def test_manifest_verify_exception_secret_is_not_persisted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    container = _container(tmp_path)
+    seal_dataset(
+        runs_dir=Path(container.settings.evaluation.runs_dir), dataset_run_id="sv-run"
+    )
+
+    def _boom(_path) -> None:
+        raise RuntimeError(f"verify boom {_SECRET_BLOB}")
+
+    monkeypatch.setattr(harness_mod, "verify_dataset_manifest", _boom)
+    record = await execute_execution(dataset_run_id="sv-run", container=container)
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_MANIFEST_VERIFY_FAILURE
+    assert record.failure.failure_type == "RuntimeError"
+    artifact = _artifact(container, "sv-run", record)
+    payload = artifact.read_text(encoding="utf-8")
+    assert _SECRET_BLOB not in payload
+    assert read_record(artifact).failure.category == CAT_MANIFEST_VERIFY_FAILURE
+
+
+async def test_start_exception_secret_is_not_persisted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    container = _container(tmp_path)
+    seal_dataset(
+        runs_dir=Path(container.settings.evaluation.runs_dir), dataset_run_id="ss-run"
+    )
+
+    async def _no_active(c, tenant_id, external_ref) -> bool:
+        return False
+
+    monkeypatch.setattr(harness_mod, "_active_investigation_exists", _no_active)
+
+    class _BoomingHandler:
+        async def start_alert_investigation(self, command):
+            raise RuntimeError(f"start boom {_SECRET_BLOB}")
+
+    monkeypatch.setattr(
+        container, "investigation_command_handler", lambda: _BoomingHandler()
+    )
+
+    record = await execute_execution(
+        dataset_run_id="ss-run",
+        container=container,
+        execution_code=("head", False),
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_START_FAILED
+    assert record.failure.failure_type == "RuntimeError"
+    payload = _artifact(container, "ss-run", record).read_text(encoding="utf-8")
+    assert _SECRET_BLOB not in payload

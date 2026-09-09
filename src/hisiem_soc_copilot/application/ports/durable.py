@@ -158,6 +158,19 @@ class CommandReceiptStore(Protocol):
         self, *, tenant_id: str, command_type: str, idempotency_key: str
     ) -> dict[str, Any] | None: ...
 
+    async def list_for_aggregate(
+        self, *, tenant_id: str, aggregate_type: str, aggregate_id: UUID
+    ) -> list[CommandReceiptRecord]:
+        """Every command receipt currently bound to one aggregate (tenant-scoped).
+
+        Read-only, used by the evaluation harness to PROVE a returned aggregate was
+        created by the caller's own command: an aggregate created fresh by one
+        command is bound by exactly that command's receipt, while an aggregate a
+        command merely converged onto (a concurrent winner) is bound by BOTH the
+        winner's receipt and the converger's. Distinct receipts bound to the same
+        aggregate therefore reveal a pre-existing/foreign owner.
+        """
+
 
 class OutboxStore(Protocol):
     """Transactional outbox read/claim/mark for the dispatcher.

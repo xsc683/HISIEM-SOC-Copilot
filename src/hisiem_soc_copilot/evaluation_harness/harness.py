@@ -18,12 +18,22 @@ manually.
 E1-C1 correctness guarantees:
 - Dataset vs execution provenance are SEPARATE: ``dataset_*`` comes from
   ``manifest.code``; ``execution_*`` is the CURRENT clean Copilot HEAD/worktree
-  resolved before any side effect. An execution worktree that is dirty fails
-  closed; the two revisions are allowed to differ.
+  resolved before any side effect. Execution provenance is anchored to the Git
+  repository CONTAINING the executed Copilot source (derived from the package
+  path, never the caller CWD); a worktree that is dirty fails closed, and
+  provenance that cannot be proven fails closed as ``EXECUTION_PROVENANCE_UNAVAILABLE``.
 - Fail-closed gates before any Investigation side effect: manifest verify +
   dataset authority, dataset identity (``dataset_run_id`` == ``manifest.run.run_id``),
-  environment isolation, clean execution worktree, and no pre-existing ACTIVE
-  investigation for the same tenant/source alert.
+  environment isolation, clean/provable execution provenance, and no pre-existing
+  ACTIVE investigation for the same tenant/source alert.
+- ``thread_id`` is an OBSERVED fact only — NULL until the production
+  OrchestrationBinding is read back through the repository; the deterministic
+  ``inv:<id>`` value is never fabricated into a RUNNING/FAILED record.
+- Post-start ownership proof: after ``StartAlertInvestigation`` returns, the
+  returned Investigation is verified (via the execution-scoped command receipt +
+  exclusive aggregate binding) to have been created by THIS execution. A
+  concurrent foreign Investigation that won after the precheck is never silently
+  reused → ``EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT``, fail closed.
 - Every unexpected post-start runtime exception is terminalized to a FAILED
   record (``DRIVE_FAILED``) — never left RUNNING. Failure diagnostics persist
   only bounded safe category/type/fixed-message — never raw ``str(exc)``.
@@ -44,6 +54,7 @@ from uuid import UUID, uuid4
 
 from ..application.commands.investigation import StartAlertInvestigation
 from ..application.errors import NotFoundError
+from ..domain.investigation.content import compute_content_hash
 from ..domain.investigation.value_objects import ExternalResourceRef
 from ..evaluation.contracts import SealedManifest
 from ..evaluation.launch_projection import launch_ref
@@ -78,7 +89,11 @@ CAT_DATASET_IDENTITY_MISMATCH = "DATASET_IDENTITY_MISMATCH"
 CAT_DISPATCHER_ENABLED = "DISPATCHER_ENABLED"
 CAT_NON_SCRIPTED_PROVIDER = "NON_SCRIPTED_PROVIDER"
 CAT_EXECUTION_WORKTREE_DIRTY = "EXECUTION_WORKTREE_DIRTY"
+CAT_EXECUTION_PROVENANCE_UNAVAILABLE = "EXECUTION_PROVENANCE_UNAVAILABLE"
 CAT_ACTIVE_INVESTIGATION_EXISTS = "ACTIVE_INVESTIGATION_EXISTS"
+CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT = (
+    "EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT"
+)
 CAT_SOURCE_ALERT_MISSING = "SOURCE_ALERT_MISSING"
 CAT_START_FAILED = "START_FAILED"
 CAT_DRIVE_FAILED = "DRIVE_FAILED"
@@ -135,9 +150,19 @@ _FIXED_MESSAGES: dict[str, str] = {
         "the execution worktree has uncommitted changes; E1-C1 requires a clean "
         "authoritative Copilot HEAD at execution time"
     ),
+    CAT_EXECUTION_PROVENANCE_UNAVAILABLE: (
+        "execution provenance could not be proven (the executed Copilot source is "
+        "not inside a resolvable Git checkout); E1-C1 fails closed on unprovable "
+        "provenance"
+    ),
     CAT_ACTIVE_INVESTIGATION_EXISTS: (
         "an active investigation already exists for this tenant/source alert; "
         "not silently reusing it"
+    ),
+    CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT: (
+        "the investigation returned by StartAlertInvestigation is not bound "
+        "exclusively to this execution — a concurrent foreign command created it; "
+        "not reusing a foreign investigation"
     ),
     CAT_SOURCE_ALERT_MISSING: (
         "source alert not found or not accessible through HISIEM"
@@ -168,7 +193,11 @@ _FIXED_TYPES: dict[str, str] = {
     CAT_DISPATCHER_ENABLED: "DispatcherEnabled",
     CAT_NON_SCRIPTED_PROVIDER: "NonScriptedProvider",
     CAT_EXECUTION_WORKTREE_DIRTY: "DirtyExecutionWorktree",
+    CAT_EXECUTION_PROVENANCE_UNAVAILABLE: "ExecutionProvenanceUnavailable",
     CAT_ACTIVE_INVESTIGATION_EXISTS: "ActiveInvestigationExists",
+    CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT: (
+        "EvaluationInvestigationOwnershipConflict"
+    ),
     CAT_DRIVE_TIMEOUT: "DriveTimeout",
     CAT_INVESTIGATION_NOT_COMPLETED: "TerminalNotCompleted",
     CAT_INVESTIGATION_RESULT_MISSING: "ResultNotFound",
@@ -182,10 +211,27 @@ _FIXED_TYPES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _git_capture(*args: str) -> str | None:
-    """Best-effort ``git <args>`` from the current working directory (repo root)."""
+def _provenance_anchor() -> Path:
+    """Default provenance anchor: this executed module's real file location.
+
+    The Copilot repository root is derived by walking UP from this anchor until a
+    ``.git`` is found — never from ``os.getcwd()``/``Path.cwd()``, because the CLI
+    may be invoked from an arbitrary directory or even from inside a different Git
+    repository. Tests may point the anchor at a disposable checkout to exercise
+    the real resolver hermetically.
+    """
+    return Path(__file__).resolve()
+
+
+def _git_capture(*args: str, repo_root: Path) -> str | None:
+    """Best-effort ``git -C <repo_root> <args>`` (explicit root, never the CWD)."""
     try:
-        out = subprocess.run(("git", *args), capture_output=True, text=True, timeout=5)
+        out = subprocess.run(
+            ("git", "-C", str(repo_root), *args),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
@@ -193,17 +239,34 @@ def _git_capture(*args: str) -> str | None:
     return out.stdout.strip()
 
 
-def current_execution_code() -> tuple[str, bool]:
-    """Resolve the CURRENT Copilot revision executing the Agent (E1-C1 patch §1).
+def resolve_execution_provenance(
+    anchor: Path | None = None,
+) -> tuple[str, bool] | None:
+    """Resolve ``(current_commit, dirty)`` for the checkout containing the executed
+    Copilot source.
 
-    Fails safe: if the revision cannot be proven (not a git checkout / git error),
-    report ``("unknown", True)`` so the execution-worktree gate fails closed —
-    the harness never proceeds on unprovable provenance.
+    The repository root is the nearest ancestor of ``anchor`` (default: this
+    module's file) that contains ``.git``; Git then runs with an explicit
+    ``git -C <repo_root>`` so caller CWD can never influence the result. Returns
+    None when the root cannot be proven (the executed source is not inside a Git
+    checkout, or Git is unavailable/errors) — the caller must then fail closed
+    with ``EXECUTION_PROVENANCE_UNAVAILABLE`` (NOT merely treat the tree as dirty).
     """
-    commit = _git_capture("rev-parse", "HEAD")
-    porcelain = _git_capture("status", "--porcelain")
-    if commit is None or porcelain is None:
-        return ("unknown", True)
+    start = (anchor or _provenance_anchor()).resolve()
+    directory = start if start.is_dir() else start.parent
+    repo_root: Path | None = None
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".git").exists():
+            repo_root = candidate
+            break
+    if repo_root is None:
+        return None
+    commit = _git_capture("rev-parse", "HEAD", repo_root=repo_root)
+    if commit is None:
+        return None
+    porcelain = _git_capture("status", "--porcelain", repo_root=repo_root)
+    if porcelain is None:
+        return None
     return commit, porcelain != ""
 
 
@@ -270,6 +333,24 @@ def to_external_resource_ref(launch: LaunchProjection) -> ExternalResourceRef:
     )
 
 
+def _start_idempotency_key(dataset_run_id: str, execution_id: str) -> str:
+    """The execution-scoped idempotency key binding one start to one execution."""
+    return f"eval:{dataset_run_id}:{execution_id}:start"
+
+
+def _launch_fingerprint(launch: LaunchProjection) -> str:
+    """The bounded fingerprint of the launch request (same payload the production
+    handler stores on the command receipt for a StartAlertInvestigation)."""
+    return compute_content_hash(
+        {
+            "provider": launch.provider,
+            "resource_type": launch.resource_type,
+            "address_id": launch.address_id,
+            "business_id": launch.business_id,
+        }
+    )
+
+
 def build_start_command(
     *,
     launch: LaunchProjection,
@@ -283,7 +364,7 @@ def build_start_command(
         source_alert_ref=to_external_resource_ref(launch),
         initiated_by_subject=ACTOR_SUBJECT,
         initiated_by_display_name=ACTOR_DISPLAY_NAME,
-        idempotency_key=f"eval:{dataset_run_id}:{execution_id}:start",
+        idempotency_key=_start_idempotency_key(dataset_run_id, execution_id),
     )
 
 
@@ -426,7 +507,20 @@ async def execute_execution(
         return persist(record)
 
     if execution_code is None:
-        commit, dirty = current_execution_code()
+        resolved = resolve_execution_provenance()
+        if resolved is None:
+            # Provenance is UNPROVABLE (not merely dirty) → a distinct fail-closed
+            # category. The executed Copilot source could not be tied to a Git
+            # checkout, so no authoritative execution provenance exists.
+            record.execution_code_git_commit = "unknown"
+            record.execution_code_dirty = True
+            record.fail(
+                category=CAT_EXECUTION_PROVENANCE_UNAVAILABLE,
+                failure_type=_FIXED_TYPES[CAT_EXECUTION_PROVENANCE_UNAVAILABLE],
+                message=_FIXED_MESSAGES[CAT_EXECUTION_PROVENANCE_UNAVAILABLE],
+            )
+            return persist(record)
+        commit, dirty = resolved
     else:
         commit, dirty = execution_code
     record.execution_code_git_commit = commit
@@ -442,11 +536,12 @@ async def execute_execution(
     # Persist CREATED BEFORE any side effect (crash-safe recoverable record).
     persist(record)
 
-    # --- Phase 3: active-investigation isolation + start (bounded). --------------
+    # --- Phase 3: active-investigation isolation + start + ownership (bounded). ---
     launch = record.launch
     external_ref = to_external_resource_ref(launch)
     if hisiem is not None:
         container.hisiem_adapter = hisiem
+    owned = False
     try:
         if await _active_investigation_exists(container, record.tenant_id, external_ref):
             record.fail(
@@ -463,6 +558,19 @@ async def execute_execution(
                 dataset_run_id=dataset_run_id,
                 execution_id=execution_id,
             )
+        )
+        investigation_id = str(investigation.id)
+        # §3: prove THIS execution created/bound the returned Investigation through
+        # the production command-receipt authority. A concurrent foreign command
+        # that won between the precheck and the start leaves its own receipt bound
+        # to the returned aggregate → ownership cannot be proven → fail closed.
+        owned = await _execution_owns_investigation(
+            container=container,
+            launch=launch,
+            tenant_id=record.tenant_id,
+            dataset_run_id=dataset_run_id,
+            execution_id=execution_id,
+            investigation_id=investigation_id,
         )
     except NotFoundError as exc:  # source alert gone / not accessible
         record.fail(
@@ -481,9 +589,17 @@ async def execute_execution(
         )
         return persist(record)
 
-    investigation_id = str(investigation.id)
     record.investigation_id = investigation_id
-    record.thread_id = f"inv:{investigation_id}"  # placeholder; observed later
+    if not owned:
+        record.fail(
+            category=CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT,
+            failure_type=_FIXED_TYPES[CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT],
+            message=_FIXED_MESSAGES[CAT_EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT],
+        )
+        return persist(record)
+
+    # §2: thread_id stays NULL until the OrchestrationBinding is observed — never
+    # predict the deterministic inv:<id> value.
     record.execution_status = ExecutionStatus.RUNNING
     persist(record)
 
@@ -553,6 +669,61 @@ async def _active_investigation_exists(
     finally:
         await uow.close()
     return existing is not None
+
+
+async def _execution_owns_investigation(
+    *,
+    container: Container,
+    launch: LaunchProjection,
+    tenant_id: str,
+    dataset_run_id: str,
+    execution_id: str,
+    investigation_id: str,
+) -> bool:
+    """Prove THIS execution created/bound the Investigation returned by start (§3).
+
+    Ownership authority is the production command receipt for this execution's
+    scoped idempotency key ``eval:<dataset>:<execution>:start``. The returned
+    aggregate is OURS only when ALL hold (reads only — never mutates/cancels/
+    reuses a foreign investigation):
+
+      - a receipt exists for (tenant, ``StartAlertInvestigation``, our key);
+      - its aggregate_id == the returned investigation;
+      - its request_fingerprint == this execution's launch fingerprint (a key
+        rebound to a different source alert is never claimed);
+      - the returned aggregate is bound EXCLUSIVELY by our receipt.
+
+    A concurrent foreign command that won between the harness precheck and the
+    production start leaves ITS OWN earlier receipt bound to the returned
+    aggregate too (the production handler converges on the winner and binds our
+    key to it) → we do NOT own it → ``EVALUATION_INVESTIGATION_OWNERSHIP_CONFLICT``.
+    Never inferred from actor subject (all evaluation executions share one actor)
+    nor from source-alert equality.
+    """
+    key = _start_idempotency_key(dataset_run_id, execution_id)
+    expected_fingerprint = _launch_fingerprint(launch)
+    uow = container.unit_of_work()
+    try:
+        receipt = await uow.command_receipts.find(
+            tenant_id=tenant_id,
+            command_type="StartAlertInvestigation",
+            idempotency_key=key,
+        )
+        if receipt is None or receipt.aggregate_id is None:
+            return False
+        if str(receipt.aggregate_id) != investigation_id:
+            return False
+        if receipt.request_fingerprint != expected_fingerprint:
+            return False
+        bound = await uow.command_receipts.list_for_aggregate(
+            tenant_id=tenant_id,
+            aggregate_type="investigation",
+            aggregate_id=UUID(investigation_id),
+        )
+    finally:
+        await uow.close()
+    ours = [r for r in bound if r.idempotency_key == key]
+    return len(bound) == 1 and len(ours) == 1
 
 
 async def _drain_to_terminal(
@@ -767,9 +938,12 @@ async def execute_cli(*, dataset_run_id: str) -> int:
             started_at=rfc3339_utc(),
             execution_status=ExecutionStatus.CREATED,
         )
-        commit, dirty = current_execution_code()
-        record.execution_code_git_commit = commit
-        record.execution_code_dirty = dirty
+        resolved = resolve_execution_provenance()
+        if resolved is None:
+            record.execution_code_git_commit = "unknown"
+            record.execution_code_dirty = True
+        else:
+            record.execution_code_git_commit, record.execution_code_dirty = resolved
         record.fail(
             category=violation,
             failure_type=_FIXED_TYPES[violation],

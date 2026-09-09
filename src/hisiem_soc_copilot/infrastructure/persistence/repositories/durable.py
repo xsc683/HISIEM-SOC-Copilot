@@ -149,16 +149,19 @@ class SqlAlchemyCommandReceiptStore(CommandReceiptStore):
             )
         )
         row = result.scalar_one_or_none()
-        if row is None:
-            return None
-        return CommandReceiptRecord(
-            idempotency_key=row.idempotency_key,
-            command_type=row.command_type,
-            tenant_id=row.tenant_id,
-            aggregate_id=row.aggregate_id,
-            request_fingerprint=row.request_fingerprint,
-            safe_result=dict(row.safe_result) if row.safe_result else None,
+        return _receipt_record(row) if row is not None else None
+
+    async def list_for_aggregate(
+        self, *, tenant_id: str, aggregate_type: str, aggregate_id: UUID
+    ) -> list[CommandReceiptRecord]:
+        result = await self._session.execute(
+            select(CommandReceiptRow).where(
+                CommandReceiptRow.tenant_id == tenant_id,
+                CommandReceiptRow.aggregate_type == aggregate_type,
+                CommandReceiptRow.aggregate_id == aggregate_id,
+            )
         )
+        return [_receipt_record(row) for row in result.scalars().all()]
 
     async def record(self, receipt: DurableCommand) -> None:
         self._session.add(
@@ -222,6 +225,17 @@ class SqlAlchemyOrchestrationBindingStore(OrchestrationBindingStore):
                 created_at=datetime.now(UTC),
             )
         )
+
+
+def _receipt_record(row: CommandReceiptRow) -> CommandReceiptRecord:
+    return CommandReceiptRecord(
+        idempotency_key=row.idempotency_key,
+        command_type=row.command_type,
+        tenant_id=row.tenant_id,
+        aggregate_id=row.aggregate_id,
+        request_fingerprint=row.request_fingerprint,
+        safe_result=dict(row.safe_result) if row.safe_result else None,
+    )
 
 
 def _binding_row(row: OrchestrationBindingRow) -> OrchestrationBinding:

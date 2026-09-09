@@ -8,10 +8,13 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from hisiem_soc_copilot.evaluation_harness.harness import record_from_manifest
 from hisiem_soc_copilot.evaluation_harness.record import (
     EXECUTION_SCHEMA_VERSION,
     EvaluationExecutionRecord,
+    ExecutionSchemaError,
     ExecutionStatus,
     LaunchProjection,
     read_record,
@@ -113,8 +116,34 @@ def test_payload_round_trip_preserves_bounded_fields() -> None:
 
 
 def test_schema_version_is_stable() -> None:
-    assert EXECUTION_SCHEMA_VERSION == "evaluation-execution/v1"
+    assert EXECUTION_SCHEMA_VERSION == "evaluation-execution/v2"
     assert EvaluationExecutionRecord().schema_version == EXECUTION_SCHEMA_VERSION
+
+
+def test_new_records_serialize_as_v2() -> None:
+    payload = _full_record().to_payload()
+    assert payload["schema_version"] == "evaluation-execution/v2"
+
+
+def test_v1_payload_is_explicitly_rejected() -> None:
+    payload = _full_record().to_payload()
+    payload["schema_version"] = "evaluation-execution/v1"
+    with pytest.raises(ExecutionSchemaError):
+        EvaluationExecutionRecord.from_payload(payload)
+
+
+def test_unknown_schema_is_explicitly_rejected() -> None:
+    payload = _full_record().to_payload()
+    payload["schema_version"] = "evaluation-execution/v99"
+    with pytest.raises(ExecutionSchemaError):
+        EvaluationExecutionRecord.from_payload(payload)
+
+
+def test_missing_schema_is_explicitly_rejected() -> None:
+    payload = _full_record().to_payload()
+    del payload["schema_version"]
+    with pytest.raises(ExecutionSchemaError):
+        EvaluationExecutionRecord.from_payload(payload)
 
 
 def test_dataset_and_execution_provenance_are_distinct_fields() -> None:

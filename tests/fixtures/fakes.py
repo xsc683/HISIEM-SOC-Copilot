@@ -279,6 +279,24 @@ class FakeCommandReceiptStore:
         receipt = self._receipts.get((tenant_id, command_type, idempotency_key))
         return dict(receipt.safe_result) if receipt and receipt.safe_result else None
 
+    async def list_for_aggregate(
+        self, *, tenant_id: str, aggregate_type: str, aggregate_id: UUID
+    ) -> list[CommandReceiptRecord]:
+        return [
+            CommandReceiptRecord(
+                idempotency_key=r.idempotency_key,
+                command_type=r.command_type,
+                tenant_id=r.tenant_id,
+                aggregate_id=r.aggregate_id,
+                request_fingerprint=r.request_fingerprint,
+                safe_result=dict(r.safe_result) if r.safe_result else None,
+            )
+            for r in self._receipts.values()
+            if r.tenant_id == tenant_id
+            and r.aggregate_type == aggregate_type
+            and r.aggregate_id == aggregate_id
+        ]
+
     def receipts(self) -> list[DurableCommand]:
         return list(self._receipts.values())
 

@@ -17,6 +17,7 @@ from .harness import (
     launch_projection,
     record_from_manifest,
     report,
+    resolve_execution_provenance,
     verify_dataset_manifest,
 )
 from .record import EvaluationExecutionRecord, ExecutionStatus
@@ -30,5 +31,6 @@ __all__ = [
     "launch_projection",
     "record_from_manifest",
     "report",
+    "resolve_execution_provenance",
     "verify_dataset_manifest",
 ]
