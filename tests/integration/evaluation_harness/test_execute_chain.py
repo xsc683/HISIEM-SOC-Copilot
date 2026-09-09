@@ -1,4 +1,4 @@
-"""E1-C1 execute chain over real Postgres (E1-C1 §22 live proof, scripted HISIEM).
+"""E1-C1 execute chain over real Postgres (E1-C1 §9/§22 live proof, scripted HISIEM).
 
 Drives one sealed GP-01 manifest through the REAL production pipeline: real
 Copilot PostgreSQL (5433), real LangGraph Postgres checkpoint, real
@@ -6,35 +6,46 @@ domain/outbox/runner code, real graph — with an injected FakeHisiem (alert
 hydration) and the explicit deterministic ScriptedModelProvider. Asserts the
 sealed manifest -> verify -> launch projection ONLY -> StartAlertInvestigation ->
 outbox -> dispatcher drain -> binding/thread -> graph -> COMPLETED -> persisted
-InvestigationResult -> COMPLETED Evaluation Execution Record. Also asserts the
-artifact file and that a duplicate drain does not re-run a terminal
-investigation.
+InvestigationResult -> COMPLETED Evaluation Execution Record, including the
+OBSERVED OrchestrationBinding + LangGraph checkpoint. Also asserts active-
+investigation collision fail-closed and drive-exception terminalization (secret-
+safe).
 
 Skipped when Postgres is unreachable (same convention as the durable API chain).
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from hisiem_soc_copilot.agent.graph.builder import thread_config
+from hisiem_soc_copilot.application.commands.investigation import StartAlertInvestigation
 from hisiem_soc_copilot.bootstrap.container import Container
 from hisiem_soc_copilot.config import Settings
-from hisiem_soc_copilot.evaluation_harness.harness import execute_execution
+from hisiem_soc_copilot.domain.investigation.value_objects import ExternalResourceRef
+from hisiem_soc_copilot.evaluation_harness.harness import (
+    CAT_ACTIVE_INVESTIGATION_EXISTS,
+    CAT_DRIVE_FAILED,
+    execute_execution,
+)
 from hisiem_soc_copilot.evaluation_harness.record import (
     ExecutionStatus,
     execution_artifact_path,
     read_record,
 )
-from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
+from hisiem_soc_copilot.infrastructure.checkpoint.postgres import PostgresCheckpointer
 from tests.fixtures.hisiem_fake import FakeHisiem
 from tests.unit.evaluation_harness._seal_helpers import seal_dataset
 
 _DATASET_RUN_ID = "e1c1-chain-run"
+_EXECUTION_CODE = ("integration-exec-head", False)  # deterministic clean worktree
 
 _TRUNCATE = (
     "tool_invocation",
@@ -96,110 +107,207 @@ async def _truncate(factory: async_sessionmaker[AsyncSession]) -> None:
         await session.commit()
 
 
-async def _db_counts(
-    factory: async_sessionmaker[AsyncSession], investigation_id: str
-) -> dict[str, Any]:
+async def _investigation_count(factory: async_sessionmaker[AsyncSession]) -> int:
     async with factory() as session:
-        return {
-            "investigations": (
+        return int(
+            (
                 await session.execute(text("SELECT count(*) FROM copilot.investigation"))
-            ).scalar(),
-            "bindings": (
-                await session.execute(
-                    text(
-                        "SELECT count(*) FROM copilot.orchestration_binding "
-                        "WHERE investigation_id=:iid"
-                    ),
-                    {"iid": investigation_id},
-                )
-            ).scalar(),
-            "result_disposition": (
-                await session.execute(
-                    text(
-                        "SELECT verdict_disposition FROM copilot.investigation_result "
-                        "WHERE investigation_id=:iid"
-                    ),
-                    {"iid": investigation_id},
-                )
-            ).scalar(),
-            "outbox_published": (
-                await session.execute(
-                    text(
-                        "SELECT count(*) FROM copilot.outbox_message o "
-                        "JOIN copilot.domain_event e ON e.event_id=o.event_id "
-                        "WHERE e.aggregate_id=:iid AND o.status='PUBLISHED'"
-                    ),
-                    {"iid": investigation_id},
-                )
-            ).scalar(),
-        }
+            ).scalar()
+        )
 
 
-async def test_execute_chain_reaches_completed(tmp_path: Path) -> None:
+async def _assert_checkpoint_observed(settings: Settings, thread_id: str) -> None:
+    """The LangGraph Postgres checkpointer holds state for the observed thread."""
+    async with PostgresCheckpointer(settings.langgraph) as saver:
+        checkpoint = await saver.aget_tuple(thread_config(thread_id))  # type: ignore[arg-type]
+        assert checkpoint is not None
+
+
+async def _open_env(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[Settings, Any, Any, Container]]:
+    """Open a real-Postgres environment (truncated) and yield it for one test."""
     settings = _settings(tmp_path)
     if not await _db_reachable(settings):
-        pytest.skip("PostgreSQL not reachable — skipping E1-C1 execute chain test")
-
+        pytest.skip("PostgreSQL not reachable — skipping E1-C1 integration test")
     seal_dataset(
         runs_dir=Path(settings.evaluation.runs_dir),
         dataset_run_id=_DATASET_RUN_ID,
     )
-
     engine = create_async_engine(settings.database.database_url)
     factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
     await _truncate(factory)
-
     container = Container(settings)
     await container.open()
     try:
-        hisiem = FakeHisiem(alert_id="es-doc-0001")  # matches make_verified's alert
-        record = await execute_execution(
-            dataset_run_id=_DATASET_RUN_ID,
-            container=container,
-            hisiem=hisiem,
-        )
-        artifact = execution_artifact_path(
-            settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
-        )
-
-        # The execution record is terminal + complete, with the persisted result.
-        assert record.execution_status == ExecutionStatus.COMPLETED
-        assert record.investigation_id is not None
-        assert record.thread_id == f"inv:{record.investigation_id}"
-        assert record.investigation_status == "COMPLETED"
-        assert record.result_disposition == "INCONCLUSIVE"  # scripted verdict
-        assert record.result_confidence == 0.3
-        # Counts reflect the REAL graph: FINALIZE converges with no tool calls
-        # (zero evidence/findings) but the pipeline registers its working
-        # hypothesis during planning.
-        assert record.evidence_count == 0
-        assert record.finding_count == 0
-        assert record.hypothesis_count >= 1
-
-        # The artifact file is the record (readable + atomic, no temp leftovers).
-        assert artifact.is_file()
-        restored = read_record(artifact)
-        assert restored.execution_id == record.execution_id
-        assert restored.execution_status == ExecutionStatus.COMPLETED
-
-        # Real DB: one investigation, one binding, published outbox, a result.
-        counts = await _db_counts(factory, record.investigation_id)
-        assert counts["investigations"] == 1
-        assert counts["bindings"] == 1
-        assert counts["outbox_published"] == 1
-        assert counts["result_disposition"] == "INCONCLUSIVE"
-
-        # A second drain is a no-op for the terminal investigation (never re-run):
-        # the terminal aggregate wins over the checkpoint, so no new rows appear.
-        dispatcher = container.outbox_dispatcher(
-            hisiem=hisiem, model=ScriptedModelProvider()
-        )
-        await dispatcher.drain_once()
-        await dispatcher.drain_once()
-        after = await _db_counts(factory, record.investigation_id)
-        assert after["investigations"] == 1
-        assert after["bindings"] == 1
-        assert after["result_disposition"] == "INCONCLUSIVE"
+        yield settings, engine, factory, container
     finally:
         await container.close()
         await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def real_env(
+    tmp_path: Path,
+) -> AsyncIterator[tuple[Settings, Any, Any, Container]]:
+    async for env in _open_env(tmp_path):
+        yield env
+
+
+async def test_execute_chain_reaches_completed(real_env) -> None:
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")  # matches make_verified's alert
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
+    )
+
+    # The execution record is terminal + complete, with the persisted result.
+    assert record.execution_status == ExecutionStatus.COMPLETED
+    assert record.investigation_id is not None
+    assert record.investigation_status == "COMPLETED"
+    assert record.thread_id == f"inv:{record.investigation_id}"
+    assert record.result_disposition == "INCONCLUSIVE"  # scripted verdict
+    assert record.result_confidence == 0.3
+    assert record.evidence_count == 0
+    assert record.finding_count == 0
+    assert record.hypothesis_count >= 1
+    # Dataset provenance (sealed) is NOT mislabeled as execution provenance.
+    assert record.dataset_code_git_commit == "test-commit"
+    assert record.execution_code_git_commit == "integration-exec-head"
+    assert record.dataset_code_git_commit != record.execution_code_git_commit
+
+    # The artifact file is the record (readable + atomic, no temp leftovers).
+    assert artifact.is_file()
+    restored = read_record(artifact)
+    assert restored.execution_id == record.execution_id
+    assert restored.execution_status == ExecutionStatus.COMPLETED
+
+    # Real DB: one investigation + binding; published outbox; INCONCLUSIVE result.
+    assert await _investigation_count(factory) == 1
+    async with factory() as session:
+        thread_id = (
+            await session.execute(
+                text(
+                    "SELECT thread_id FROM copilot.orchestration_binding "
+                    "WHERE investigation_id=:iid"
+                ),
+                {"iid": record.investigation_id},
+            )
+        ).scalar()
+        outbox_published = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM copilot.outbox_message o "
+                    "JOIN copilot.domain_event e ON e.event_id=o.event_id "
+                    "WHERE e.aggregate_id=:iid AND o.status='PUBLISHED'"
+                ),
+                {"iid": record.investigation_id},
+            )
+        ).scalar()
+        disposition = (
+            await session.execute(
+                text(
+                    "SELECT verdict_disposition FROM copilot.investigation_result "
+                    "WHERE investigation_id=:iid"
+                ),
+                {"iid": record.investigation_id},
+            )
+        ).scalar()
+    assert thread_id == record.thread_id
+    assert outbox_published == 1
+    assert disposition == "INCONCLUSIVE"
+
+    # Observed LangGraph Postgres checkpoint for the observed thread.
+    await _assert_checkpoint_observed(settings, record.thread_id)
+
+    # A second drain is a no-op for the terminal investigation (never re-run).
+    from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
+
+    dispatcher = container.outbox_dispatcher(
+        hisiem=hisiem, model=ScriptedModelProvider()
+    )
+    await dispatcher.drain_once()
+    await dispatcher.drain_once()
+    assert await _investigation_count(factory) == 1
+
+
+async def test_active_investigation_collision_fails_closed(real_env) -> None:
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+    container.hisiem_adapter = hisiem
+    # A REAL existing ACTIVE (CREATED, never dispatched) investigation for the
+    # same tenant + source alert — created OUTSIDE this execution.
+    handler = container.investigation_command_handler()
+    await handler.start_alert_investigation(
+        StartAlertInvestigation(
+            tenant_id="tenant-a",
+            source_alert_ref=ExternalResourceRef(
+                provider="hisiem",
+                resource_type="alert",
+                address_id="es-doc-0001",
+                business_id="biz-0001",
+            ),
+            initiated_by_subject="tester",
+        )
+    )
+    assert await _investigation_count(factory) == 1
+
+    # A new execution for the same dataset must FAIL CLOSED, not silently attach.
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_ACTIVE_INVESTIGATION_EXISTS
+    assert record.investigation_id is None
+    # No new investigation, no reuse/cancel of the pre-existing one.
+    assert await _investigation_count(factory) == 1
+
+
+async def test_drive_exception_terminalizes_and_no_secret(real_env, monkeypatch) -> None:
+    settings, engine, factory, container = real_env
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+    secret = "SUPERSECRET1234"
+
+    class _RaisingDispatcher:
+        async def drain_once(self) -> int:
+            raise RuntimeError(f"boom database password={secret}")
+
+    monkeypatch.setattr(
+        container,
+        "outbox_dispatcher",
+        lambda hisiem=None, model=None: _RaisingDispatcher(),
+    )
+
+    record = await execute_execution(
+        dataset_run_id=_DATASET_RUN_ID,
+        container=container,
+        hisiem=hisiem,
+        execution_code=_EXECUTION_CODE,
+    )
+    # Start succeeded (an investigation row exists) but the drive threw → the
+    # record must be a terminal FAILED artifact, never left RUNNING.
+    assert await _investigation_count(factory) == 1
+    assert record.investigation_id is not None
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_DRIVE_FAILED
+    assert record.failure.failure_type == "RuntimeError"
+
+    # The raw exception message (which contained the fake secret) was NOT persisted.
+    artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, record.execution_id
+    )
+    assert artifact.is_file()
+    payload = artifact.read_text(encoding="utf-8")
+    assert secret not in payload
+    restored = read_record(artifact)
+    assert restored.execution_status == ExecutionStatus.FAILED
+    assert restored.failure.category == CAT_DRIVE_FAILED

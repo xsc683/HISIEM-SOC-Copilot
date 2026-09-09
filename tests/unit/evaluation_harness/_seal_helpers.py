@@ -47,3 +47,21 @@ def seal_dataset(
     manifest = build_manifest_for(verified, dirty=dirty)
     seal_manifest(manifest, target)
     return manifest
+
+
+def seal_under(
+    *,
+    runs_dir: Path,
+    directory_id: str,
+    run_id: str,
+    tenant_id: str = "tenant-a",
+    dirty: bool = False,
+) -> SealedManifest:
+    """Seal a manifest whose ``run.run_id`` may DIFFER from the directory it lives
+    under (to exercise the dataset-identity gate)."""
+    target = runs_dir / "gp-01" / directory_id / "manifest.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    verified = make_verified(run_id=run_id, tenant_id=tenant_id)
+    manifest = build_manifest_for(verified, dirty=dirty)
+    seal_manifest(manifest, target)
+    return manifest

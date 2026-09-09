@@ -87,8 +87,13 @@ def test_record_from_manifest_stamps_bounded_identity(tmp_path: Path) -> None:
     assert record.scenario_id == "gp-01"
     assert record.dataset_run_id == dataset_run_id
     assert record.dataset_manifest_sha256 == manifest.integrity["manifest_sha256"]
-    assert record.copilot_git_commit == manifest.code.git_commit
-    assert record.copilot_dirty is False
+    # DATASET provenance comes from manifest.code — never presented as execution.
+    assert record.dataset_code_git_commit == manifest.code.git_commit
+    assert record.dataset_code_dirty == manifest.code.dirty
+    assert record.dataset_code_dirty is False
+    # EXECUTION provenance is NOT taken from the manifest (stamped separately).
+    assert record.execution_code_git_commit == ""
+    assert record.execution_code_dirty is True
     assert record.model_provider == "scripted"
     assert record.tenant_id == manifest.scope["tenant_id"]
     assert record.launch.address_id == manifest.source_alert.address_id

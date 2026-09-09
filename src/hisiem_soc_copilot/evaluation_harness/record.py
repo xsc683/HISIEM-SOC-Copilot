@@ -83,15 +83,24 @@ class ExecutionFailure:
 
 @dataclass
 class EvaluationExecutionRecord:
-    """The typed execution record (mutable operational artifact)."""
+    """The typed execution record (mutable operational artifact).
+
+    Code provenance is deliberately split (E1-C1 correctness patch): ``dataset_*``
+    describes the code revision that created the SEALED DATASET (from
+    ``manifest.code``); ``execution_*`` describes the code revision executing the
+    Agent NOW (current Copilot HEAD/worktree). They are allowed to differ; neither
+    is ever presented as the other's provenance.
+    """
 
     schema_version: str = EXECUTION_SCHEMA_VERSION
     execution_id: str = ""
     scenario_id: str = ""
     dataset_run_id: str = ""
     dataset_manifest_sha256: str = ""
-    copilot_git_commit: str = ""
-    copilot_dirty: bool = True
+    dataset_code_git_commit: str = ""
+    dataset_code_dirty: bool = True
+    execution_code_git_commit: str = ""
+    execution_code_dirty: bool = True
     model_provider: str = "scripted"
     tenant_id: str = ""
     started_at: str = ""
@@ -122,8 +131,10 @@ class EvaluationExecutionRecord:
             "scenario_id": self.scenario_id,
             "dataset_run_id": self.dataset_run_id,
             "dataset_manifest_sha256": self.dataset_manifest_sha256,
-            "copilot_git_commit": self.copilot_git_commit,
-            "copilot_dirty": self.copilot_dirty,
+            "dataset_code_git_commit": self.dataset_code_git_commit,
+            "dataset_code_dirty": self.dataset_code_dirty,
+            "execution_code_git_commit": self.execution_code_git_commit,
+            "execution_code_dirty": self.execution_code_dirty,
             "model_provider": self.model_provider,
             "tenant_id": self.tenant_id,
             "started_at": self.started_at,
@@ -170,8 +181,10 @@ class EvaluationExecutionRecord:
             scenario_id=str(payload.get("scenario_id", "")),
             dataset_run_id=str(payload.get("dataset_run_id", "")),
             dataset_manifest_sha256=str(payload.get("dataset_manifest_sha256", "")),
-            copilot_git_commit=str(payload.get("copilot_git_commit", "")),
-            copilot_dirty=bool(payload.get("copilot_dirty", True)),
+            dataset_code_git_commit=str(payload.get("dataset_code_git_commit", "")),
+            dataset_code_dirty=bool(payload.get("dataset_code_dirty", True)),
+            execution_code_git_commit=str(payload.get("execution_code_git_commit", "")),
+            execution_code_dirty=bool(payload.get("execution_code_dirty", True)),
             model_provider=str(payload.get("model_provider", "scripted")),
             tenant_id=str(payload.get("tenant_id", "")),
             started_at=str(payload.get("started_at", "")),
@@ -241,8 +254,9 @@ def _bounded(message: str) -> str:
 _PAYLOAD_KEYS = frozenset(
     {
         "schema_version", "execution_id", "scenario_id", "dataset_run_id",
-        "dataset_manifest_sha256", "copilot_git_commit", "copilot_dirty",
-        "model_provider", "tenant_id", "started_at", "finished_at", "launch_ref",
+        "dataset_manifest_sha256", "dataset_code_git_commit", "dataset_code_dirty",
+        "execution_code_git_commit", "execution_code_dirty", "model_provider",
+        "tenant_id", "started_at", "finished_at", "launch_ref",
         "investigation_id", "thread_id", "investigation_status",
         "investigation_phase", "termination_reason", "result", "evidence_count",
         "finding_count", "hypothesis_count", "execution_status", "failure",

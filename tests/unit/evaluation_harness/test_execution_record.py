@@ -1,6 +1,6 @@
 """Execution-record unit tests (E1-C1 §21): typed record, atomic persistence,
-bounded failure payloads, and the guarantee that a serialized record never
-contains oracle / dataset-event / secret content."""
+bounded failure payloads, split dataset/execution provenance, and the guarantee
+that a serialized record never contains oracle / dataset-event / secret content."""
 
 from __future__ import annotations
 
@@ -36,6 +36,34 @@ _FORBIDDEN_TOKENS = (
     "token",
 )
 
+_PAYLOAD_KEYS = {
+    "schema_version",
+    "execution_id",
+    "scenario_id",
+    "dataset_run_id",
+    "dataset_manifest_sha256",
+    "dataset_code_git_commit",
+    "dataset_code_dirty",
+    "execution_code_git_commit",
+    "execution_code_dirty",
+    "model_provider",
+    "tenant_id",
+    "started_at",
+    "finished_at",
+    "launch_ref",
+    "investigation_id",
+    "thread_id",
+    "investigation_status",
+    "investigation_phase",
+    "termination_reason",
+    "result",
+    "evidence_count",
+    "finding_count",
+    "hypothesis_count",
+    "execution_status",
+    "failure",
+}
+
 
 def _full_record() -> EvaluationExecutionRecord:
     return EvaluationExecutionRecord(
@@ -43,8 +71,10 @@ def _full_record() -> EvaluationExecutionRecord:
         scenario_id="gp-01",
         dataset_run_id="run-123",
         dataset_manifest_sha256="c0ffee" * 8,
-        copilot_git_commit="abc123",
-        copilot_dirty=False,
+        dataset_code_git_commit="dataset-head",
+        dataset_code_dirty=False,
+        execution_code_git_commit="exec-head",
+        execution_code_dirty=False,
         model_provider="scripted",
         tenant_id="tenant-a",
         started_at=rfc3339_utc(),
@@ -78,11 +108,25 @@ def test_payload_round_trip_preserves_bounded_fields() -> None:
     assert restored.launch.address_id == "es-doc-0001"
     assert restored.result_disposition == "INCONCLUSIVE"
     assert restored.thread_id == "inv:inv-1"
+    assert restored.dataset_code_git_commit == "dataset-head"
+    assert restored.execution_code_git_commit == "exec-head"
 
 
 def test_schema_version_is_stable() -> None:
     assert EXECUTION_SCHEMA_VERSION == "evaluation-execution/v1"
     assert EvaluationExecutionRecord().schema_version == EXECUTION_SCHEMA_VERSION
+
+
+def test_dataset_and_execution_provenance_are_distinct_fields() -> None:
+    """Dataset provenance is NOT execution provenance: they are separate fields."""
+    record = _full_record()
+    assert record.dataset_code_git_commit != record.execution_code_git_commit
+    payload = record.to_payload()
+    assert payload["dataset_code_git_commit"] == "dataset-head"
+    assert payload["execution_code_git_commit"] == "exec-head"
+    # Neither legacy "copilot_*" field is allowed to resurface.
+    assert "copilot_git_commit" not in payload
+    assert "copilot_dirty" not in payload
 
 
 def test_record_from_real_manifest_never_contains_oracle_or_events(tmp_path: Path) -> None:
@@ -91,7 +135,7 @@ def test_record_from_real_manifest_never_contains_oracle_or_events(tmp_path: Pat
     record = record_from_manifest(
         manifest, execution_id=uuid4().hex, dataset_run_id=dataset_run_id
     )
-    assert record.copilot_dirty is False
+    assert record.dataset_code_dirty is False
     # Drive the record through every lifecycle the harness persists.
     record.investigation_id = "inv-1"
     record.thread_id = "inv:inv-1"
@@ -109,31 +153,7 @@ def test_record_from_real_manifest_never_contains_oracle_or_events(tmp_path: Pat
     assert payload["launch_ref"]["address_id"] == manifest.source_alert.address_id
     assert payload["execution_status"] == "FAILED"
     # The record must be a strict allow-list payload: no unexpected top-level keys.
-    assert set(payload) == {
-        "schema_version",
-        "execution_id",
-        "scenario_id",
-        "dataset_run_id",
-        "dataset_manifest_sha256",
-        "copilot_git_commit",
-        "copilot_dirty",
-        "model_provider",
-        "tenant_id",
-        "started_at",
-        "finished_at",
-        "launch_ref",
-        "investigation_id",
-        "thread_id",
-        "investigation_status",
-        "investigation_phase",
-        "termination_reason",
-        "result",
-        "evidence_count",
-        "finding_count",
-        "hypothesis_count",
-        "execution_status",
-        "failure",
-    }
+    assert set(payload) == _PAYLOAD_KEYS
 
 
 def test_serialized_payload_has_no_secret_shaped_fields() -> None:
