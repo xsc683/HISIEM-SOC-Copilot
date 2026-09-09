@@ -183,6 +183,47 @@ class OpenAICompatibleModelProvider:
         self.usage: deque[ModelUsage] = deque(maxlen=_USAGE_MAXLEN)
 
     # ------------------------------------------------------------------
+    # public bounded introspection (E1-C2 §4) — safe metadata only
+    # ------------------------------------------------------------------
+    @property
+    def provider_name(self) -> str:
+        """Stable adapter provider id (``command_code``)."""
+        return _PROVIDER
+
+    @property
+    def protocol_name(self) -> str:
+        """The wire protocol this adapter speaks (never the SDK)."""
+        return _PROTOCOL
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def zdr_enabled(self) -> bool:
+        return self._zdr
+
+    @property
+    def configured_structured_output_mode(self) -> str:
+        """The configured ladder entry (``auto`` or a pinned mode)."""
+        return self._structured_output_mode
+
+    @property
+    def resolved_structured_output_mode(self) -> str | None:
+        """The structured-output mode the provider actually honored, once proven by a
+        successful completion; None before the first success (never guessed)."""
+        return self._mode
+
+    def usage_snapshot(self) -> tuple[ModelUsage, ...]:
+        """Immutable copy of the current bounded usage records.
+
+        Never exposes an API key, prompt, raw response, Authorization header,
+        client internals, or chain-of-thought — each :class:`ModelUsage` is a
+        bounded frozen operational record.
+        """
+        return tuple(self.usage)
+
+    # ------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------
     def _build_client(self) -> Any:

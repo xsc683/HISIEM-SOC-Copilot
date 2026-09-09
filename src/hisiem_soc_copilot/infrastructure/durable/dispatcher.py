@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ...application.ports.durable import OutboxRecord, OutboxStore
 from ..persistence.orm.events import DomainEventRow
-from .investigation_runner import AsyncInvestigationGraphRunner
+from .investigation_runner import AsyncInvestigationGraphRunner, NonRetryableRunError
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,22 @@ class AsyncOutboxDispatcher:
                         investigation_id=investigation_id, tenant_id=tenant_id
                     ),
                 )
+            except NonRetryableRunError as exc:
+                # A deterministic configuration failure (e.g. MODEL_CONFIGURATION)
+                # can never be fixed by retry/backoff — DEAD_LETTER immediately. The
+                # investigation was already marked FAILED/FAILED_FATAL by the runner;
+                # no retry loop, no provider exception text persisted.
+                await self._outbox.mark_dead_letter(
+                    outbox_id=record.id,
+                    lease_token=record.lease_token,
+                    error_code=exc.code,
+                )
+                logger.warning(
+                    "investigation %s run failed NON-RETRYABLE (%s); dead-lettered",
+                    investigation_id,
+                    exc.code,
+                )
+                return
             except Exception as exc:  # recoverable: retry with backoff
                 await self._fail(record, "RUN_FAILED")
                 logger.warning(

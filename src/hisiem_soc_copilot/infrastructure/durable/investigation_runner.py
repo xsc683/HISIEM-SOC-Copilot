@@ -23,11 +23,12 @@ from uuid import UUID
 from ...agent.graph.builder import build_investigation_graph, thread_config
 from ...agent.graph.runtime import GraphRuntime
 from ...agent.graph.state import SCHEMA_VERSION
-from ...application.commands.investigation import StartInvestigation
+from ...application.commands.investigation import FailInvestigation, StartInvestigation
 from ...application.handlers.workflow import InvestigationWorkflowHandler
 from ...application.ports.durable import OrchestrationBinding
 from ...application.ports.unit_of_work import UnitOfWork
 from ...config import LangGraphSettings
+from ...contracts.llm.errors import ModelConfigurationError
 from ...domain.investigation.enums import InvestigationStatus
 
 GRAPH_NAME = "investigation"
@@ -39,6 +40,21 @@ RuntimeFactory = Callable[[str], GraphRuntime]
 CompileGraph = Callable[[GraphRuntime, Any], Any]
 # Async context manager factory yielding a checkpointer (LangGraph saver).
 CheckpointerFactory = Callable[[], Any]
+
+
+class NonRetryableRunError(Exception):
+    """A deterministic runner failure the outbox dispatcher must NEVER retry.
+
+    Used for provider configuration/deployment failures (e.g. ``MODEL_CONFIGURATION``)
+    that a bounded backoff retry can never fix. Exposes ONLY a stable safe ``code`` —
+    never the underlying provider/exception text.
+    """
+
+    code = "RUN_FAILED_FATAL"
+
+    def __init__(self, *, code: str = "RUN_FAILED_FATAL") -> None:
+        self.code = code
+        super().__init__(f"non-retryable run failure ({code})")
 
 
 class AsyncInvestigationGraphRunner:
@@ -91,10 +107,30 @@ class AsyncInvestigationGraphRunner:
         )
         async with checkpointer_ctx as saver:
             graph = self._compile_graph(runtime, saver)
-            await graph.ainvoke(
-                {"investigation_id": investigation_id},
-                thread_config(binding.thread_id),
+            try:
+                await graph.ainvoke(
+                    {"investigation_id": investigation_id},
+                    thread_config(binding.thread_id),
+                )
+            except ModelConfigurationError as exc:
+                # A provider configuration/deployment failure (bad API key, 401/403,
+                # invalid endpoint, unknown model) is deterministic: NEVER silently
+                # defaulted by the graph and NEVER retried by the dispatcher as a
+                # recoverable backoff. Fail the Investigation FATAL, then surface a
+                # SAFE non-retryable run error (stable code only, no provider text).
+                await self._fail_fatal(tenant_id, investigation_uuid)
+                raise NonRetryableRunError(code="MODEL_CONFIGURATION") from exc
+
+    async def _fail_fatal(self, tenant_id: str, investigation_id: UUID) -> None:
+        """Deterministically mark the Investigation FAILED with FAILED_FATAL."""
+        await self._workflow_handler.fail(
+            FailInvestigation(
+                tenant_id=tenant_id,
+                investigation_id=investigation_id,
+                idempotency_key=f"investigation:{investigation_id}:fail:fatal",
+                reason="FAILED_FATAL",
             )
+        )
 
     def _default_checkpointer(self) -> Any:
         from ..checkpoint.postgres import PostgresCheckpointer

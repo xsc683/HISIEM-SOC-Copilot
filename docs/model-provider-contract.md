@@ -385,3 +385,66 @@ Approval、SOAR execution、Frontend、Web Search、File Search、Computer Use�
 
 Tool Authority / Budget Authority / Evidence Authority / Domain Authority 继续留在现有
 runtime。
+
+---
+
+## 21. E1-C2 Real-Model Evaluation Profile
+
+E1-C2 用 **typed evaluation profile**（`evaluation_harness` 的 harness policy）驱动一次
+REAL provider 的端到端 execution，不改动生产 Graph 的 provider 中立性：
+
+```text
+E1_C1_SCRIPTED   (CLI: execute)
+    LLM_PROVIDER == scripted           否则 FAIL CLOSED / no Investigation
+    COPILOT_APP_ENABLE_DISPATCHER=false
+
+E1_C2_REAL_MODEL (CLI: execute-real-model)
+    LLM_PROVIDER == openai_compatible  否则 FAIL CLOSED / no Investigation
+    COPILOT_APP_ENABLE_DISPATCHER=false
+```
+
+两个 profile 的隔离检查都在 `Container.open()` **之前**。`execute` 永不根据环境静默切换
+到真实 provider。E1-C2 从 composition root 的唯一构造路径获得 **ONE** real provider
+instance，注入 manual dispatcher 供 graph 调用，并由同一 instance 的 usage buffer 生成
+telemetry —— 一个 instance、一个真实 usage 来源。
+
+Provider 构造失败（缺 `CMD_API_KEY` / SDK / 非法配置）→ `MODEL_CONFIGURATION`，
+在任何 Investigation 之前 FAIL CLOSED。E1-C2 不评分 GP-01 oracle；MALICIOUS 不是 PASS
+条件；BENIGN / INCONCLUSIVE 皆可。
+
+---
+
+## 22. Model Telemetry Artifact
+
+E1-C2 不改 `evaluation-execution/v2`。同目录新增独立 sidecar：
+
+```text
+<executions_dir>/gp-01/<dataset_run_id>/<execution_id>/
+    execution.json          schema = evaluation-execution/v2
+    model-telemetry.json    schema = evaluation-model-telemetry/v1
+```
+
+记录 bounded 真实 usage：provider / protocol / model / zdr_enabled /
+configured+resolved structured-output mode / usage_records[]（operation、
+provider_request_id、latency_ms、attempt_count、input/output/total_tokens（未报告即
+null，不猜）、outcome、error_category）/ required+successful_operations /
+gate_status / gate_failures。
+
+**Gate 与 Investigation/execution status 分离（§6）**：运行时把 provider outage /
+refusal / invalid output 降级为确定性 fallback，因此可能出现 Investigation=COMPLETED
++ INCONCLUSIVE 而 E1-C2 gate=FAIL（所有真实调用失败）。`model-telemetry.json` 拥有
+E1-C2 gate 结果。PASS 要求 plan/decide/assess/verdict 各自至少一次 successful validated
+真实调用、resolved mode ∈ json_schema|json_object|json_only、且无 MODEL_CONFIGURATION
+失败。telemetry 永远不存 API key / Authorization header / prompt / raw completion /
+evidence / raw alert / oracle / CoT / 异常文本。写入是原子文件替换。
+
+---
+
+## 23. Opt-in Live Provider Gate
+
+真实 Command Code smoke 套件（`tests/live/test_command_code_smoke.py`）是 opt-in：
+仅当 `RUN_LIVE_LLM_TESTS=1` **且** `CMD_API_KEY` 存在时运行；其余环境 SKIP，绝不触网、
+绝不影响默认套件、绝不打印 API key。它直接证明 plan / decide / assess / verdict 的
+live structured candidate 兼容性，并用 provider 的 public `resolved_structured_output_mode`
+报告真实模式（json_schema → json_object → json_only）。直接 smoke 通过 + integrated
+execution COMPLETED 两者都是 E1-C2 的必需层，缺一不可；不能只凭其一宣告 PASS。

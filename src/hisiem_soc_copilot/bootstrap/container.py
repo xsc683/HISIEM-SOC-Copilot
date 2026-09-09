@@ -85,6 +85,33 @@ class Container:
         store: OutboxStore = SqlAlchemyOutboxStore(self.session_factory())
         return store
 
+    def model_provider(self) -> ModelProvider:
+        """The SINGLE configuration-based provider construction path (E1-C2 §3).
+
+        Provider selection lives ONLY here (config/bootstrap/container): the graph
+        never branches on the provider name. ``scripted`` → the deterministic fake;
+        ``openai_compatible`` → the real Command Code adapter. The adapter's
+        constructor reads the API key from ``llm.api_key_env`` and raises
+        :class:`ModelConfigurationError` when it is absent — so a real provider can
+        never be silently built without credentials. Callers that need ONE provider
+        instance shared by the graph AND telemetry obtain it here and inject it.
+        """
+        from ..infrastructure.llm.openai_compatible import OpenAICompatibleModelProvider
+        from ..infrastructure.llm.scripted import ScriptedModelProvider
+
+        llm = self.settings.llm
+        if llm.provider == "openai_compatible":
+            return OpenAICompatibleModelProvider(
+                base_url=llm.base_url,
+                model=llm.model,
+                api_key_env=llm.api_key_env,
+                timeout_seconds=llm.timeout_seconds,
+                max_retries=llm.max_retries,
+                zdr=llm.zdr,
+                structured_output_mode=llm.structured_output_mode,
+            )
+        return ScriptedModelProvider()
+
     def investigation_runner(
         self,
         *,
@@ -94,38 +121,19 @@ class Container:
         """Build the durable runner that executes one investigation's graph.
 
         ``hisiem`` defaults to the real HISIEM HTTP adapter; ``model`` defaults to
-        the provider selected by ``llm.provider`` (scripted for tests/offline, the
-        real OpenAI-compatible Command Code adapter when configured). Tests inject
-        fakes to run the graph without a live HISIEM or model API.
+        :meth:`model_provider` (the single configuration-based provider selection).
+        Tests inject fakes to run the graph without a live HISIEM or model API.
         """
         from ..agent.evidence.normalizer import EvidenceNormalizer
         from ..agent.graph.builder import build_investigation_graph
         from ..agent.graph.runtime import GraphRuntime
         from ..agent.tools.executor import ToolExecutor
         from ..agent.tools.registry import ToolRegistry
-        from ..infrastructure.llm.openai_compatible import OpenAICompatibleModelProvider
-        from ..infrastructure.llm.scripted import ScriptedModelProvider
 
         uow_factory = self.unit_of_work_factory()
         workflow_handler = self.investigation_workflow_handler()
         hisiem_adapter = hisiem if hisiem is not None else self.hisiem()
-        model_provider = model
-        if model_provider is None:
-            # Provider selection lives ONLY in config/bootstrap/container — the graph
-            # never branches on the provider name.
-            llm = self.settings.llm
-            if llm.provider == "openai_compatible":
-                model_provider = OpenAICompatibleModelProvider(
-                    base_url=llm.base_url,
-                    model=llm.model,
-                    api_key_env=llm.api_key_env,
-                    timeout_seconds=llm.timeout_seconds,
-                    max_retries=llm.max_retries,
-                    zdr=llm.zdr,
-                    structured_output_mode=llm.structured_output_mode,
-                )
-            else:
-                model_provider = ScriptedModelProvider()
+        model_provider = model if model is not None else self.model_provider()
 
         def _runtime(tenant_id: str) -> GraphRuntime:
             return GraphRuntime(

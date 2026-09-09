@@ -19,6 +19,7 @@ from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
 from hisiem_soc_copilot.agent.evidence.normalizer import EvidenceNormalizer
@@ -27,6 +28,14 @@ from hisiem_soc_copilot.agent.graph.runtime import GraphRuntime
 from hisiem_soc_copilot.agent.tools.executor import ToolExecutor
 from hisiem_soc_copilot.agent.tools.registry import ToolRegistry
 from hisiem_soc_copilot.application.handlers.workflow import InvestigationWorkflowHandler
+from hisiem_soc_copilot.contracts.llm.errors import (
+    ModelConfigurationError,
+    ModelOutputValidationError,
+    ModelRateLimitedError,
+    ModelRefusalError,
+    ModelTimeoutError,
+    ModelUnavailableError,
+)
 from hisiem_soc_copilot.domain.investigation.aggregate import Investigation
 from hisiem_soc_copilot.domain.investigation.enums import InvestigationStatus
 from hisiem_soc_copilot.domain.investigation.value_objects import (
@@ -36,6 +45,7 @@ from hisiem_soc_copilot.domain.investigation.value_objects import (
 )
 from hisiem_soc_copilot.infrastructure.durable.investigation_runner import (
     AsyncInvestigationGraphRunner,
+    NonRetryableRunError,
 )
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.fakes import FakeUnitOfWorkFactory
@@ -373,3 +383,163 @@ class _Memctx:
 
 def _memctx() -> _Memctx:
     return _Memctx()
+
+
+class _ConfigFailingModel:
+    """A ModelProvider whose FIRST consult raises a ModelConfigurationError."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def plan(self, request: Any) -> Any:
+        self.calls.append("plan")
+        raise ModelConfigurationError("bad api key boom SUPERSECRET1234")
+
+    async def decide_next(self, request: Any) -> Any:
+        self.calls.append("decide")
+        raise AssertionError("decide reached after config failure")
+
+    async def assess(self, request: Any) -> Any:
+        self.calls.append("assess")
+        raise AssertionError("assess reached after config failure")
+
+    async def verdict(self, request: Any) -> Any:
+        self.calls.append("verdict")
+        raise AssertionError("verdict reached after config failure")
+
+
+async def test_runner_model_configuration_fails_fatal_and_is_nonretryable() -> None:
+    """§8: a ModelConfigurationError from the graph must mark the Investigation
+    FAILED/FAILED_FATAL and surface as a SAFE non-retryable run error — the provider
+    is consulted exactly once (no silent default, no graph retry)."""
+    uows = FakeUnitOfWorkFactory()
+    inv = await _create_investigation(uows)
+    hisiem = FakeHisiem(alert_id="alert-runner-1")
+    model = _ConfigFailingModel()
+    handler = InvestigationWorkflowHandler(unit_of_work_factory=uows)
+
+    def _runtime(tenant_id: str) -> GraphRuntime:
+        return GraphRuntime(
+            uow_factory=uows,
+            workflow_handler=handler,
+            model=model,  # type: ignore[arg-type]
+            executor=ToolExecutor(hisiem=hisiem),
+            normalizer=EvidenceNormalizer(),
+            registry=ToolRegistry(),
+            hisiem=hisiem,
+            tenant_id=tenant_id,
+        )
+
+    runner = AsyncInvestigationGraphRunner(
+        unit_of_work_factory=uows,
+        workflow_handler=handler,
+        runtime_factory=_runtime,
+        compile_graph=build_investigation_graph,
+        checkpointer_factory=lambda: _memctx(),
+    )
+    with pytest.raises(NonRetryableRunError) as excinfo:
+        await runner.run_investigation(
+            investigation_id=str(inv.id), tenant_id="tenant-a"
+        )
+    assert excinfo.value.code == "MODEL_CONFIGURATION"
+    # Exactly one provider invocation; the deterministic config failure never
+    # degrades to a fallback and never re-consults.
+    assert model.calls == ["plan"]
+
+    uow = uows()
+    try:
+        loaded = await uow.investigations.get(
+            tenant_id="tenant-a", investigation_id=inv.id
+        )
+        assert loaded is not None
+        assert loaded.status == InvestigationStatus.FAILED
+        assert loaded.termination_reason is not None
+        assert loaded.termination_reason.value == "FAILED_FATAL"
+    finally:
+        await uow.close()
+
+
+class _FailingModel:
+    """A ModelProvider raising ONE typed non-config error on every consult."""
+
+    def __init__(self, error_type: type[Exception]) -> None:
+        self.error_type = error_type
+        self.calls: list[str] = []
+
+    async def _raise(self, operation: str) -> Any:
+        self.calls.append(operation)
+        raise self.error_type(f"deterministic {operation} failure")
+
+    async def plan(self, request: Any) -> Any:
+        return await self._raise("plan")
+
+    async def decide_next(self, request: Any) -> Any:
+        return await self._raise("decide")
+
+    async def assess(self, request: Any) -> Any:
+        return await self._raise("assess")
+
+    async def verdict(self, request: Any) -> Any:
+        return await self._raise("verdict")
+
+
+async def test_non_config_model_failures_keep_runtime_fallback() -> None:
+    """§10/§16: timeout/unavailable, refusal, and invalid-output are NOT fatal — the
+    runtime applies its deterministic fallback and the Investigation still COMPLETES
+    (INCONCLUSIVE). Only ModelConfigurationError is fatal (covered above)."""
+    for error_type in (
+        ModelUnavailableError,
+        ModelRateLimitedError,
+        ModelTimeoutError,
+        ModelRefusalError,
+        ModelOutputValidationError,
+    ):
+        uows = FakeUnitOfWorkFactory()
+        inv = await _create_investigation(uows)
+        model = _FailingModel(error_type)
+        await _run_with(uows, model).run_investigation(
+            investigation_id=str(inv.id), tenant_id="tenant-a"
+        )
+        # Every consult was attempted and fell back — never FATAL.
+        assert model.calls == ["plan", "decide", "assess", "verdict"]
+        uow = uows()
+        try:
+            loaded = await uow.investigations.get(
+                tenant_id="tenant-a", investigation_id=inv.id
+            )
+            assert loaded is not None
+            assert loaded.status == InvestigationStatus.COMPLETED
+        finally:
+            await uow.close()
+
+
+def _run_with(
+    uows: FakeUnitOfWorkFactory,
+    model: Any,
+    *,
+    hisiem: FakeHisiem | None = None,
+) -> AsyncInvestigationGraphRunner:
+    """Build a durable runner bound to a model (no loop-variable late binding)."""
+    if hisiem is None:
+        hisiem = FakeHisiem(alert_id="alert-runner-1")
+    handler = InvestigationWorkflowHandler(unit_of_work_factory=uows)
+
+    def _runtime(tenant_id: str) -> GraphRuntime:
+        return GraphRuntime(
+            uow_factory=uows,
+            workflow_handler=handler,
+            model=model,  # type: ignore[arg-type]
+            executor=ToolExecutor(hisiem=hisiem),
+            normalizer=EvidenceNormalizer(),
+            registry=ToolRegistry(),
+            hisiem=hisiem,
+            tenant_id=tenant_id,
+        )
+
+    return AsyncInvestigationGraphRunner(
+        unit_of_work_factory=uows,
+        workflow_handler=handler,
+        runtime_factory=_runtime,
+        compile_graph=build_investigation_graph,
+        checkpointer_factory=lambda: _memctx(),
+    )

@@ -7,6 +7,7 @@ Commands:
     python -m hisiem_soc_copilot.evaluation.cli prepare GP-01
     python -m hisiem_soc_copilot.evaluation.cli verify-manifest <run_id>
     python -m hisiem_soc_copilot.evaluation.cli execute <run_id>
+    python -m hisiem_soc_copilot.evaluation.cli execute-real-model <run_id>
 
 ``prepare GP-01`` is a convenience that runs materialize -> resolve -> verify ->
 seal, but materialization and sealing remain separate internal contracts. Run
@@ -290,6 +291,21 @@ async def _execute_run(dataset_run_id: str) -> int:
     return await execute_cli(dataset_run_id=dataset_run_id)
 
 
+async def _execute_real_model_run(dataset_run_id: str) -> int:
+    """E1-C2: run one sealed GP-01 dataset through the REAL provider pipeline.
+
+    Like E1-C1 but under the E1_C2_REAL_MODEL profile: requires
+    ``LLM_PROVIDER=openai_compatible`` + ``COPILOT_APP_ENABLE_DISPATCHER=false``
+    BEFORE the Container opens, obtains ONE real provider instance from the
+    composition root, and persists the E1-C2 ``model-telemetry.json`` sidecar
+    (gate PASS is separate from the execution status). Returns 0 only when the
+    execution COMPLETED AND the real-model telemetry gate PASSES.
+    """
+    from ..evaluation_harness import execute_real_model_cli
+
+    return await execute_real_model_cli(dataset_run_id=dataset_run_id)
+
+
 def _build_settings() -> tuple[EvaluationSettings, HisiemSettings]:
     from ..config import get_settings
 
@@ -348,6 +364,9 @@ async def _dispatch(argv: list[str]) -> int:
 
     if command == "execute":
         return await _execute_run(target)
+
+    if command == "execute-real-model":
+        return await _execute_real_model_run(target)
 
     print(f"unknown command {command!r}")
     return 2

@@ -48,6 +48,7 @@ import asyncio
 import logging
 import subprocess
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -68,6 +69,12 @@ from .record import (
     rfc3339_utc,
     write_record,
 )
+from .telemetry import (
+    GATE_PASS,
+    build_model_telemetry,
+    model_telemetry_path,
+    write_model_telemetry,
+)
 
 if TYPE_CHECKING:
     from ..bootstrap.container import Container
@@ -81,6 +88,20 @@ SCENARIO_SEGMENT = "gp-01"
 ACTOR_SUBJECT = "evaluation-runner"
 ACTOR_DISPLAY_NAME = "Evaluation Runner"
 
+
+class EvaluationProfile(StrEnum):
+    """Typed evaluation-harness profile (policy only — the production graph and
+    Container stay provider-neutral).
+
+    ``E1_C1_SCRIPTED`` (the ``execute`` command) requires the deterministic
+    scripted provider; ``E1_C2_REAL_MODEL`` (the ``execute-real-model`` command)
+    requires the REAL OpenAI-compatible provider. Both require the background
+    dispatcher disabled so the harness drives :meth:`drain_once` manually.
+    """
+
+    E1_C1_SCRIPTED = "E1_C1_SCRIPTED"
+    E1_C2_REAL_MODEL = "E1_C2_REAL_MODEL"
+
 # Failure categories (bounded — never free-form secrets).
 CAT_MANIFEST_NOT_FOUND = "MANIFEST_NOT_FOUND"
 CAT_MANIFEST_VERIFY_FAILURE = "MANIFEST_VERIFY_FAILURE"
@@ -88,6 +109,8 @@ CAT_MANIFEST_NOT_AUTHORITATIVE = "MANIFEST_NOT_AUTHORITATIVE"
 CAT_DATASET_IDENTITY_MISMATCH = "DATASET_IDENTITY_MISMATCH"
 CAT_DISPATCHER_ENABLED = "DISPATCHER_ENABLED"
 CAT_NON_SCRIPTED_PROVIDER = "NON_SCRIPTED_PROVIDER"
+CAT_REAL_MODEL_PROVIDER_REQUIRED = "REAL_MODEL_PROVIDER_REQUIRED"
+CAT_MODEL_CONFIGURATION = "MODEL_CONFIGURATION"
 CAT_EXECUTION_WORKTREE_DIRTY = "EXECUTION_WORKTREE_DIRTY"
 CAT_EXECUTION_PROVENANCE_UNAVAILABLE = "EXECUTION_PROVENANCE_UNAVAILABLE"
 CAT_ACTIVE_INVESTIGATION_EXISTS = "ACTIVE_INVESTIGATION_EXISTS"
@@ -146,6 +169,15 @@ _FIXED_MESSAGES: dict[str, str] = {
         "the configured LLM provider is not 'scripted'; E1-C1 requires "
         "LLM_PROVIDER=scripted"
     ),
+    CAT_REAL_MODEL_PROVIDER_REQUIRED: (
+        "the configured LLM provider is not 'openai_compatible'; the E1-C2 "
+        "real-model profile requires LLM_PROVIDER=openai_compatible"
+    ),
+    CAT_MODEL_CONFIGURATION: (
+        "the real model provider could not be constructed from configuration "
+        "(missing API key / SDK / invalid settings); E1-C2 fails closed before any "
+        "investigation"
+    ),
     CAT_EXECUTION_WORKTREE_DIRTY: (
         "the execution worktree has uncommitted changes; E1-C1 requires a clean "
         "authoritative Copilot HEAD at execution time"
@@ -192,6 +224,8 @@ _FIXED_TYPES: dict[str, str] = {
     CAT_DATASET_IDENTITY_MISMATCH: "DatasetIdentityMismatch",
     CAT_DISPATCHER_ENABLED: "DispatcherEnabled",
     CAT_NON_SCRIPTED_PROVIDER: "NonScriptedProvider",
+    CAT_REAL_MODEL_PROVIDER_REQUIRED: "RealModelProviderRequired",
+    CAT_MODEL_CONFIGURATION: "ModelConfiguration",
     CAT_EXECUTION_WORKTREE_DIRTY: "DirtyExecutionWorktree",
     CAT_EXECUTION_PROVENANCE_UNAVAILABLE: "ExecutionProvenanceUnavailable",
     CAT_ACTIVE_INVESTIGATION_EXISTS: "ActiveInvestigationExists",
@@ -294,16 +328,25 @@ def verify_dataset_manifest(path: str | Path) -> SealedManifest:
     return verify_sealed_manifest(path)
 
 
-def execution_isolation_violation(settings: Any) -> str | None:
-    """Return the isolation-failure category, or None when E1-C1 isolation holds.
+def execution_isolation_violation(
+    settings: Any, profile: EvaluationProfile = EvaluationProfile.E1_C1_SCRIPTED
+) -> str | None:
+    """Return the isolation-failure category, or None when the profile's isolation
+    holds.
 
-    E1-C1 must deterministically run with the durable dispatcher disabled and the
-    configured LLM provider set to ``scripted``. This MUST be checked before the
-    Container opens (so ``Container.open()`` never starts a background dispatcher
-    that could race the harness's manual dispatcher using the real provider).
+    Both evaluation profiles must run with the durable outbox dispatcher DISABLED
+    and the harness drives :meth:`drain_once` manually. The provider requirement is
+    profile-specific: E1_C1 requires ``scripted``; E1_C2_REAL_MODEL requires
+    ``openai_compatible``. This MUST be checked before the Container opens (so
+    ``Container.open()`` never starts a background dispatcher that could race the
+    harness's manual dispatcher using the real provider).
     """
     if settings.app.enable_dispatcher:
         return CAT_DISPATCHER_ENABLED
+    if profile == EvaluationProfile.E1_C2_REAL_MODEL:
+        if settings.llm.provider != "openai_compatible":
+            return CAT_REAL_MODEL_PROVIDER_REQUIRED
+        return None
     if settings.llm.provider != "scripted":
         return CAT_NON_SCRIPTED_PROVIDER
     return None
@@ -408,22 +451,28 @@ async def execute_execution(
     model: Any | None = None,
     hisiem: Any | None = None,
     execution_code: tuple[str, bool] | None = None,
+    profile: EvaluationProfile = EvaluationProfile.E1_C1_SCRIPTED,
 ) -> EvaluationExecutionRecord:
-    """Run one E1-C1 execution for ``dataset_run_id`` against an OPEN container.
+    """Run one evaluation execution for ``dataset_run_id`` against an OPEN container.
 
-    Fail-closed + authoritative-only: environment isolation, verification, dataset
-    identity, dataset authority, clean execution worktree, and the active-
+    Fail-closed + authoritative-only: profile isolation, verification, dataset
+    identity, dataset authority, clean execution provenance, and the active-
     investigation guard all run BEFORE the investigation is started. Returns the
     terminal (COMPLETED or FAILED) record, persisted atomically under
     ``<executions_dir>/gp-01/...``. Any unexpected post-start runtime exception is
     terminalized to a FAILED ``DRIVE_FAILED`` record (never left RUNNING).
 
-    ``model`` defaults to the deterministic :class:`ScriptedModelProvider` (E1-C1
-    never enables a real provider). ``hisiem`` defaults to the container's real
-    HISIEM HTTP adapter; tests inject a fake. ``execution_code`` overrides the
-    CURRENT Copilot revision (tests inject it; the CLI/operator path resolves the
-    real HEAD). The container MUST be opened by the caller (the DB phase requires
-    its session factory).
+    ``profile`` selects the harness policy: ``E1_C1_SCRIPTED`` (deterministic
+    scripted model) or ``E1_C2_REAL_MODEL`` (REAL provider — ``model`` MUST be a
+    single provider instance obtained from :meth:`Container.model_provider`, so the
+    graph calls and the E1-C2 telemetry share ONE usage buffer). When ``model`` is
+    None under ``E1_C2_REAL_MODEL`` the provider is built from the container's
+    single construction path HERE — before any Investigation — and a provider
+    configuration failure (e.g. missing API key) fails closed with NO investigation.
+    ``hisiem`` defaults to the container's real HISIEM HTTP adapter; tests inject a
+    fake. ``execution_code`` overrides the CURRENT Copilot revision (tests inject
+    it; the CLI/operator path resolves the real HEAD). The container MUST be opened
+    by the caller (the DB phase requires its session factory).
     """
     settings = container.settings
     eval_settings = settings.evaluation
@@ -436,8 +485,8 @@ async def execute_execution(
         write_record(artifact, record)
         return record
 
-    # --- Phase 0: environment isolation (must hold before Container side effects).
-    violation = execution_isolation_violation(settings)
+    # --- Phase 0: profile isolation (must hold before Container side effects). ---
+    violation = execution_isolation_violation(settings, profile)
     if violation is not None:
         record = EvaluationExecutionRecord(
             execution_id=execution_id,
@@ -452,6 +501,36 @@ async def execute_execution(
             message=_FIXED_MESSAGES[violation],
         )
         return persist(record)
+
+    # --- Phase 0.5: resolve the ONE model provider BEFORE any investigation. -----
+    if model is not None:
+        model_provider = model
+    elif profile == EvaluationProfile.E1_C2_REAL_MODEL:
+        try:
+            model_provider = container.model_provider()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — configuration error, bounded
+            # Provider construction failed (missing API key / SDK / invalid
+            # settings): fail closed with NO investigation. Only the bounded
+            # category/type is persisted — never str(exc)/the key.
+            record = EvaluationExecutionRecord(
+                execution_id=execution_id,
+                dataset_run_id=dataset_run_id,
+                model_provider=str(settings.llm.provider),
+                started_at=rfc3339_utc(),
+                execution_status=ExecutionStatus.CREATED,
+            )
+            record.fail(
+                category=CAT_MODEL_CONFIGURATION,
+                failure_type=type(exc).__name__,
+                message=_FIXED_MESSAGES[CAT_MODEL_CONFIGURATION],
+            )
+            return persist(record)
+    else:
+        model_provider = ScriptedModelProvider(
+            script={"verdict": _E1C1_SCRIPTED_VERDICT}
+        )
 
     # --- Phase 1: verify manifest (fail closed, no investigation). ---------------
     manifest_path = dataset_manifest_path(eval_settings, dataset_run_id)
@@ -489,6 +568,9 @@ async def execute_execution(
     record = record_from_manifest(
         manifest, execution_id=execution_id, dataset_run_id=dataset_run_id
     )
+    # The record's model_provider mirrors the ACTUAL configured provider (scripted
+    # under E1-C1; openai_compatible under the E1-C2 real-model profile).
+    record.model_provider = str(settings.llm.provider)
 
     if dataset_run_id != manifest.run.run_id:
         record.fail(
@@ -604,11 +686,8 @@ async def execute_execution(
     persist(record)
 
     # --- Phase 4: drive the durable outbox dispatcher to a terminal state. -------
-    model_provider = (
-        model
-        if model is not None
-        else ScriptedModelProvider(script={"verdict": _E1C1_SCRIPTED_VERDICT})
-    )
+    # ``model_provider`` was resolved in Phase 0.5 (E1-C1 scripted default / E1-C2
+    # real provider) — ONE instance shared by the graph and the E1-C2 telemetry.
     dispatcher = container.outbox_dispatcher(hisiem=hisiem, model=model_provider)
 
     try:
@@ -974,5 +1053,119 @@ async def execute_cli(*, dataset_run_id: str) -> int:
     )
     print(f"execution_artifact={artifact}")
     if record.execution_status == ExecutionStatus.COMPLETED:
+        return 0
+    return 1
+
+
+async def execute_real_model_cli(*, dataset_run_id: str) -> int:
+    """Operator-facing E1-C2 driver: real-model profile isolation + telemetry.
+
+    Same fail-closed gates as :func:`execute_cli` but under
+    :class:`EvaluationProfile.E1_C2_REAL_MODEL`: it requires
+    ``LLM_PROVIDER=openai_compatible`` and ``COPILOT_APP_ENABLE_DISPATCHER=false``
+    BEFORE ``Container.open()``; a provider configuration failure (missing
+    ``CMD_API_KEY`` / SDK / invalid settings) fails closed with NO investigation.
+    ONE real provider instance is obtained from :meth:`Container.model_provider`
+    and shared by the graph AND the E1-C2 ``model-telemetry.json`` sidecar, so the
+    telemetry usage buffer is truthful.
+
+    Returns 0 only when the execution COMPLETED AND the E1-C2 model-telemetry gate
+    PASSES (>=1 successful validated real model call for each of plan/decide/assess/
+    verdict in a resolved structured-output mode, no MODEL_CONFIGURATION failure) —
+    E1-C2 PASS is separate from the Investigation/execution status (§6).
+    """
+    from ..bootstrap.container import Container
+    from ..config import get_settings
+
+    root = get_settings()
+    profile = EvaluationProfile.E1_C2_REAL_MODEL
+    execution_id = uuid4().hex
+    violation = execution_isolation_violation(root, profile)
+
+    def _write_failure(category: str, failure_type: str, message: str) -> int:
+        record = EvaluationExecutionRecord(
+            execution_id=execution_id,
+            dataset_run_id=dataset_run_id,
+            model_provider=str(root.llm.provider),
+            started_at=rfc3339_utc(),
+            execution_status=ExecutionStatus.CREATED,
+        )
+        resolved = resolve_execution_provenance()
+        if resolved is None:
+            record.execution_code_git_commit = "unknown"
+            record.execution_code_dirty = True
+        else:
+            record.execution_code_git_commit, record.execution_code_dirty = resolved
+        record.fail(category=category, failure_type=failure_type, message=message)
+        artifact = execution_artifact_path(
+            root.evaluation.executions_dir, dataset_run_id, execution_id
+        )
+        write_record(artifact, record)
+        for line in report(record):
+            print(line)
+        print(f"execution_artifact={artifact}")
+        return 1
+
+    if violation is not None:
+        return _write_failure(
+            violation, _FIXED_TYPES[violation], _FIXED_MESSAGES[violation]
+        )
+
+    container = Container(root)
+    try:
+        provider = container.model_provider()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — provider configuration error, bounded
+        return _write_failure(
+            CAT_MODEL_CONFIGURATION,
+            type(exc).__name__,
+            _FIXED_MESSAGES[CAT_MODEL_CONFIGURATION],
+        )
+    await container.open()
+    try:
+        record = await execute_execution(
+            dataset_run_id=dataset_run_id,
+            container=container,
+            model=provider,
+            profile=profile,
+        )
+    finally:
+        await container.close()
+
+    telemetry = build_model_telemetry(
+        execution_id=record.execution_id,
+        dataset_run_id=dataset_run_id,
+        provider_adapter=str(root.llm.provider),
+        provider=provider,
+    )
+    artifact = execution_artifact_path(
+        root.evaluation.executions_dir, dataset_run_id, record.execution_id
+    )
+    telemetry_artifact = model_telemetry_path(
+        root.evaluation.executions_dir, dataset_run_id, record.execution_id
+    )
+    write_model_telemetry(telemetry_artifact, telemetry)
+
+    for line in report(record):
+        print(line)
+    print(f"execution_artifact={artifact}")
+    print(f"model_telemetry_artifact={telemetry_artifact}")
+    print(f"model_telemetry_gate={telemetry.gate_status}")
+    if telemetry.gate_failures:
+        print(f"model_telemetry_failures={','.join(telemetry.gate_failures)}")
+    print(
+        f"model_telemetry_provider={telemetry.provider} "
+        f"protocol={telemetry.protocol} model={telemetry.model}"
+    )
+    print(
+        f"model_telemetry_resolved_mode={telemetry.resolved_structured_output_mode}"
+    )
+    print(f"model_telemetry_successful={','.join(telemetry.successful_operations)}")
+
+    if (
+        record.execution_status == ExecutionStatus.COMPLETED
+        and telemetry.gate_status == GATE_PASS
+    ):
         return 0
     return 1

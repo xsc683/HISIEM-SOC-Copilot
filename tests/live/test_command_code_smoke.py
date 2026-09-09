@@ -169,7 +169,7 @@ async def test_live_reports_resolved_structured_mode(
     """
     plan = await live_provider.plan(_plan_request())
     assert plan.goal
-    mode = live_provider._mode
+    mode = live_provider.resolved_structured_output_mode
     print(f"\n[LIVE] command_code/deepseek-v4-flash resolved structured mode: {mode!r}")
     assert mode in ("json_schema", "json_object", "json_only")
 

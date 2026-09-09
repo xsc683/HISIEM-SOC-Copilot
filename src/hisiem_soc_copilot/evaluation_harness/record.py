@@ -308,9 +308,14 @@ def write_record(path: str | Path, record: EvaluationExecutionRecord) -> None:
     observes a torn JSON document. Never uses the sealer — this is NOT a sealed
     manifest and MUST NOT be seal_manifest()'d.
     """
+    atomic_write_json(path, record.to_payload())
+
+
+def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically write one bounded JSON payload (shared by record + telemetry)."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(record.to_payload(), ensure_ascii=False, indent=2).encode("utf-8")
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     _atomic_write(target, data)
 
 
