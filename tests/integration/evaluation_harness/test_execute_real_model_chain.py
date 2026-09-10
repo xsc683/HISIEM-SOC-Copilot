@@ -36,16 +36,20 @@ from hisiem_soc_copilot.contracts.llm.errors import (
 from hisiem_soc_copilot.evaluation_harness.harness import (
     EvaluationProfile,
     execute_execution,
+    execute_real_model_run,
 )
 from hisiem_soc_copilot.evaluation_harness.record import (
     ExecutionStatus,
     execution_artifact_path,
+    read_record,
 )
 from hisiem_soc_copilot.evaluation_harness.telemetry import (
     GATE_FAIL,
     GATE_PASS,
     REQUIRED_OPERATIONS,
     build_model_telemetry,
+    model_telemetry_path,
+    read_model_telemetry,
 )
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.hisiem_fake import FakeHisiem
@@ -389,3 +393,210 @@ async def test_model_configuration_fails_fatal_dead_letter_and_secret_safe(
     )
     payload = artifact.read_text(encoding="utf-8")
     assert secret not in payload
+
+
+# ---------------------------------------------------------------------------
+# §4 — the REAL ``execute-real-model`` orchestration path (execute_real_model_run)
+#
+# These drive the SAME internal function the production CLI calls. ``provider`` /
+# ``hisiem`` / ``execution_code`` are the injection seams; the CLI passes none of
+# them, so the operator path is identical.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def real_settings(tmp_path: Path) -> AsyncIterator[tuple[Settings, Any]]:
+    """Sealed dataset + reachable DB, WITHOUT an open container.
+
+    ``execute_real_model_run`` opens (and closes) its OWN container, so this fixture
+    only seals + truncates and yields ``(settings, session_factory)`` for the
+    post-run DB assertions.
+    """
+    settings = _settings(tmp_path)
+    if not await _db_reachable(settings):
+        import pytest
+
+        pytest.skip("PostgreSQL not reachable — skipping E1-C2 integration test")
+    seal_dataset(
+        runs_dir=Path(settings.evaluation.runs_dir), dataset_run_id=_DATASET_RUN_ID
+    )
+    engine = create_async_engine(settings.database.database_url)
+    factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    await _truncate(factory)
+    try:
+        yield settings, factory
+    finally:
+        await engine.dispose()
+
+
+async def test_execute_real_model_run_healthy_creates_both_artifacts(
+    real_settings,
+) -> None:
+    """§4 healthy: execution.json + model-telemetry.json for the SAME execution_id,
+    COMPLETED with an InvestigationResult, telemetry gate PASS, exit 0, and the
+    telemetry is sourced from the SAME provider instance the graph consulted."""
+    settings, _factory = real_settings
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+    provider = _RecordingScripted(
+        scripted=ScriptedModelProvider(script={"verdict": dict(_SCRIPTED_VERDICT)})
+    )
+    result = await execute_real_model_run(
+        dataset_run_id=_DATASET_RUN_ID,
+        settings=settings,
+        provider=provider,
+        hisiem=hisiem,
+        execution_code=("integration-exec-head", False),
+    )
+    assert result.exit_code == 0
+    assert result.execution_id is not None
+    assert result.telemetry is not None
+    assert result.telemetry.gate_status == GATE_PASS
+    assert result.telemetry.successful_operations == REQUIRED_OPERATIONS
+    # The SAME instance the graph used is the telemetry source.
+    assert {r["operation"] for r in result.telemetry.usage_records} >= set(
+        REQUIRED_OPERATIONS
+    )
+    assert len(provider.usage) >= len(REQUIRED_OPERATIONS)
+
+    executions_dir = settings.evaluation.executions_dir
+    exec_artifact = execution_artifact_path(
+        executions_dir, _DATASET_RUN_ID, result.execution_id
+    )
+    telemetry_artifact = model_telemetry_path(
+        executions_dir, _DATASET_RUN_ID, result.execution_id
+    )
+    assert exec_artifact.is_file()
+    assert telemetry_artifact.is_file()
+    # BOTH artifacts belong to the ONE execution_id.
+    assert telemetry_artifact.parent == exec_artifact.parent
+    record = read_record(exec_artifact)
+    assert record.execution_id == result.execution_id
+    assert record.execution_status == ExecutionStatus.COMPLETED
+    assert record.result_disposition is not None
+    restored = read_model_telemetry(telemetry_artifact)
+    assert restored.execution_id == result.execution_id
+    assert restored.gate_status == GATE_PASS
+
+
+async def test_execute_real_model_run_fallback_completed_but_gate_fail(
+    real_settings,
+) -> None:
+    """§4 fallback: a transient/unavailable provider degrades into COMPLETED +
+    INCONCLUSIVE (runtime fallback), but the E1-C2 gate FAILs → exit 1."""
+    settings, _factory = real_settings
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+
+    class _UnavailableProvider:
+        provider_name = "command_code"
+        protocol_name = "openai_compatible_chat_completions"
+        model_name = "deepseek/deepseek-v4-flash"
+        zdr_enabled = True
+        configured_structured_output_mode = "auto"
+        _resolved: str | None = None
+        usage: list[dict[str, object]] = []
+
+        @property
+        def resolved_structured_output_mode(self) -> str | None:
+            return self._resolved
+
+        def usage_snapshot(self) -> tuple[dict[str, object], ...]:
+            return tuple(self.usage)
+
+        def _err(self, operation: str) -> None:
+            self.usage.append(
+                {
+                    "operation": operation,
+                    "outcome": "error",
+                    "error_category": "MODEL_UNAVAILABLE",
+                }
+            )
+
+        async def plan(self, request: Any) -> Any:
+            self._err("plan")
+            raise ModelUnavailableError("provider is down")
+
+        async def decide_next(self, request: Any) -> Any:
+            self._err("decide")
+            raise ModelUnavailableError("provider is down")
+
+        async def assess(self, request: Any) -> Any:
+            self._err("assess")
+            raise ModelUnavailableError("provider is down")
+
+        async def verdict(self, request: Any) -> Any:
+            self._err("verdict")
+            raise ModelUnavailableError("provider is down")
+
+    provider = _UnavailableProvider()
+    result = await execute_real_model_run(
+        dataset_run_id=_DATASET_RUN_ID,
+        settings=settings,
+        provider=provider,
+        hisiem=hisiem,
+        execution_code=("integration-exec-head", False),
+    )
+    assert result.exit_code == 1
+    assert result.telemetry is not None
+    assert result.telemetry.gate_status == GATE_FAIL
+    assert result.telemetry.successful_operations == ()
+    # Investigation still COMPLETED but INCONCLUSIVE (deterministic fallback).
+    exec_artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, result.execution_id
+    )
+    assert exec_artifact.is_file()
+    record = read_record(exec_artifact)
+    assert record.execution_status == ExecutionStatus.COMPLETED
+    assert record.result_disposition == "INCONCLUSIVE"
+
+
+async def test_execute_real_model_run_configuration_fatal_no_retry(
+    real_settings,
+) -> None:
+    """§4 configuration fatal: ModelConfigurationError on the first consult →
+    provider consulted exactly ONCE, Investigation FAILED/FAILED_FATAL, outbox
+    DEAD_LETTER, exit 1 — no retry."""
+    settings, factory = real_settings
+    hisiem = FakeHisiem(alert_id="es-doc-0001")
+
+    class _ConfigFailing:
+        provider_name = "command_code"
+        protocol_name = "openai_compatible_chat_completions"
+        model_name = "deepseek/deepseek-v4-flash"
+        zdr_enabled = True
+        configured_structured_output_mode = "auto"
+        resolved_structured_output_mode: str | None = "json_schema"
+        calls: list[str] = []
+
+        async def plan(self, request: Any) -> Any:
+            self.calls.append("plan")
+            raise ModelConfigurationError("bad api key")
+
+        async def decide_next(self, request: Any) -> Any:
+            raise AssertionError("decide reached after config failure")
+
+        async def assess(self, request: Any) -> Any:
+            raise AssertionError("assess reached after config failure")
+
+        async def verdict(self, request: Any) -> Any:
+            raise AssertionError("verdict reached after config failure")
+
+    provider = _ConfigFailing()
+    result = await execute_real_model_run(
+        dataset_run_id=_DATASET_RUN_ID,
+        settings=settings,
+        provider=provider,
+        hisiem=hisiem,
+        execution_code=("integration-exec-head", False),
+    )
+    assert result.exit_code == 1
+    assert provider.calls == ["plan"]
+    exec_artifact = execution_artifact_path(
+        settings.evaluation.executions_dir, _DATASET_RUN_ID, result.execution_id
+    )
+    record = read_record(exec_artifact)
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.investigation_id is not None
+    status, reason = await _investigation_state(factory, record.investigation_id)
+    assert status == "FAILED"
+    assert reason == "FAILED_FATAL"
+    assert await _outbox_status(factory, record.investigation_id) == "DEAD_LETTER"

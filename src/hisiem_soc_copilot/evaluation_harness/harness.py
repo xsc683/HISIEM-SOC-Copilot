@@ -48,6 +48,7 @@ import asyncio
 import logging
 import subprocess
 import time
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,6 +72,7 @@ from .record import (
 )
 from .telemetry import (
     GATE_PASS,
+    ModelTelemetry,
     build_model_telemetry,
     model_telemetry_path,
     write_model_telemetry,
@@ -110,6 +112,12 @@ CAT_DATASET_IDENTITY_MISMATCH = "DATASET_IDENTITY_MISMATCH"
 CAT_DISPATCHER_ENABLED = "DISPATCHER_ENABLED"
 CAT_NON_SCRIPTED_PROVIDER = "NON_SCRIPTED_PROVIDER"
 CAT_REAL_MODEL_PROVIDER_REQUIRED = "REAL_MODEL_PROVIDER_REQUIRED"
+# E1-C2 exact Command Code provider-baseline mismatches (fail closed pre-open).
+CAT_UNEXPECTED_BASE_URL = "UNEXPECTED_BASE_URL"
+CAT_UNEXPECTED_MODEL = "UNEXPECTED_MODEL"
+CAT_UNEXPECTED_API_KEY_ENV = "UNEXPECTED_API_KEY_ENV"
+CAT_ZDR_DISABLED = "ZDR_DISABLED"
+CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG = "UNEXPECTED_STRUCTURED_OUTPUT_CONFIG"
 CAT_MODEL_CONFIGURATION = "MODEL_CONFIGURATION"
 CAT_EXECUTION_WORKTREE_DIRTY = "EXECUTION_WORKTREE_DIRTY"
 CAT_EXECUTION_PROVENANCE_UNAVAILABLE = "EXECUTION_PROVENANCE_UNAVAILABLE"
@@ -125,6 +133,16 @@ CAT_INVESTIGATION_NOT_COMPLETED = "INVESTIGATION_NOT_COMPLETED"
 CAT_INVESTIGATION_RESULT_MISSING = "INVESTIGATION_RESULT_MISSING"
 CAT_BINDING_MISSING = "ORCHESTRATION_BINDING_MISSING"
 CAT_CHECKPOINT_MISSING = "CHECKPOINT_MISSING"
+
+# The EXACT E1-C2 Command Code runtime baseline. The E1_C2_REAL_MODEL profile fails
+# closed BEFORE Container.open() unless the configured LLM settings match all of
+# these (base_url compared with harmless trailing-slash normalization). These
+# mirror the telemetry gate's provider-contract constants; the values are
+# non-secret configuration (never the API key itself).
+E1_C2_BASE_URL = "https://api.commandcode.ai/provider/v1"
+E1_C2_MODEL = "deepseek/deepseek-v4-flash"
+E1_C2_API_KEY_ENV = "CMD_API_KEY"
+E1_C2_STRUCTURED_OUTPUT_MODE = "auto"
 
 # Terminal investigation statuses (mirrors InvestigationStatus.is_terminal).
 _TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
@@ -163,15 +181,36 @@ _FIXED_MESSAGES: dict[str, str] = {
     ),
     CAT_DISPATCHER_ENABLED: (
         "the durable outbox dispatcher is enabled "
-        "(COPILOT_APP_ENABLE_DISPATCHER); E1-C1 requires it disabled"
+        "(COPILOT_APP_ENABLE_DISPATCHER); evaluation executions drive the "
+        "dispatcher manually and require it disabled"
     ),
     CAT_NON_SCRIPTED_PROVIDER: (
-        "the configured LLM provider is not 'scripted'; E1-C1 requires "
-        "LLM_PROVIDER=scripted"
+        "the configured LLM provider is not 'scripted'; the E1-C1 scripted "
+        "profile requires LLM_PROVIDER=scripted"
     ),
     CAT_REAL_MODEL_PROVIDER_REQUIRED: (
         "the configured LLM provider is not 'openai_compatible'; the E1-C2 "
         "real-model profile requires LLM_PROVIDER=openai_compatible"
+    ),
+    CAT_UNEXPECTED_BASE_URL: (
+        "the configured LLM base URL is not the E1-C2 Command Code endpoint "
+        "(LLM_BASE_URL=https://api.commandcode.ai/provider/v1)"
+    ),
+    CAT_UNEXPECTED_MODEL: (
+        "the configured LLM model is not the E1-C2 Command Code model "
+        "(LLM_MODEL=deepseek/deepseek-v4-flash)"
+    ),
+    CAT_UNEXPECTED_API_KEY_ENV: (
+        "the configured LLM api_key_env is not the E1-C2 baseline "
+        "(LLM_API_KEY_ENV=CMD_API_KEY)"
+    ),
+    CAT_ZDR_DISABLED: (
+        "the configured LLM zero-data-retention flag is not enabled "
+        "(LLM_ZDR=true) required by the E1-C2 real-model profile"
+    ),
+    CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG: (
+        "the configured LLM structured-output mode is not the E1-C2 baseline "
+        "(LLM_STRUCTURED_OUTPUT_MODE=auto)"
     ),
     CAT_MODEL_CONFIGURATION: (
         "the real model provider could not be constructed from configuration "
@@ -179,13 +218,13 @@ _FIXED_MESSAGES: dict[str, str] = {
         "investigation"
     ),
     CAT_EXECUTION_WORKTREE_DIRTY: (
-        "the execution worktree has uncommitted changes; E1-C1 requires a clean "
-        "authoritative Copilot HEAD at execution time"
+        "the execution worktree has uncommitted changes; evaluation requires a "
+        "clean authoritative Copilot HEAD at execution time"
     ),
     CAT_EXECUTION_PROVENANCE_UNAVAILABLE: (
         "execution provenance could not be proven (the executed Copilot source is "
-        "not inside a resolvable Git checkout); E1-C1 fails closed on unprovable "
-        "provenance"
+        "not inside a resolvable Git checkout); evaluation fails closed on "
+        "unprovable provenance"
     ),
     CAT_ACTIVE_INVESTIGATION_EXISTS: (
         "an active investigation already exists for this tenant/source alert; "
@@ -225,6 +264,11 @@ _FIXED_TYPES: dict[str, str] = {
     CAT_DISPATCHER_ENABLED: "DispatcherEnabled",
     CAT_NON_SCRIPTED_PROVIDER: "NonScriptedProvider",
     CAT_REAL_MODEL_PROVIDER_REQUIRED: "RealModelProviderRequired",
+    CAT_UNEXPECTED_BASE_URL: "UnexpectedBaseUrl",
+    CAT_UNEXPECTED_MODEL: "UnexpectedModel",
+    CAT_UNEXPECTED_API_KEY_ENV: "UnexpectedApiKeyEnv",
+    CAT_ZDR_DISABLED: "ZdrDisabled",
+    CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG: "UnexpectedStructuredOutputConfig",
     CAT_MODEL_CONFIGURATION: "ModelConfiguration",
     CAT_EXECUTION_WORKTREE_DIRTY: "DirtyExecutionWorktree",
     CAT_EXECUTION_PROVENANCE_UNAVAILABLE: "ExecutionProvenanceUnavailable",
@@ -328,6 +372,11 @@ def verify_dataset_manifest(path: str | Path) -> SealedManifest:
     return verify_sealed_manifest(path)
 
 
+def _normalize_base_url(url: str) -> str:
+    """Compare base URLs ignoring a harmless trailing slash."""
+    return url.strip().rstrip("/")
+
+
 def execution_isolation_violation(
     settings: Any, profile: EvaluationProfile = EvaluationProfile.E1_C1_SCRIPTED
 ) -> str | None:
@@ -336,16 +385,30 @@ def execution_isolation_violation(
 
     Both evaluation profiles must run with the durable outbox dispatcher DISABLED
     and the harness drives :meth:`drain_once` manually. The provider requirement is
-    profile-specific: E1_C1 requires ``scripted``; E1_C2_REAL_MODEL requires
-    ``openai_compatible``. This MUST be checked before the Container opens (so
-    ``Container.open()`` never starts a background dispatcher that could race the
-    harness's manual dispatcher using the real provider).
+    profile-specific: E1_C1 requires ``scripted``; E1_C2_REAL_MODEL requires the
+    EXACT Command Code baseline (``openai_compatible`` + the canonical base URL,
+    model, api_key_env, ZDR, and ``auto`` structured-output mode). This MUST be
+    checked before the Container opens (so ``Container.open()`` never starts a
+    background dispatcher that could race the harness's manual dispatcher using the
+    real provider, and so a mis-specified model endpoint/model never reaches a live
+    execution).
     """
     if settings.app.enable_dispatcher:
         return CAT_DISPATCHER_ENABLED
     if profile == EvaluationProfile.E1_C2_REAL_MODEL:
-        if settings.llm.provider != "openai_compatible":
+        llm = settings.llm
+        if llm.provider != "openai_compatible":
             return CAT_REAL_MODEL_PROVIDER_REQUIRED
+        if _normalize_base_url(str(llm.base_url)) != _normalize_base_url(E1_C2_BASE_URL):
+            return CAT_UNEXPECTED_BASE_URL
+        if llm.model != E1_C2_MODEL:
+            return CAT_UNEXPECTED_MODEL
+        if llm.api_key_env != E1_C2_API_KEY_ENV:
+            return CAT_UNEXPECTED_API_KEY_ENV
+        if not llm.zdr:
+            return CAT_ZDR_DISABLED
+        if llm.structured_output_mode != E1_C2_STRUCTURED_OUTPUT_MODE:
+            return CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG
         return None
     if settings.llm.provider != "scripted":
         return CAT_NON_SCRIPTED_PROVIDER
@@ -1057,36 +1120,58 @@ async def execute_cli(*, dataset_run_id: str) -> int:
     return 1
 
 
-async def execute_real_model_cli(*, dataset_run_id: str) -> int:
-    """Operator-facing E1-C2 driver: real-model profile isolation + telemetry.
+@dataclass(frozen=True)
+class RealModelRunResult:
+    """Outcome of ONE E1-C2 ``execute-real-model`` orchestration (§4/§6).
 
-    Same fail-closed gates as :func:`execute_cli` but under
-    :class:`EvaluationProfile.E1_C2_REAL_MODEL`: it requires
-    ``LLM_PROVIDER=openai_compatible`` and ``COPILOT_APP_ENABLE_DISPATCHER=false``
-    BEFORE ``Container.open()``; a provider configuration failure (missing
-    ``CMD_API_KEY`` / SDK / invalid settings) fails closed with NO investigation.
-    ONE real provider instance is obtained from :meth:`Container.model_provider`
-    and shared by the graph AND the E1-C2 ``model-telemetry.json`` sidecar, so the
-    telemetry usage buffer is truthful.
+    ``exit_code`` is 0 only when the execution COMPLETED AND the model-telemetry
+    gate PASSED. ``execution_id``/``telemetry`` are the orchestration facts a caller
+    (CLI or integration test) inspects; both are always populated once the run
+    reached the provider-resolution phase (None only for a pre-open fail-closed).
+    """
 
-    Returns 0 only when the execution COMPLETED AND the E1-C2 model-telemetry gate
-    PASSES (>=1 successful validated real model call for each of plan/decide/assess/
-    verdict in a resolved structured-output mode, no MODEL_CONFIGURATION failure) —
-    E1-C2 PASS is separate from the Investigation/execution status (§6).
+    exit_code: int
+    execution_id: str | None
+    telemetry: ModelTelemetry | None
+
+
+async def execute_real_model_run(
+    *,
+    dataset_run_id: str,
+    settings: Any,
+    provider: Any | None = None,
+    hisiem: Any | None = None,
+    execution_code: tuple[str, bool] | None = None,
+) -> RealModelRunResult:
+    """The REAL E1-C2 orchestration path — shared by the CLI and integration tests.
+
+    Enforces the EXACT Command Code baseline + dispatcher-disabled isolation BEFORE
+    ``Container.open()`` (§1), resolves the ONE real provider instance from
+    :meth:`Container.model_provider` when not injected (a configuration failure —
+    missing API key / SDK — fails closed with NO investigation), drives the REAL
+    production pipeline via :func:`execute_execution` under ``E1_C2_REAL_MODEL``, then
+    persists ``model-telemetry.json`` built from the SAME provider instance the graph
+    consulted (ONE usage buffer, §4/§5).
+
+    Returns a :class:`RealModelRunResult` whose ``exit_code`` is 0 only when the
+    execution COMPLETED AND the E1-C2 provider-contract gate PASSED — the gate is
+    SEPARATE from the execution status (§6): a runtime that degrades a provider
+    outage into COMPLETED+INCONCLUSIVE still yields exit_code 1 and gate FAIL.
+
+    ``provider``/``hisiem``/``execution_code`` are injection seams for tests; the
+    operator CLI passes none of them, so the production path is identical.
     """
     from ..bootstrap.container import Container
-    from ..config import get_settings
 
-    root = get_settings()
     profile = EvaluationProfile.E1_C2_REAL_MODEL
     execution_id = uuid4().hex
-    violation = execution_isolation_violation(root, profile)
+    violation = execution_isolation_violation(settings, profile)
 
-    def _write_failure(category: str, failure_type: str, message: str) -> int:
+    def _write_failure(category: str, failure_type: str, message: str) -> RealModelRunResult:
         record = EvaluationExecutionRecord(
             execution_id=execution_id,
             dataset_run_id=dataset_run_id,
-            model_provider=str(root.llm.provider),
+            model_provider=str(settings.llm.provider),
             started_at=rfc3339_utc(),
             execution_status=ExecutionStatus.CREATED,
         )
@@ -1098,36 +1183,41 @@ async def execute_real_model_cli(*, dataset_run_id: str) -> int:
             record.execution_code_git_commit, record.execution_code_dirty = resolved
         record.fail(category=category, failure_type=failure_type, message=message)
         artifact = execution_artifact_path(
-            root.evaluation.executions_dir, dataset_run_id, execution_id
+            settings.evaluation.executions_dir, dataset_run_id, execution_id
         )
         write_record(artifact, record)
         for line in report(record):
             print(line)
         print(f"execution_artifact={artifact}")
-        return 1
+        return RealModelRunResult(
+            exit_code=1, execution_id=execution_id, telemetry=None
+        )
 
     if violation is not None:
         return _write_failure(
             violation, _FIXED_TYPES[violation], _FIXED_MESSAGES[violation]
         )
 
-    container = Container(root)
-    try:
-        provider = container.model_provider()
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 — provider configuration error, bounded
-        return _write_failure(
-            CAT_MODEL_CONFIGURATION,
-            type(exc).__name__,
-            _FIXED_MESSAGES[CAT_MODEL_CONFIGURATION],
-        )
+    container = Container(settings)
+    if provider is None:
+        try:
+            provider = container.model_provider()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — configuration error, bounded
+            return _write_failure(
+                CAT_MODEL_CONFIGURATION,
+                type(exc).__name__,
+                _FIXED_MESSAGES[CAT_MODEL_CONFIGURATION],
+            )
     await container.open()
     try:
         record = await execute_execution(
             dataset_run_id=dataset_run_id,
             container=container,
             model=provider,
+            hisiem=hisiem,
+            execution_code=execution_code,
             profile=profile,
         )
     finally:
@@ -1136,14 +1226,14 @@ async def execute_real_model_cli(*, dataset_run_id: str) -> int:
     telemetry = build_model_telemetry(
         execution_id=record.execution_id,
         dataset_run_id=dataset_run_id,
-        provider_adapter=str(root.llm.provider),
+        provider_adapter=str(settings.llm.provider),
         provider=provider,
     )
     artifact = execution_artifact_path(
-        root.evaluation.executions_dir, dataset_run_id, record.execution_id
+        settings.evaluation.executions_dir, dataset_run_id, record.execution_id
     )
     telemetry_artifact = model_telemetry_path(
-        root.evaluation.executions_dir, dataset_run_id, record.execution_id
+        settings.evaluation.executions_dir, dataset_run_id, record.execution_id
     )
     write_model_telemetry(telemetry_artifact, telemetry)
 
@@ -1163,9 +1253,31 @@ async def execute_real_model_cli(*, dataset_run_id: str) -> int:
     )
     print(f"model_telemetry_successful={','.join(telemetry.successful_operations)}")
 
-    if (
-        record.execution_status == ExecutionStatus.COMPLETED
+    exit_code = (
+        0
+        if record.execution_status == ExecutionStatus.COMPLETED
         and telemetry.gate_status == GATE_PASS
-    ):
-        return 0
-    return 1
+        else 1
+    )
+    return RealModelRunResult(
+        exit_code=exit_code,
+        execution_id=record.execution_id,
+        telemetry=telemetry,
+    )
+
+
+async def execute_real_model_cli(*, dataset_run_id: str) -> int:
+    """Operator-facing E1-C2 driver: real-model profile isolation + telemetry.
+
+    Thin wrapper over :func:`execute_real_model_run` using the process settings, so
+    the operator CLI and the integration tests exercise the SAME orchestration path.
+    Returns 0 only when the execution COMPLETED AND the E1-C2 model-telemetry gate
+    PASSES (full Command Code provider contract, §2) — E1-C2 PASS is separate from
+    the Investigation/execution status (§6).
+    """
+    from ..config import get_settings
+
+    result = await execute_real_model_run(
+        dataset_run_id=dataset_run_id, settings=get_settings()
+    )
+    return result.exit_code

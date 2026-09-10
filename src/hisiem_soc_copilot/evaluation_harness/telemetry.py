@@ -40,6 +40,36 @@ _ALLOWED_RESOLVED_MODES: frozenset[str] = frozenset(
     {"json_schema", "json_object", "json_only"}
 )
 
+# The EXACT E1-C2 provider contract the telemetry gate must confirm for PASS. A
+# PASS means the full contract below holds — never merely "four operations ran".
+EXPECTED_PROVIDER_ADAPTER = "openai_compatible"
+EXPECTED_PROVIDER = "command_code"
+EXPECTED_PROTOCOL = "openai_compatible_chat_completions"
+EXPECTED_MODEL = "deepseek/deepseek-v4-flash"
+EXPECTED_CONFIGURED_MODE = "auto"
+
+# Hard bound for any externally supplied (provider-supplied) string persisted.
+MAX_FIELD_LEN = 200
+
+# The ONLY usage-record fields this artifact may persist. Everything else the
+# provider snapshot may carry (api_key, Authorization, prompt, messages,
+# raw_response, headers, environment, ...) is dropped — a real allowlist boundary,
+# never a pass-through of ``dict(record)``.
+_USAGE_ALLOWLIST: tuple[str, ...] = (
+    "provider",
+    "protocol",
+    "model",
+    "operation",
+    "provider_request_id",
+    "latency_ms",
+    "attempt_count",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "outcome",
+    "error_category",
+)
+
 GATE_PASS = "PASS"
 GATE_FAIL = "FAIL"
 
@@ -110,48 +140,74 @@ class ModelTelemetry:
             )
         records = payload.get("usage_records") or []
         return cls(
-            execution_id=str(payload.get("execution_id", "")),
-            dataset_run_id=str(payload.get("dataset_run_id", "")),
-            provider_adapter=str(payload.get("provider_adapter", "")),
-            provider=str(payload.get("provider", "")),
-            protocol=str(payload.get("protocol", "")),
-            model=str(payload.get("model", "")),
+            execution_id=_bounded_str(payload.get("execution_id", "")),
+            dataset_run_id=_bounded_str(payload.get("dataset_run_id", "")),
+            provider_adapter=_bounded_str(payload.get("provider_adapter", "")),
+            provider=_bounded_str(payload.get("provider", "")),
+            protocol=_bounded_str(payload.get("protocol", "")),
+            model=_bounded_str(payload.get("model", "")),
             zdr_enabled=bool(payload.get("zdr_enabled", True)),
-            configured_structured_output_mode=str(
+            configured_structured_output_mode=_bounded_str(
                 payload.get("configured_structured_output_mode", "")
             ),
-            resolved_structured_output_mode=_optional_str(
+            resolved_structured_output_mode=_optional_bounded_str(
                 payload.get("resolved_structured_output_mode")
             ),
-            usage_records=tuple(
-                dict(r) if isinstance(r, dict) else {}
-                for r in records
-            ),
+            # Re-apply the allowlist on read-back: a tampered/legacy payload can
+            # never smuggle an arbitrary field back into the in-memory artifact.
+            usage_records=tuple(_allowlist_record(r) for r in records),
             required_operations=tuple(
-                str(o) for o in (payload.get("required_operations") or REQUIRED_OPERATIONS)
+                _bounded_str(o)
+                for o in (payload.get("required_operations") or REQUIRED_OPERATIONS)
             ),
             successful_operations=tuple(
-                str(o) for o in (payload.get("successful_operations") or [])
+                _bounded_str(o) for o in (payload.get("successful_operations") or [])
             ),
-            gate_status=str(payload.get("gate_status", GATE_FAIL)),
+            gate_status=_bounded_str(payload.get("gate_status", GATE_FAIL)),
             gate_failures=tuple(
-                str(f) for f in (payload.get("gate_failures") or [])
+                _bounded_str(f) for f in (payload.get("gate_failures") or [])
             ),
         )
 
 
-def _optional_str(value: Any) -> str | None:
-    return str(value) if value is not None else None
+def _bounded_str(value: Any) -> str:
+    """Coerce to a bounded string (never persist an unbounded provider string)."""
+    return str(value)[:MAX_FIELD_LEN]
+
+
+def _optional_bounded_str(value: Any) -> str | None:
+    return None if value is None else str(value)[:MAX_FIELD_LEN]
+
+
+def _safe_scalar(value: Any) -> Any:
+    """Keep only bounded scalars; drop anything structured (never leak a dict/list)."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:MAX_FIELD_LEN]
+    return None
 
 
 def _record_dict(record: Any) -> dict[str, Any]:
-    """Normalize ONE usage record to its bounded dict (``ModelUsage.as_dict``)."""
+    """Normalize ONE usage record to a raw dict (``ModelUsage.as_dict``) — UNFILTERED."""
     if isinstance(record, dict):
         return dict(record)
     as_dict = getattr(record, "as_dict", None)
     if callable(as_dict):
         return dict(as_dict())
     return {}
+
+
+def _allowlist_record(record: Any) -> dict[str, Any]:
+    """Reduce ONE usage record to the allowlisted bounded fields ONLY (§3).
+
+    Any field not in :data:`_USAGE_ALLOWLIST` (api_key, Authorization, prompt,
+    messages, raw_response, headers, environment, ...) is dropped, and every value
+    is coerced to a bounded scalar. This is the security boundary — the artifact
+    must never persist arbitrary provider-supplied fields.
+    """
+    raw = _record_dict(record)
+    return {k: _safe_scalar(raw[k]) for k in _USAGE_ALLOWLIST if k in raw}
 
 
 def build_model_telemetry(
@@ -167,26 +223,34 @@ def build_model_telemetry(
     :class:`OpenAICompatibleModelProvider`: ``provider_name``, ``protocol_name``,
     ``model_name``, ``zdr_enabled``, ``configured_structured_output_mode``,
     ``resolved_structured_output_mode``, and ``usage_snapshot()``. Only public safe
-    metadata is read — never the API key/prompt/client internals.
+    metadata is read — never the API key/prompt/client internals; every usage record
+    is reduced to the explicit :data:`_USAGE_ALLOWLIST` (§3).
 
-    Gate semantics (§6/§7): PASS only when there is >= 1 successful validated model
-    call for EVERY required operation (plan/decide/assess/verdict), the resolved
-    structured-output mode is one of json_schema/json_object/json_only, and no usage
-    record carries a MODEL_CONFIGURATION failure. The gate is INDEPENDENT of the
-    Investigation/execution status.
+    Gate semantics (§2/§6): PASS only when the COMPLETE E1-C2 provider contract
+    holds — adapter ``openai_compatible``, provider ``command_code``, protocol
+    ``openai_compatible_chat_completions``, model ``deepseek/deepseek-v4-flash``,
+    ZDR enabled, configured structured-output mode ``auto``, a resolved mode in
+    json_schema/json_object/json_only, >= 1 successful validated call for EVERY
+    required operation (plan/decide/assess/verdict), and no MODEL_CONFIGURATION
+    failure. The gate is INDEPENDENT of the Investigation/execution status.
     """
-    provider_name = str(getattr(provider, "provider_name", "") or "")
-    protocol = str(getattr(provider, "protocol_name", "") or "")
-    model = str(getattr(provider, "model_name", "") or "")
+    provider_adapter = _bounded_str(provider_adapter)
+    provider_name = _bounded_str(getattr(provider, "provider_name", "") or "")
+    protocol = _bounded_str(getattr(provider, "protocol_name", "") or "")
+    model = _bounded_str(getattr(provider, "model_name", "") or "")
     zdr = bool(getattr(provider, "zdr_enabled", False))
-    configured = str(getattr(provider, "configured_structured_output_mode", "") or "")
-    resolved = _optional_str(getattr(provider, "resolved_structured_output_mode", None))
+    configured = _bounded_str(
+        getattr(provider, "configured_structured_output_mode", "") or ""
+    )
+    resolved = _optional_bounded_str(
+        getattr(provider, "resolved_structured_output_mode", None)
+    )
 
     snapshot = getattr(provider, "usage_snapshot", None)
     records: list[dict[str, Any]] = []
     if callable(snapshot):
         for record in snapshot():
-            d = _record_dict(record)
+            d = _allowlist_record(record)
             if d:
                 records.append(d)
 
@@ -199,20 +263,30 @@ def build_model_telemetry(
     successful = tuple(op for op in REQUIRED_OPERATIONS if successes[op])
 
     gate_failures: list[str] = []
-    if any(
-        r.get("error_category") == "MODEL_CONFIGURATION" for r in records
-    ):
-        gate_failures.append("MODEL_CONFIGURATION_FAILURE")
+    if provider_adapter != EXPECTED_PROVIDER_ADAPTER:
+        gate_failures.append("UNEXPECTED_PROVIDER_ADAPTER")
+    if provider_name != EXPECTED_PROVIDER:
+        gate_failures.append("UNEXPECTED_PROVIDER")
+    if protocol != EXPECTED_PROTOCOL:
+        gate_failures.append("UNEXPECTED_PROTOCOL")
+    if model != EXPECTED_MODEL:
+        gate_failures.append("UNEXPECTED_MODEL")
+    if not zdr:
+        gate_failures.append("ZDR_DISABLED")
+    if configured != EXPECTED_CONFIGURED_MODE:
+        gate_failures.append("UNEXPECTED_STRUCTURED_OUTPUT_CONFIG")
+    if resolved not in _ALLOWED_RESOLVED_MODES:
+        gate_failures.append("STRUCTURED_OUTPUT_MODE_UNRESOLVED")
     for op in REQUIRED_OPERATIONS:
         if not successes[op]:
             gate_failures.append(f"MISSING_SUCCESSFUL_{op.upper()}")
-    if resolved not in _ALLOWED_RESOLVED_MODES:
-        gate_failures.append("STRUCTURED_OUTPUT_MODE_UNRESOLVED")
+    if any(r.get("error_category") == "MODEL_CONFIGURATION" for r in records):
+        gate_failures.append("MODEL_CONFIGURATION_FAILURE")
     gate_status = GATE_PASS if not gate_failures else GATE_FAIL
 
     return ModelTelemetry(
-        execution_id=execution_id,
-        dataset_run_id=dataset_run_id,
+        execution_id=_bounded_str(execution_id),
+        dataset_run_id=_bounded_str(dataset_run_id),
         provider_adapter=provider_adapter,
         provider=provider_name,
         protocol=protocol,

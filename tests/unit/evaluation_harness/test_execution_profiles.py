@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hisiem_soc_copilot.bootstrap.container import Container
 from hisiem_soc_copilot.config import Settings
 from hisiem_soc_copilot.evaluation_harness.harness import (
@@ -19,6 +21,12 @@ from hisiem_soc_copilot.evaluation_harness.harness import (
     CAT_MODEL_CONFIGURATION,
     CAT_NON_SCRIPTED_PROVIDER,
     CAT_REAL_MODEL_PROVIDER_REQUIRED,
+    CAT_UNEXPECTED_API_KEY_ENV,
+    CAT_UNEXPECTED_BASE_URL,
+    CAT_UNEXPECTED_MODEL,
+    CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG,
+    CAT_ZDR_DISABLED,
+    E1_C2_BASE_URL,
     EvaluationProfile,
     execute_execution,
     execution_isolation_violation,
@@ -156,3 +164,67 @@ async def test_e1c2_profile_accepts_openai_compatible_when_key_present(
     assert record.execution_status == ExecutionStatus.FAILED
     assert record.failure.category == "MANIFEST_NOT_FOUND"
     assert record.investigation_id is None
+
+
+@pytest.mark.parametrize(
+    ("section", "attr", "value", "category"),
+    [
+        ("llm", "base_url", "https://evil.example/v1", CAT_UNEXPECTED_BASE_URL),
+        ("llm", "model", "gpt-4o", CAT_UNEXPECTED_MODEL),
+        ("llm", "api_key_env", "SOME_OTHER_KEY", CAT_UNEXPECTED_API_KEY_ENV),
+        ("llm", "zdr", False, CAT_ZDR_DISABLED),
+        (
+            "llm",
+            "structured_output_mode",
+            "json_object",
+            CAT_UNEXPECTED_STRUCTURED_OUTPUT_CONFIG,
+        ),
+    ],
+)
+def test_e1c2_rejects_wrong_provider_baseline(
+    tmp_path: Path, section: str, attr: str, value: object, category: str
+) -> None:
+    """Each deviation from the exact Command Code baseline fails closed BEFORE open."""
+    container = _container(
+        tmp_path,
+        settings=[("llm", "provider", "openai_compatible"), (section, attr, value)],
+    )
+    assert (
+        execution_isolation_violation(
+            container.settings, EvaluationProfile.E1_C2_REAL_MODEL
+        )
+        == category
+    )
+
+
+async def test_e1c2_wrong_baseline_fails_before_investigation(tmp_path: Path) -> None:
+    """A wrong baseline model → FAILED with NO investigation (never a Container open)."""
+    container = _container(
+        tmp_path,
+        settings=[("llm", "provider", "openai_compatible"), ("llm", "model", "gpt-4o")],
+    )
+    record = await execute_execution(
+        dataset_run_id="any",
+        container=container,
+        profile=EvaluationProfile.E1_C2_REAL_MODEL,
+    )
+    assert record.execution_status == ExecutionStatus.FAILED
+    assert record.failure.category == CAT_UNEXPECTED_MODEL
+    assert record.investigation_id is None
+
+
+def test_e1c2_base_url_trailing_slash_is_normalized(tmp_path: Path) -> None:
+    """A harmless trailing slash on the Command Code base URL still passes."""
+    container = _container(
+        tmp_path,
+        settings=[
+            ("llm", "provider", "openai_compatible"),
+            ("llm", "base_url", E1_C2_BASE_URL + "/"),
+        ],
+    )
+    assert (
+        execution_isolation_violation(
+            container.settings, EvaluationProfile.E1_C2_REAL_MODEL
+        )
+        is None
+    )
