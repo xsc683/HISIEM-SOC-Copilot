@@ -64,6 +64,19 @@ class EvidenceRepository(Protocol):
         self, *, tenant_id: str, investigation_id: UUID, evidence_ids: list[UUID]
     ) -> list[Evidence]: ...
 
+    async def find_investigation_ids_by_evidence_ids(
+        self, *, tenant_id: str, evidence_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        """Resolve cited Evidence ids to their owning investigation_id (READ-ONLY).
+
+        Tenant-scoped but NOT investigation-scoped: a citation whose Evidence lives
+        in ANOTHER investigation is exactly the anomaly the caller must detect, and
+        the per-investigation ``find_by_ids`` is blind to it. An id present in no
+        row of the tenant is absent from the returned map (a dangling citation).
+        Used by the evaluation harness's Finding-citation lineage check; production
+        investigation code never needs a cross-investigation Evidence read.
+        """
+
 
 class FindingRepository(Protocol):
     async def add(self, finding: Finding) -> None: ...

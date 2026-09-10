@@ -374,6 +374,11 @@ class FakeToolInvocationStore:
     ) -> ToolInvocationRecord | None:
         return self.rows.get((investigation_id, idempotency_key))
 
+    async def list_by_investigation(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> list[ToolInvocationRecord]:
+        return self.by_investigation(investigation_id)
+
     def by_investigation(self, investigation_id: UUID) -> list[ToolInvocationRecord]:
         return [
             r for (iid, _key), r in self.rows.items() if iid == investigation_id
@@ -458,6 +463,16 @@ class FakeEvidenceRepository:
             for e in self._store.values()
             if e.investigation_id == investigation_id and e.id in evidence_ids
         ]
+
+    async def find_investigation_ids_by_evidence_ids(
+        self, *, tenant_id: str, evidence_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        wanted = set(evidence_ids)
+        return {
+            e.id: e.investigation_id
+            for e in self._store.values()
+            if e.id in wanted
+        }
 
 
 class FakeFindingRepository:

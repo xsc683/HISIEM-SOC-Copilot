@@ -107,6 +107,22 @@ class SqlAlchemyEvidenceRepository(EvidenceRepository):
         result = await self._session.execute(stmt)
         return [_evidence_row_to_domain(row) for row in result.scalars().all()]
 
+    async def find_investigation_ids_by_evidence_ids(
+        self, *, tenant_id: str, evidence_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        if not evidence_ids:
+            return {}
+        stmt = (
+            select(EvidenceRow.id, EvidenceRow.investigation_id)
+            .join(InvestigationRow, InvestigationRow.id == EvidenceRow.investigation_id)
+            .where(
+                InvestigationRow.tenant_id == tenant_id,
+                EvidenceRow.id.in_(evidence_ids),
+            )
+        )
+        result = await self._session.execute(stmt)
+        return {row.id: row.investigation_id for row in result.all()}
+
 
 def _evidence_row_to_domain(row: EvidenceRow) -> Evidence:
     """Read an Evidence row back as a domain object.

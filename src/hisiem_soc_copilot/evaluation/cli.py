@@ -8,6 +8,7 @@ Commands:
     python -m hisiem_soc_copilot.evaluation.cli verify-manifest <run_id>
     python -m hisiem_soc_copilot.evaluation.cli execute <run_id>
     python -m hisiem_soc_copilot.evaluation.cli execute-real-model <run_id>
+    python -m hisiem_soc_copilot.evaluation.cli execute-tool-evidence <run_id>
 
 ``prepare GP-01`` is a convenience that runs materialize -> resolve -> verify ->
 seal, but materialization and sealing remain separate internal contracts. Run
@@ -306,6 +307,22 @@ async def _execute_real_model_run(dataset_run_id: str) -> int:
     return await execute_real_model_cli(dataset_run_id=dataset_run_id)
 
 
+async def _execute_tool_evidence_run(dataset_run_id: str) -> int:
+    """E1-C3: run one sealed GP-01 dataset, then evaluate the S1 evidence chain.
+
+    Reuses the E1-C2 real-model orchestration UNCHANGED (real Command Code
+    provider + real production pipeline), then — on the EVALUATION side only —
+    resolves the expected S1/W1 provider identity from the verified sealed manifest
+    and persists ``tool-evidence-quality.json`` beside the execution + telemetry
+    artifacts. Returns 0 only when the E1-C3 tool/evidence gate PASSES (E1-C2
+    telemetry PASS + the Agent independently discovered S1, linked it to a
+    SUCCEEDED ``hisiem.search_events`` invocation, and grounded a Finding on it).
+    """
+    from ..evaluation_harness import execute_tool_evidence_cli
+
+    return await execute_tool_evidence_cli(dataset_run_id=dataset_run_id)
+
+
 def _build_settings() -> tuple[EvaluationSettings, HisiemSettings]:
     from ..config import get_settings
 
@@ -367,6 +384,9 @@ async def _dispatch(argv: list[str]) -> int:
 
     if command == "execute-real-model":
         return await _execute_real_model_run(target)
+
+    if command == "execute-tool-evidence":
+        return await _execute_tool_evidence_run(target)
 
     print(f"unknown command {command!r}")
     return 2

@@ -293,3 +293,18 @@ class ToolInvocationStore(Protocol):
         investigation_id: UUID,
         idempotency_key: str,
     ) -> ToolInvocationRecord | None: ...
+
+    async def list_by_investigation(
+        self,
+        *,
+        tenant_id: str,
+        investigation_id: UUID,
+    ) -> list[ToolInvocationRecord]:
+        """Every audit row recorded for one investigation (READ-ONLY, tenant-scoped).
+
+        Read-only audit access used by the evaluation harness to prove a specific
+        tool actually ran and succeeded for an investigation. Production runtime
+        never enumerates audit rows this way — the graph addresses a row by its
+        ``(investigation_id, idempotency_key)``. Scoped through the owning
+        Investigation so a foreign tenant can never read another tenant's audit.
+        """

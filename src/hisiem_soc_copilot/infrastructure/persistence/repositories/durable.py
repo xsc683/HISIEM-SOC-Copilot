@@ -337,6 +337,22 @@ class SqlAlchemyToolInvocationStore(ToolInvocationStore):
         obj = row.scalar_one_or_none()
         return _tool_row(obj) if obj is not None else None
 
+    async def list_by_investigation(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> list[ToolInvocationRecord]:
+        rows = await self._session.execute(
+            select(ToolInvocationRow)
+            .join(
+                InvestigationRow,
+                InvestigationRow.id == ToolInvocationRow.investigation_id,
+            )
+            .where(
+                InvestigationRow.tenant_id == tenant_id,
+                ToolInvocationRow.investigation_id == investigation_id,
+            )
+        )
+        return [_tool_row(row) for row in rows.scalars().all()]
+
 
 def _tool_row(row: ToolInvocationRow) -> ToolInvocationRecord:
     return ToolInvocationRecord(
