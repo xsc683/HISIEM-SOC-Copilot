@@ -18,6 +18,7 @@ from fastapi import Depends, Request
 from ..application.handlers.investigation import InvestigationCommandHandler
 from ..application.ports.trust import TrustedContext, TrustedContextProvider
 from ..application.services.investigation_service import InvestigationReadService
+from ..application.services.workspace_service import InvestigationWorkspaceService
 from ..bootstrap.container import Container
 
 
@@ -62,6 +63,10 @@ def read_service(request: Request) -> InvestigationReadService:
     return _container(request).investigation_read_service()
 
 
+def workspace_service(request: Request) -> InvestigationWorkspaceService:
+    return _container(request).investigation_workspace_service()
+
+
 def dispatcher(request: Request) -> object:
     """Expose the durable outbox dispatcher (used by tests to drive async work).
 
@@ -76,4 +81,7 @@ def dispatcher(request: Request) -> object:
 # service classes as request/response fields.
 CommandHandlerDep = Annotated[InvestigationCommandHandler, Depends(command_handler)]
 ReadServiceDep = Annotated[InvestigationReadService, Depends(read_service)]
+WorkspaceServiceDep = Annotated[
+    InvestigationWorkspaceService, Depends(workspace_service)
+]
 DispatcherDep = Annotated[object | None, Depends(dispatcher)]

@@ -386,6 +386,15 @@ class FakeToolInvocationStore:
 
 
 
+def _same_alert(a: ExternalResourceRef, b: ExternalResourceRef) -> bool:
+    """Alert addressing identity — mirrors the SQL WHERE (business_id excluded)."""
+    return (
+        a.provider == b.provider
+        and a.resource_type == b.resource_type
+        and a.address_id == b.address_id
+    )
+
+
 class FakeInvestigationRepository:
     def __init__(self) -> None:
         self._store: dict[UUID, Investigation] = {}
@@ -414,7 +423,7 @@ class FakeInvestigationRepository:
         for inv in self._store.values():
             if inv.tenant_id != tenant_id:
                 continue
-            if inv.source_alert_ref != source_alert_ref:
+            if not _same_alert(inv.source_alert_ref, source_alert_ref):
                 continue
             if inv.status.is_active:
                 return inv
@@ -432,6 +441,19 @@ class FakeInvestigationRepository:
             ):
                 return inv
         return None
+
+    async def find_latest_by_alert(
+        self, *, tenant_id: str, source_alert_ref: ExternalResourceRef
+    ) -> Investigation | None:
+        matches = [
+            inv
+            for inv in self._store.values()
+            if inv.tenant_id == tenant_id
+            and _same_alert(inv.source_alert_ref, source_alert_ref)
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda inv: (inv.created_at, str(inv.id)))
 
 
 class FakeEvidenceRepository:

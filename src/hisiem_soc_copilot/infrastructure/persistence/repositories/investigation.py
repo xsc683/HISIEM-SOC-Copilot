@@ -120,3 +120,24 @@ class SqlAlchemyInvestigationRepository(InvestigationRepository):
         )
         row = result.scalar_one_or_none()
         return to_domain(row) if row is not None else None
+
+    async def find_latest_by_alert(
+        self,
+        *,
+        tenant_id: str,
+        source_alert_ref: ExternalResourceRef,
+    ) -> Investigation | None:
+        result = await self._session.execute(
+            select(InvestigationRow)
+            .where(
+                InvestigationRow.tenant_id == tenant_id,
+                InvestigationRow.source_provider == source_alert_ref.provider,
+                InvestigationRow.source_resource_type == source_alert_ref.resource_type,
+                InvestigationRow.source_address_id == source_alert_ref.address_id,
+            )
+            .order_by(
+                InvestigationRow.created_at.desc(), InvestigationRow.id.desc()
+            )
+        )
+        row = result.scalars().first()
+        return to_domain(row) if row is not None else None

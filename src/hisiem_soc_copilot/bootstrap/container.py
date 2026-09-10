@@ -22,6 +22,7 @@ from ..application.ports.model_provider import ModelProvider
 from ..application.ports.trust import TrustedContextProvider
 from ..application.ports.unit_of_work import UnitOfWork
 from ..application.services.investigation_service import InvestigationReadService
+from ..application.services.workspace_service import InvestigationWorkspaceService
 from ..config import Settings
 from ..domain.investigation.value_objects import BudgetLimits
 from ..infrastructure.auth.header_provider import HeaderTrustedContextProvider
@@ -208,6 +209,9 @@ class Container:
 
     def investigation_read_service(self) -> InvestigationReadService:
         return InvestigationReadService(unit_of_work=self.unit_of_work())
+
+    def investigation_workspace_service(self) -> InvestigationWorkspaceService:
+        return InvestigationWorkspaceService(unit_of_work=self.unit_of_work())
 
 
 def _budget_limits(settings: Settings) -> BudgetLimits:

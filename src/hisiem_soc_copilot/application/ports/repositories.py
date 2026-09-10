@@ -46,6 +46,19 @@ class InvestigationRepository(Protocol):
         self, *, tenant_id: str, provider: str, resource_type: str, address_id: str
     ) -> Investigation | None: ...
 
+    async def find_latest_by_alert(
+        self,
+        *,
+        tenant_id: str,
+        source_alert_ref: ExternalResourceRef,
+    ) -> Investigation | None:
+        """The most recent Investigation of ANY status for one source alert.
+
+        Tenant-scoped, read-only. Powers Alert re-entry so a terminal Investigation
+        stays reachable after re-investigation created a newer one (docs §6/§22).
+        Ordered by ``created_at`` DESC with an ``id`` tie-break (deterministic).
+        """
+
 
 class EvidenceRepository(Protocol):
     """Append-only evidence ledger access."""

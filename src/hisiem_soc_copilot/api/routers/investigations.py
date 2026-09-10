@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Path, status
+from fastapi import APIRouter, Header, Path, Query, status
 from pydantic import UUID4
 
 from ...application.commands.investigation import (
@@ -22,10 +22,15 @@ from ..dependencies import (
     CommandHandlerDep,
     ReadServiceDep,
     TrustedContextDep,
+    WorkspaceServiceDep,
 )
 from ..schemas.common import (
     InvestigationResponse,
     StartInvestigationRequest,
+)
+from ..schemas.workspace import (
+    AlertInvestigationLookupResponse,
+    InvestigationWorkspaceResponse,
 )
 
 router = APIRouter(prefix="/api/v1/investigations", tags=["investigations"])
@@ -67,6 +72,30 @@ async def start_investigation(
     return InvestigationResponse.from_read_model(rm)
 
 
+@router.get("/lookup", response_model=AlertInvestigationLookupResponse)
+async def lookup_alert_investigation(
+    context: TrustedContextDep,
+    workspace_service: WorkspaceServiceDep,
+    provider: Annotated[str, Query(min_length=1)],
+    resource_type: Annotated[str, Query(min_length=1)],
+    address_id: Annotated[str, Query(min_length=1)],
+) -> AlertInvestigationLookupResponse:
+    """Server-to-server Alert re-entry lookup (docs §22).
+
+    Returns the at-most-one ACTIVE Investigation for the source alert plus the most
+    recent Investigation of any status, so HISIEM can render the correct Alert
+    action (start / continue / view). Tenant is derived from the trusted context —
+    never declared by the caller — so a foreign alert can never be resolved.
+    """
+    lookup = await workspace_service.lookup_alert_investigation(
+        tenant_id=context.tenant_id,
+        provider=provider,
+        resource_type=resource_type,
+        address_id=address_id,
+    )
+    return AlertInvestigationLookupResponse.from_read_model(lookup)
+
+
 @router.get("/{investigation_id}", response_model=InvestigationResponse)
 async def get_investigation(
     investigation_id: Annotated[UUID4, Path()],
@@ -78,6 +107,26 @@ async def get_investigation(
         tenant_id=context.tenant_id, investigation_id=UUID(str(investigation_id))
     )
     return InvestigationResponse.from_read_model(rm)
+
+
+@router.get(
+    "/{investigation_id}/workspace", response_model=InvestigationWorkspaceResponse
+)
+async def get_investigation_workspace(
+    investigation_id: Annotated[UUID4, Path()],
+    context: TrustedContextDep,
+    workspace_service: WorkspaceServiceDep,
+) -> InvestigationWorkspaceResponse:
+    """Compose the Analyst Workspace projection for one investigation (docs §7/§8).
+
+    Read-only: it mutates no domain state and runs no Agent/Graph/model/tool. The
+    whole projection is tenant-scoped; a foreign or unknown investigation is a 404.
+    """
+    workspace = await workspace_service.get_workspace(
+        tenant_id=context.tenant_id,
+        investigation_id=UUID(str(investigation_id)),
+    )
+    return InvestigationWorkspaceResponse.from_read_model(workspace)
 
 
 @router.post("/{investigation_id}/cancel", response_model=InvestigationResponse)
