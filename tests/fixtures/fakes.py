@@ -487,6 +487,16 @@ class FakeFindingRepository:
     ) -> list[Finding]:
         return [f for f in self._store.values() if f.investigation_id == investigation_id]
 
+    async def find_investigation_ids_by_finding_ids(
+        self, *, tenant_id: str, finding_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        wanted = set(finding_ids)
+        return {
+            f.id: f.investigation_id
+            for f in self._store.values()
+            if f.id in wanted
+        }
+
 
 class FakeHypothesisRepository:
     def __init__(self) -> None:

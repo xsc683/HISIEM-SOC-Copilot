@@ -210,6 +210,22 @@ class SqlAlchemyFindingRepository(FindingRepository):
             mapping.setdefault(finding_id, []).append(row.evidence_id)
         return mapping
 
+    async def find_investigation_ids_by_finding_ids(
+        self, *, tenant_id: str, finding_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        if not finding_ids:
+            return {}
+        stmt = (
+            select(FindingRow.id, FindingRow.investigation_id)
+            .join(InvestigationRow, InvestigationRow.id == FindingRow.investigation_id)
+            .where(
+                InvestigationRow.tenant_id == tenant_id,
+                FindingRow.id.in_(finding_ids),
+            )
+        )
+        result = await self._session.execute(stmt)
+        return {row.id: row.investigation_id for row in result.all()}
+
 
 def _finding_row_to_domain(
     row: FindingRow, citations: dict[UUID, list[UUID]]

@@ -85,6 +85,20 @@ class FindingRepository(Protocol):
         self, *, tenant_id: str, investigation_id: UUID
     ) -> list[Finding]: ...
 
+    async def find_investigation_ids_by_finding_ids(
+        self, *, tenant_id: str, finding_ids: list[UUID]
+    ) -> dict[UUID, UUID]:
+        """Resolve Finding ids to their owning investigation_id (READ-ONLY).
+
+        Tenant-scoped but NOT investigation-scoped: a result that references a
+        Finding belonging to ANOTHER investigation is exactly the anomaly the caller
+        must detect, and the per-investigation ``list_by_investigation`` is blind to
+        it. An id present in no row of the tenant is absent from the returned map (a
+        dangling result finding). Used by the evaluation harness's result→finding
+        integrity check; production investigation code never needs a cross-
+        investigation Finding read.
+        """
+
 
 class HypothesisRepository(Protocol):
     async def add(self, hypothesis: Hypothesis) -> None: ...

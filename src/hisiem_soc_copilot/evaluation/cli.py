@@ -9,6 +9,9 @@ Commands:
     python -m hisiem_soc_copilot.evaluation.cli execute <run_id>
     python -m hisiem_soc_copilot.evaluation.cli execute-real-model <run_id>
     python -m hisiem_soc_copilot.evaluation.cli execute-tool-evidence <run_id>
+    python -m hisiem_soc_copilot.evaluation.cli score-execution <run_id> <execution_id>
+    python -m hisiem_soc_copilot.evaluation.cli evaluate-gp01 <run_id> \
+        [--valid-runs N] [--max-attempts N]
 
 ``prepare GP-01`` is a convenience that runs materialize -> resolve -> verify ->
 seal, but materialization and sealing remain separate internal contracts. Run
@@ -323,6 +326,66 @@ async def _execute_tool_evidence_run(dataset_run_id: str) -> int:
     return await execute_tool_evidence_cli(dataset_run_id=dataset_run_id)
 
 
+async def _score_execution_run(dataset_run_id: str, execution_id: str) -> int:
+    """E1-C4: deterministically score ONE persisted execution (§15).
+
+    Strictly a SCORER: it never runs the Agent, never calls a model/tool, and never
+    mutates a production row. It reads the persisted execution/telemetry/quality
+    artifacts + the persisted InvestigationResult/Findings (READ-ONLY ports), writes
+    ``score.json`` beside them, and returns 0 only when the E1-C4 correctness gate
+    PASSES.
+    """
+    from ..evaluation_harness import score_execution_cli
+
+    return await score_execution_cli(
+        dataset_run_id=dataset_run_id, execution_id=execution_id
+    )
+
+
+def _parse_suite_flags(args: list[str]) -> tuple[int, int]:
+    """Parse ``--valid-runs`` / ``--max-attempts`` (defaults 3 / 6)."""
+    from ..evaluation_harness import DEFAULT_MAX_ATTEMPTS, DEFAULT_VALID_RUNS
+
+    valid_runs = DEFAULT_VALID_RUNS
+    max_attempts = DEFAULT_MAX_ATTEMPTS
+    index = 0
+    while index < len(args):
+        flag = args[index]
+        if flag in ("--valid-runs", "--max-attempts"):
+            if index + 1 >= len(args):
+                raise ValueError(f"{flag} requires a value")
+            try:
+                value = int(args[index + 1])
+            except ValueError as exc:
+                raise ValueError(f"{flag} must be an integer") from exc
+            if flag == "--valid-runs":
+                valid_runs = value
+            else:
+                max_attempts = value
+            index += 2
+            continue
+        raise ValueError(f"unknown argument {flag!r}")
+    return valid_runs, max_attempts
+
+
+async def _evaluate_gp01_run(
+    dataset_run_id: str, valid_runs: int, max_attempts: int
+) -> int:
+    """E1-C5/C6: collect a bounded GP-01 repeatability suite + persist ONE summary.
+
+    The suite controller owns attempt classification and never deletes or replaces a
+    valid failed sample; a provider-transient attempt is preserved but replaced only
+    within ``max_attempts``. Returns 0 only when the suite gate PASSES.
+    """
+    from ..evaluation_harness import evaluate_gp01_cli
+
+    return await evaluate_gp01_cli(
+        dataset_run_id=dataset_run_id,
+        valid_runs=valid_runs,
+        max_attempts=max_attempts,
+    )
+
+
 def _build_settings() -> tuple[EvaluationSettings, HisiemSettings]:
     from ..config import get_settings
 
@@ -387,6 +450,23 @@ async def _dispatch(argv: list[str]) -> int:
 
     if command == "execute-tool-evidence":
         return await _execute_tool_evidence_run(target)
+
+    if command == "score-execution":
+        if len(argv) < 3:
+            print("usage: score-execution <run_id> <execution_id>")
+            return 2
+        return await _score_execution_run(argv[1], argv[2])
+
+    if command == "evaluate-gp01":
+        try:
+            valid_runs, max_attempts = _parse_suite_flags(argv[2:])
+            from ..evaluation_harness import validate_bounds
+
+            validate_bounds(valid_runs, max_attempts)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 2
+        return await _evaluate_gp01_run(target, valid_runs, max_attempts)
 
     print(f"unknown command {command!r}")
     return 2
