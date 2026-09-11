@@ -176,20 +176,18 @@ async def create_response_proposal(
 ) -> ResponseProposalResponse:
     """Derive + policy-validate + persist one typed response proposal.
 
-    Deterministic: the caller supplies the bounded action contract; no model round.
-    Tenant and actor are server-derived — never taken from the body.
+    Deterministic: the caller supplies only the bounded action contract — the
+    action key, the supporting evidence ids of THIS investigation, and the bounded
+    playbook parameters. The TARGET is never accepted here: it is derived
+    server-side from the persisted Investigation's authoritative source alert, and
+    the evidence ids are re-resolved authoritatively inside the handler. Tenant and
+    actor are server-derived — never taken from the body.
     """
     command = CreateResponseProposal(
         tenant_id=context.tenant_id,
         investigation_id=UUID(str(investigation_id)),
         action_key=body.action_key,
-        target_ref=ExternalResourceRef(
-            provider=body.target.provider,
-            resource_type=body.target.resource_type,
-            address_id=body.target.address_id,
-            business_id=body.target.business_id,
-        ),
-        evidence_ids=tuple(UUID(e) for e in body.evidence_ids),
+        evidence_ids=tuple(body.evidence_ids),
         parameters=dict(body.parameters),
         reason=body.reason,
         initiated_by_subject=context.actor_subject_id,

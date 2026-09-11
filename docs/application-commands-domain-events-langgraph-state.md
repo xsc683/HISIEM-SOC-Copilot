@@ -126,7 +126,7 @@ investigation:{id}:plan:{revision}
 tool:{tool_invocation_id}:evidence
 investigation:{id}:result:{candidate_hash}
 proposal:{id}:approval:{content_revision}
-proposal:{id}:execute:{content_revision}
+response:{tenant_id}:{proposal_id}
 ```
 
 ---
@@ -144,6 +144,8 @@ RejectResponse
 
 `StartAlertInvestigation` 只负责 durable creation + scheduling：校验并写入 Investigation（CREATED）+ Domain Event + Outbox，随后由 Outbox Dispatcher 调度执行。它不直接驱动 Graph / Checkpoint。
 
+`ApproveResponse` / `RejectResponse` 是 Human API Command，只作用于 `ResponseProposal` 聚合（§7），不产生任何 Investigation 状态迁移。
+
 ### 6.2 Orchestrator / System Command
 
 ```text
@@ -157,15 +159,17 @@ RecordFindings
 FinalizeInvestigationResult
 CreateResponseProposal
 EvaluateResponsePolicy
-RequestResponseApproval
 SubmitApprovedResponse
 RecordResponseExecutionObservation
 CompleteInvestigation
-CompleteInvestigationAfterResponse
 FailInvestigation
 ```
 
 `StartInvestigation` 是受信 Orchestrator / System Command：由 Durable Runtime（Outbox Dispatcher → Investigation Runner）在 Graph 执行前调用，将 Investigation 从 `CREATED` 桥接为 `RUNNING`。
+
+`SubmitApprovedResponse` 由 durable submit worker（destination `response.execution.submit`）调用；`RecordResponseExecutionObservation` 由 durable observe worker（destination `response.execution.observe`）调用。两者都只作用于 `ResponseProposal`，不在 Graph 内执行，也不调用 LLM。
+
+`RequestResponseApproval` 不再是 Investigation 聚合命令：Investigation 上不存在该命令，它现在只作用于 `ResponseProposal`（`CREATED → WAITING_APPROVAL`），见 §7。`CompleteInvestigationAfterResponse` 已移除，见 §7。
 
 读取 Alert、Events、Threat Intelligence、Knowledge、SOAR Execution 等操作是 Query / Tool / Port，不是 Domain Command。
 
@@ -272,7 +276,6 @@ InvestigationStarted
 ```text
 CREATED
 RUNNING
-WAITING_APPROVAL
 ```
 
 目标状态：
@@ -281,7 +284,8 @@ WAITING_APPROVAL
 CANCELLED
 ```
 
-`EXECUTING_RESPONSE` 后不得通过 Cancel Investigation 暗示取消 SOAR Execution。
+Response 工作流是独立于 Investigation 状态机的聚合生命周期（§24 / §25），Cancel Investigation 不覆盖 Approval / SOAR Execution。
+取消已提交的 SOAR Execution 不属于 Investigation 命令；未来如需取消必须提供独立的 Response 业务命令。
 
 事件：
 
@@ -416,7 +420,8 @@ ATT&CK mapping
 
 生成 Immutable `InvestigationResult`。
 
-Finalize Result 本身不一定完成 Investigation；后续可能进入 Response Proposal / Approval。
+Finalize Result 不改变 Investigation Status；Investigation 由 `CompleteInvestigation` 完成（RUNNING → COMPLETED）。
+独立的 Response 工作流只在此之后开始，并且永不回写 `Investigation.status`。
 
 事件：
 
@@ -428,7 +433,7 @@ InvestigationResultFinalized
 
 ### CreateResponseProposal
 
-前置条件：Finalized InvestigationResult 已存在。
+前置条件：Investigation = COMPLETED，且 Finalized InvestigationResult 已存在。
 
 必须完成：
 
@@ -441,6 +446,9 @@ supporting Evidence validation
 ```
 
 模型提供的 Action / Target / Parameters 仍然只是 Candidate。
+
+创建时必须通过 `Investigation.link_response_proposal(proposal_id)` 建立 Investigation → `ResponseProposal` 的唯一关联：
+仅允许 COMPLETED；已有值时同值幂等、异值确定性冲突；且不得改变 `status` / `finished_at` / `termination_reason`，也不得重新打开已终止的 Investigation。
 
 事件：
 
@@ -473,12 +481,14 @@ ResponsePolicyEvaluated
 
 ### RequestResponseApproval
 
+该命令作用于 `ResponseProposal` 聚合，不作用于 Investigation，也不产生任何 Investigation 状态迁移。
+
 前置条件：
 
 ```text
+Investigation = COMPLETED
 ResponseProposal exists
 PolicyDecision = REQUIRE_APPROVAL
-Investigation = RUNNING
 ```
 
 ApprovalRequest 必须绑定：
@@ -492,7 +502,7 @@ proposal_content_hash
 状态：
 
 ```text
-RUNNING → WAITING_APPROVAL
+ResponseProposal: CREATED → WAITING_APPROVAL
 ```
 
 事件：
@@ -508,7 +518,7 @@ ResponseApprovalRequested
 必须验证：
 
 ```text
-Investigation = WAITING_APPROVAL
+ResponseProposal = WAITING_APPROVAL
 actor authenticated and authorized
 same tenant
 ApprovalRequest pending
@@ -518,16 +528,29 @@ no previous ApprovalDecision
 
 创建 Immutable `ApprovalDecision(APPROVE)`。
 
+该 HTTP 事务内只允许：
+
+```text
+persist immutable ApprovalDecision
+→ ResponseProposal: WAITING_APPROVAL → APPROVED
+→ persist ResponseApproved event
+→ atomically enqueue durable outbox delivery（response_execution_queued）
+→ COMMIT
+```
+
+不得在该事务内创建 `ResponseExecutionRef`，不得调用 SOAR，也不得改变 `Investigation.status`。
+
 状态：
 
 ```text
-WAITING_APPROVAL → EXECUTING_RESPONSE
+ResponseProposal: WAITING_APPROVAL → APPROVED
 ```
 
 事件：
 
 ```text
 ResponseApproved
+response_execution_queued   → durable outbox destination: response.execution.submit
 ```
 
 ---
@@ -541,48 +564,51 @@ ResponseApproved
 状态：
 
 ```text
-WAITING_APPROVAL → COMPLETED
+ResponseProposal: WAITING_APPROVAL → REJECTED
 ```
 
-InvestigationResult 不得因 Reject 修改。
+`InvestigationResult` 与 `Investigation.status` 均不得因 Reject 修改，也不得产生 `InvestigationCompleted`。
 
 事件：
 
 ```text
 ResponseRejected
-InvestigationCompleted
 ```
 
 ---
 
 ### SubmitApprovedResponse
 
-这是 V1 具有外部 Side Effect 的核心 Application Command。
+这是 V1 具有外部 Side Effect 的核心 Application Command，由 durable submit worker（destination `response.execution.submit`）执行，
+不在 HTTP 请求内、不在 Graph 内，也不调用 LLM。
 
 前置条件：
 
 ```text
+ResponseProposal = APPROVED
 ApprovalDecision = APPROVE
-Investigation = EXECUTING_RESPONSE
 Proposal revision/hash remains valid
 ```
 
 执行：
 
 ```text
-resolve HISIEM SOAR Playbook
+reload proposal by tenant + proposal_id（要求 APPROVED）
+→ reload persisted immutable execution contract from DB（绝不信任 outbox payload）
+→ resolve HISIEM SOAR Playbook
 → build validated execution request
-→ submit with stable idempotency key
-→ persist ResponseExecutionRef
+→ submit with stable submission_key（Idempotency-Key）
+→ require REAL non-empty execution_id
+→ create ResponseExecutionRef + APPROVED → SUBMITTED + persist projection + emit fact（同一事务）
 ```
 
 稳定 Submission Key：
 
 ```text
-proposal:{proposal_id}:execute:{content_revision}
+response:{tenant_id}:{proposal_id}
 ```
 
-重复执行必须恢复/返回同一个 SOAR Execution，不得产生第二次实际响应。
+重复投递在已 `SUBMITTED` 且已持有 `ResponseExecutionRef` 时必须收敛为 no-op，不得产生第二次实际响应。
 
 事件：
 
@@ -594,6 +620,8 @@ ResponseExecutionSubmitted
 
 ### RecordResponseExecutionObservation
 
+由 durable observe worker（destination `response.execution.observe`）执行，不调用 LLM。
+
 SOAR Execution 的 Source of Truth 始终是 HISIEM。
 
 Copilot 只更新 `ResponseExecutionRef` Projection；仅在观察状态变化时产生：
@@ -602,7 +630,10 @@ Copilot 只更新 `ResponseExecutionRef` Projection；仅在观察状态变化�
 ResponseExecutionStatusChanged
 ```
 
-SOAR 到达 Terminal State 后可以触发 `CompleteInvestigationAfterResponse`。
+合法非终态（例如 `RUNNING`）不是失败：必须持久化为 observation 并通过未来 `available_at` 持久化重排下一次观察，
+不得因重试耗尽进入 DEAD_LETTER。Terminal State 到达后结算并停止 reconciliation。
+
+观察结果永不回写 Investigation：不存在 `CompleteInvestigationAfterResponse`（§7）。
 
 ---
 
@@ -611,9 +642,7 @@ SOAR 到达 Terminal State 后可以触发 `CompleteInvestigationAfterResponse`�
 允许用于：
 
 ```text
-Final Result 无可执行 Response
-或
-ResponseProposal 被 Policy DENY
+Final Result 无可执行 Response（read-only 轮次）
 ```
 
 状态：
@@ -621,6 +650,9 @@ ResponseProposal 被 Policy DENY
 ```text
 RUNNING → COMPLETED
 ```
+
+Investigation 的完成不等待任何 Response 流程；`COMPLETED` 之后才开始独立的 Response 工作流（§24 / §25），
+且 Approval / Rejection / SOAR Execution 永不改变 `Investigation.status`。
 
 事件：
 
@@ -632,27 +664,10 @@ InvestigationCompleted
 
 ### CompleteInvestigationAfterResponse
 
-前置条件：
+该命令已移除：Investigation 与 Response 是两条独立生命周期，Investigation 在 Response 工作流开始前就已 `COMPLETED`，
+不存在 `EXECUTING_RESPONSE` 状态，也不需要由 Response 结果触发 Investigation 完成。
 
-```text
-Investigation = EXECUTING_RESPONSE
-ResponseExecutionRef exists
-SOAR Execution observed terminal
-```
-
-状态：
-
-```text
-EXECUTING_RESPONSE → COMPLETED
-```
-
-SOAR `FAILED` 仍允许 Investigation 正常完成。
-
-事件：
-
-```text
-InvestigationCompleted
-```
+SOAR Execution 的终态（含 `FAILED`）只改变 `ResponseExecutionRef` Projection，永不改变 `Investigation.status` / `InvestigationResult`。
 
 ---
 
@@ -825,13 +840,15 @@ COMMIT
 | CreateResponseProposal | ResponseProposalCreated |
 | EvaluateResponsePolicy | ResponsePolicyEvaluated |
 | RequestResponseApproval | ResponseApprovalRequested |
-| ApproveResponse | ResponseApproved |
-| RejectResponse | ResponseRejected, InvestigationCompleted |
+| ApproveResponse | ResponseApproved, response_execution_queued |
+| RejectResponse | ResponseRejected |
 | SubmitApprovedResponse | ResponseExecutionSubmitted |
 | RecordResponseExecutionObservation | ResponseExecutionStatusChanged |
 | CompleteInvestigation | InvestigationCompleted |
-| CompleteInvestigationAfterResponse | InvestigationCompleted |
 | FailInvestigation | InvestigationFailed |
+
+`RequestResponseApproval` / `ApproveResponse` / `RejectResponse` / `SubmitApprovedResponse` / `RecordResponseExecutionObservation`
+只作用于 `ResponseProposal`，不产生任何 Investigation 状态迁移（§7）。
 
 ---
 
@@ -962,8 +979,10 @@ budget_deadline_at        # max_duration_seconds 派生的 UTC epoch 秒
 `assessment`
 : 仅保存下一步路由所需的结构化结果，例如 `CONTINUE` / `FINALIZE`。
 
-`result_id` / `response_proposal_id` / `approval_request_id` / `response_execution_id`
-: 只保存持久化 Domain / External Projection Reference。
+`result_id` / `response_proposal_id` / `proposal_revision` / `approval_request_id` / `response_execution_id`
+: 只保存持久化 Domain / External Projection Reference。`response_proposal_id` 是 Investigation → `ResponseProposal` 的唯一关联（由 `link_response_proposal` 建立）。
+  `proposal_revision` / `approval_request_id` / `response_execution_id` **不是** Graph 驱动字段：Investigation Graph 不含任何 Approval / Submit 节点，
+  审批、提交与观察全部由持久化 Runtime（Human API + Durable Worker，§24 / §25）在 Graph 之外推进，Graph 不等待、不提交、也不据其路由。
 
 ---
 
@@ -1024,6 +1043,8 @@ response_proposal_id?
 response_execution_id?
 ```
 
+`response_proposal_id?` / `response_execution_id?` 只回传已持久化的 Domain / External Projection 引用（§15）：
+Investigation Graph 既不产生审批，也不提交或观察 Response。
 产品 UI 不依赖 Graph Output，必须通过 `GetInvestigationWorkspace` 获取 Domain Read Model。
 
 ---
@@ -1069,7 +1090,7 @@ exhaustion / deadline   → finalize available facts → COMPLETED + INCONCLUSIV
 
 `execute_and_ingest` 在单个 Checkpoint 步内执行工具并写入其归一化 Evidence：crash mid-node 重跑整个节点，Tool 审计（by-key）与 Evidence（by dedup key）均幂等 —— checkpointed resume 既不丢也不重复。
 
-后续阶段追加 Response 分支（V1 之外的 Response 提议 / Approval 流程）：
+Graph 不含任何 Approval / Response 节点：Investigation Graph 永不停机等待 Approval，也不提交或观察 Response；approval 之后的执行不调用任何 LLM（§20 / §23）。
 
 ---
 
@@ -1085,12 +1106,10 @@ exhaustion / deadline   → finalize available facts → COMPLETED + INCONCLUSIV
 | assess | ChangeInvestigationPhase, AssessHypotheses, RecordFindings（消耗 1 LLM-Call） |
 | finalize_result | ChangeInvestigationPhase, FinalizeInvestigationResult（verdict 消耗最后 1 LLM-Call；deadline 到达则确定性 INCONCLUSIVE） |
 | complete | CompleteInvestigation |
-| request_approval | RequestResponseApproval |
-| wait_approval | LangGraph interrupt only |
-| load_approval | Query persisted ApprovalDecision |
-| submit_response | SubmitApprovedResponse |
 
 Graph Node 必须保持 Thin，不直接执行 SQL、ORM Update、Domain 字段修改或绕过 Application Layer。
+
+Investigation Graph 不含 approval / submit / observe 节点：审批与执行不由 Graph 驱动（§23 / §24 / §25）。
 
 ---
 
@@ -1162,21 +1181,17 @@ Tool Result 始终是 Data，不是 Instruction。
 
 ## 23. Human-in-the-loop
 
-Approval 必须拆为：
-
-```text
-request_approval
-→ wait_approval
-→ load_approval
-```
+Approval 不属于 Investigation Graph，而是独立的 `ResponseProposal` 事务：Investigation 在 Response 工作流开始前已 `COMPLETED`，
+Graph 不含任何 approval 节点（§19 / §20），也永不等待或提交 Response。
 
 ### request_approval
 
-通过 `RequestResponseApproval` 持久化正式 `ApprovalRequest`。
+通过 `RequestResponseApproval` 持久化正式 `ApprovalRequest`：作用于 `ResponseProposal`（`CREATED → WAITING_APPROVAL`），
+不改变 `Investigation.status`。
 
 ### wait_approval
 
-只执行 LangGraph interrupt，不创建 Domain Fact，不产生 Side Effect。
+不存在该 Graph 节点：等待发生在已持久化的 `ApprovalRequest` 上，由 Human API 驱动，而不是 LangGraph interrupt。
 
 ### Human API
 
@@ -1185,63 +1200,83 @@ Authenticated HTTP Request
 → TrustedContext
 → ApproveResponse / RejectResponse
 → persist immutable ApprovalDecision
-→ emit Domain Event
+→ ResponseProposal status transition
+→ emit Domain Event (+ durable outbox delivery)
+→ COMMIT
 ```
 
 ### Resume
 
-Graph Resume Payload 只能携带引用，例如：
+Investigation Graph 不承载 Approval Resume 语义：Graph 不暂停等待审批，也不消费审批结果做路由。
 
-```text
-approval_request_id
-decision_id
-```
+Approve / Reject 只能从已持久化的 `ApprovalDecision` 读取；重复提交必须读取同一 Immutable Decision，不产生重复审批。
 
-Resume 后必须重新读取持久化 `ApprovalDecision`。
-
-不得直接信任 Resume Payload 中的 `approved=true` 作为授权事实。
+不得信任任何请求 Payload 中的 `approved=true` 作为授权事实。
 
 ---
 
 ## 24. Approval Recovery
 
-如果 ApprovalDecision 已提交而 Graph Resume 失败：
+如果 ApprovalDecision 已提交而后续步骤（durable 投递）失败：
 
 ```text
 Domain Fact remains valid
 ```
 
-恢复逻辑可以依据：
+恢复依据的是 `ResponseProposal` 生命周期与持久化投递，而不是 `Investigation` 状态：
 
 ```text
-Investigation = WAITING_APPROVAL
+ResponseProposal = APPROVED
 +
-ApprovalRequest already decided
+ApprovalDecision already persisted
++
+durable outbox delivery（destination response.execution.submit）已存在
 ```
 
-重新 Resume。
+⇒ 由 submit worker 重新消费同一投递，并使用同一稳定 submission key 收敛到同一次 SOAR Execution。
 
-重复 Resume 必须读取同一 Immutable Decision，不产生重复审批。
+重复投递 / 重复提交必须读取同一 Immutable Decision，不产生重复审批。
 
 ---
 
 ## 25. Side Effect Recovery
 
-`SubmitApprovedResponse` 必须可安全重试。
+`SubmitApprovedResponse` / `RecordResponseExecutionObservation` 必须可安全重试，并且不依赖任何长驻进程内轮询或独立队列框架。
 
-逻辑：
+两个持久化责任（durable destination）：
 
 ```text
-check existing ResponseExecutionRef
-  ├── exists → return existing
-  └── absent
-       ↓
-submit using stable submission_key
-       ↓
-persist execution reference
+response.execution.submit    → 提交 APPROVED 的 Proposal
+response.execution.observe   → 观察 / 收敛 SUBMITTED 的外部执行
+```
+
+提交逻辑：
+
+```text
+reload proposal by tenant + proposal_id（要求 APPROVED）
+→ check existing ResponseExecutionRef
+     ├── exists → no-op（重复投递收敛）
+     └── absent
+          ↓
+reload persisted immutable contract from DB（绝不信任 outbox payload）
+          ↓
+submit using stable submission_key（Idempotency-Key）
+          ↓
+require REAL non-empty execution_id
+          ↓
+persist ResponseExecutionRef + APPROVED → SUBMITTED
 ```
 
 如果 SOAR 已接受请求但 Copilot 在保存引用前崩溃，重试必须使用相同 Submission Key 恢复同一 Execution。
+
+观察逻辑：
+
+```text
+terminal provider status     → 结算并停止 reconciliation
+non-terminal（如 RUNNING）   → 持久化 observation + 以未来 available_at 持久化重排下一次观察
+```
+
+合法非终态不是失败：不得靠重试耗尽进入 DEAD_LETTER。
 
 ---
 
@@ -1295,7 +1330,6 @@ Checkpoint 只用于：
 ```text
 crash recovery
 Agent loop resume
-human approval pause/resume
 runtime inspection
 ```
 
@@ -1303,24 +1337,18 @@ Checkpoint 不是 Domain Source of Truth。
 
 任何 Resume 首先重新读取 Investigation Domain State。
 
-建议 Reconciliation：
+建议 Reconciliation（只针对 Investigation 状态机）：
 
 ```text
 COMPLETED / FAILED / CANCELLED
 → END
 
-WAITING_APPROVAL
-→ wait/load persisted approval
-
-EXECUTING_RESPONSE + no execution ref
-→ submit_response
-
-EXECUTING_RESPONSE + execution ref exists
-→ END
-
 RUNNING
 → continue orchestration
 ```
+
+Response 工作流不经过 Graph Checkpoint：Approval / Submission / Observation 由独立持久化责任驱动（§24 / §25），
+因此 Reconciliation 不含 `WAITING_APPROVAL` / `EXECUTING_RESPONSE` —— 它们从来不是 `Investigation` 状态。
 
 Domain 与 Checkpoint 冲突时，Domain State 优先。
 

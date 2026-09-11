@@ -31,12 +31,7 @@ class InvestigationReadModel:
 
     @property
     def is_active(self) -> bool:
-        return self.status in {
-            "CREATED",
-            "RUNNING",
-            "WAITING_APPROVAL",
-            "EXECUTING_RESPONSE",
-        }
+        return self.status in {"CREATED", "RUNNING"}
 
 
 @dataclass(frozen=True)

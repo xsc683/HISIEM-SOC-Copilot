@@ -46,7 +46,12 @@ from ..orm.investigation import InvestigationRow
 # dispatcher (which claims only its own destination).
 _EVENT_DESTINATIONS: dict[str, str] = {
     "investigation_created": "investigation.graph.run",
-    "response_execution_queued": "response.execution.run",
+    # Submission and reconciliation are TWO distinct durable responsibilities:
+    # submit obtains the real provider execution id exactly once (idempotency-keyed);
+    # observe advances an already-submitted execution toward a terminal state.
+    "response_execution_queued": "response.execution.submit",
+    "response_execution_submitted": "response.execution.observe",
+    "response_execution_observed": "response.execution.observe",
 }
 
 
@@ -57,7 +62,11 @@ class SqlAlchemyEventLedger(EventLedger):
         self._session = session
 
     async def append(
-        self, event: AppendableEvent, *, aggregate_revision: int
+        self,
+        event: AppendableEvent,
+        *,
+        aggregate_revision: int,
+        available_at: datetime | None = None,
     ) -> None:
         now = datetime.now(UTC)
         self._session.add(
@@ -84,7 +93,7 @@ class SqlAlchemyEventLedger(EventLedger):
                     destination=_EVENT_DESTINATIONS[event.event_type],
                     status="PENDING",
                     attempt_count=0,
-                    available_at=now,
+                    available_at=available_at or now,
                     created_at=now,
                 )
             )

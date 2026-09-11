@@ -5,9 +5,17 @@ domain method, persist the new child rows + domain events, commit. No HTTP, no
 ORM, no infrastructure imports (python-package-boundary.md).
 
 Transaction discipline (persistence-schema.md §3): NO network I/O runs inside a
-transaction. Approval therefore never calls SOAR inline — it records the immutable
-decision, creates a QUEUED execution ref, and appends a ``response_execution_queued``
-event whose OUTBOX row a separate durable worker consumes (spec §15/§16).
+transaction. Approval therefore never calls SOAR inline and never fabricates a
+provider execution reference: it records the immutable decision, transitions the
+proposal to APPROVED, and appends a ``response_execution_queued`` event whose
+OUTBOX row a separate durable worker consumes (spec §15/§16). The durable SUBMIT
+runner obtains the real provider execution id afterwards.
+
+Trusted-input boundary (spec §1): the action target is DERIVED from the persisted
+``Investigation.source_alert_ref`` — there is no caller-supplied target anywhere on
+this path — and the supporting evidence ids are re-resolved authoritatively through
+the tenant+investigation scoped evidence repository. Caller-supplied evidence strings
+are never persisted.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
+from ...domain.investigation.enums import InvestigationStatus
 from ...domain.response.actions import is_executable, validate_action_parameters
 from ...domain.response.aggregate import ResponseProposal
 from ...domain.response.enums import (
@@ -25,6 +34,8 @@ from ...domain.response.enums import (
 from ...domain.response.errors import (
     ApprovalContractError,
     ApprovalDecisionAlreadyExistsError,
+    ResponseEvidenceInvalidError,
+    ResponseInvestigationNotCompletedError,
 )
 from ...domain.response.events import (
     response_approval_decided,
@@ -37,15 +48,12 @@ from ...domain.response.policy import evaluate_response_policy
 from ...domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
-    ResponseExecutionRef,
+    submission_key,
 )
 from ...domain.shared.errors import DomainError
-from ...domain.shared.identifiers import utc_now
 from ..commands.response import CreateResponseProposal, DecideResponseApproval
 from ..errors import NotFoundError
 from ..ports.unit_of_work import UnitOfWork
-
-_PROVIDER = "hisiem"
 
 
 @dataclass(frozen=True)
@@ -67,7 +75,17 @@ class ResponseCommandHandler:
     async def create_response_proposal(
         self, command: CreateResponseProposal
     ) -> ResponseProposal:
-        """Derive + policy-validate + persist one typed proposal (idempotent)."""
+        """Derive + validate + policy-check + persist one proposal (idempotent).
+
+        Order of authority (spec §1.1):
+          1. tenant-scoped load of the Investigation;
+          2. load the finalized InvestigationResult;
+          3. DERIVE the target from the persisted source alert (never the caller);
+          4. validate the bounded action parameters;
+          5. AUTHORITATIVELY resolve the requested evidence in tenant+investigation scope;
+          6. evaluate policy on server-resolved inputs only;
+          7. persist the proposal and establish the post-investigation association.
+        """
         uow = self._uow_factory()
         try:
             investigation = await uow.investigations.get(
@@ -88,6 +106,14 @@ class ResponseCommandHandler:
             if existing is not None:
                 return existing
 
+            # The response workflow is an INDEPENDENT post-investigation lifecycle, so
+            # only a COMPLETED investigation may establish a response association
+            # (spec §5: the investigation lifecycle is never reopened).
+            if investigation.status is not InvestigationStatus.COMPLETED:
+                raise ResponseInvestigationNotCompletedError(
+                    status=investigation.status.value
+                )
+
             result = await uow.results.get_by_investigation(
                 tenant_id=command.tenant_id,
                 investigation_id=command.investigation_id,
@@ -97,16 +123,32 @@ class ResponseCommandHandler:
                     "a response proposal requires a finalized investigation result"
                 )
 
-            # Bounded, typed action contract — no arbitrary action, no arbitrary body.
+            # (3) The target IS the persisted, tenant-resolved source alert. There is
+            # deliberately no caller-supplied target: the browser cannot name, forge,
+            # or influence the resource an approved action would hit.
+            target_ref = investigation.source_alert_ref
+
+            # (4) Bounded, typed action contract — no arbitrary action, no arbitrary body.
             validate_action_parameters(command.action_key, command.parameters)
             if not is_executable(command.action_key):
                 raise DomainError(f"response action {command.action_key!r} is not executable")
 
+            # (5) Authoritative evidence resolution: the caller's strings are UNVERIFIED
+            # at the boundary and are never persisted — only ids that resolve to Evidence
+            # of THIS investigation in THIS tenant are accepted.
+            evidence_ids = await _resolve_evidence_ids(
+                uow,
+                tenant_id=command.tenant_id,
+                investigation_id=command.investigation_id,
+                requested=command.evidence_ids,
+            )
+
+            # (6) Policy sees only server-resolved inputs.
             policy = evaluate_response_policy(
                 action_key=command.action_key,
                 verdict_disposition=result.verdict.disposition,
-                target_refs=[command.target_ref],
-                evidence_ids=list(command.evidence_ids),
+                target_refs=[target_ref],
+                evidence_ids=list(evidence_ids),
                 parameters=command.parameters,
                 tenant_id=command.tenant_id,
             )
@@ -118,8 +160,8 @@ class ResponseCommandHandler:
                 action_key=command.action_key,
                 parameters=dict(command.parameters),
                 reason=command.reason,
-                target_refs=[command.target_ref],
-                evidence_ids=list(command.evidence_ids),
+                target_refs=[target_ref],
+                evidence_ids=list(evidence_ids),
                 policy_decision=policy.decision,
                 policy_reason=policy.reason if isinstance(policy.reason, str) else (
                     policy.reason.value if policy.reason is not None else None
@@ -139,10 +181,14 @@ class ResponseCommandHandler:
                 ),
             ]
 
+            # (7) The post-investigation association is a DOMAIN decision, never a bare
+            # field write: it is legal only on a COMPLETED investigation, is idempotent
+            # for the same proposal id, and never reopens the investigation lifecycle.
+            investigation.link_response_proposal(proposal.id)
+
             if policy.decision == PolicyDecision.DENY:
                 proposal.deny(proposal.policy_reason)
                 await uow.response_proposals.add(proposal)
-                await uow.investigations.update(investigation)
             else:
                 proposal.request_approval()
                 request = ApprovalRequest(
@@ -161,7 +207,7 @@ class ResponseCommandHandler:
                     )
                 )
 
-            investigation.response_proposal_id = proposal.id
+            await uow.investigations.update(investigation)
             for event in events:
                 await uow.events.append(event, aggregate_revision=proposal.lock_version)
             await uow.commit()
@@ -252,22 +298,18 @@ class ResponseCommandHandler:
                     proposal=proposal, decision=decision, execution_queued=False
                 )
 
-            # APPROVE → durable queue only; NO SOAR call inside this transaction.
+            # APPROVE → durable SUBMISSION INTENT only. NO SOAR call inside this
+            # transaction and NO fabricated provider execution reference.
+            #
+            # At this instant HISIEM has NOT been called, so no provider execution
+            # exists. The local durable submission intent is fully represented by the
+            # immutable ApprovalDecision + this APPROVED proposal + the stable
+            # deterministic submission key + the domain event + its atomic outbox row.
+            # Persisting ``ResponseExecutionRef(execution_id="")`` here would both lie
+            # about provider identity and collide on UNIQUE(provider, execution_id) for
+            # two simultaneously-queued proposals (spec §2).
             proposal.approve(approval_request_id=request.id)
             await uow.response_proposals.update(proposal)
-
-            now = utc_now()
-            submission_key = _submission_key(command.tenant_id, proposal.id)
-            execution = ResponseExecutionRef(
-                proposal_id=proposal.id,
-                provider=_PROVIDER,
-                execution_id="",
-                submission_key=submission_key,
-                status="QUEUED",
-                submitted_at=now,
-                last_observed_at=now,
-            )
-            await uow.response_executions.add(execution)
 
             await uow.events.append(
                 response_approval_decided(
@@ -279,10 +321,13 @@ class ResponseCommandHandler:
                 ),
                 aggregate_revision=proposal.lock_version,
             )
-            # This event is the ONLY response event that enqueues an outbox delivery.
+            # This event enqueues the durable SUBMIT delivery: it carries the stable
+            # submission key, never a provider execution identity.
             await uow.events.append(
                 response_execution_queued(
-                    proposal.id, execution_id=proposal.id, tenant_id=command.tenant_id
+                    proposal.id,
+                    submission_key=submission_key(command.tenant_id, proposal.id),
+                    tenant_id=command.tenant_id,
                 ),
                 aggregate_revision=proposal.lock_version,
             )
@@ -294,10 +339,45 @@ class ResponseCommandHandler:
             await uow.close()
 
 
-def _submission_key(tenant_id: str, proposal_id: UUID) -> str:
-    """Stable idempotency identity for one logical execution (spec §25).
+async def _resolve_evidence_ids(
+    uow: UnitOfWork,
+    *,
+    tenant_id: str,
+    investigation_id: UUID,
+    requested: tuple[str, ...],
+) -> tuple[UUID, ...]:
+    """Resolve caller-supplied evidence ids to AUTHORITATIVE in-scope identities.
 
-    Deterministic across retries/crashes — a re-approval or a worker retry always
-    presents the same key, so HISIEM can converge on one execution identity.
+    Rules (spec §1.2):
+      * the list must be non-empty;
+      * duplicate ids are canonicalised (order-preserving) BEFORE validation, so a
+        duplicate can never be used to slip past a count check;
+      * every id must resolve through the tenant+investigation scoped evidence
+        repository — an unknown id, another investigation's evidence and another
+        tenant's evidence are all rejected IDENTICALLY and reveal nothing about
+        whether the foreign row exists (no existence oracle);
+      * the RESOLVED ids are what gets persisted, never the caller's raw strings.
     """
-    return f"response:{tenant_id}:{proposal_id}"
+    if not requested:
+        raise ResponseEvidenceInvalidError()
+
+    canonical: list[UUID] = []
+    seen: set[UUID] = set()
+    for raw in requested:
+        try:
+            value = UUID(str(raw))
+        except (ValueError, AttributeError, TypeError):
+            raise ResponseEvidenceInvalidError() from None
+        if value in seen:
+            continue
+        seen.add(value)
+        canonical.append(value)
+
+    resolved = await uow.evidence.find_by_ids(
+        tenant_id=tenant_id,
+        investigation_id=investigation_id,
+        evidence_ids=canonical,
+    )
+    if {item.id for item in resolved} != set(canonical):
+        raise ResponseEvidenceInvalidError()
+    return tuple(canonical)

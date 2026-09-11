@@ -94,6 +94,10 @@ _TOOL_SUCCEEDED = "SUCCEEDED"
 _EXEC_SUCCEEDED = "SUCCEEDED"
 _EXEC_FAILED = "FAILED"
 _EXEC_QUEUED = "QUEUED"
+#: The human approved and the durable SUBMIT command is queued, but NO provider
+#: execution exists yet. Deliberately not a provider execution status: nothing is
+#: claimed about a provider execution because none exists.
+_EXEC_AWAITING_SUBMISSION = "AWAITING_SUBMISSION"
 
 
 def _header(investigation: Investigation) -> WorkspaceInvestigation:
@@ -500,6 +504,9 @@ def _workspace_execution(execution: ResponseExecutionRef | None) -> WorkspaceExe
         status=execution.status,
         submitted_at=execution.submitted_at,
         last_observed_at=execution.last_observed_at,
+        # The projection row only exists AFTER HISIEM returned a non-empty real
+        # execution id, so this is a real provider identity — never a proposal id
+        # and never a placeholder (spec §2/§6).
         external_execution_id=execution.execution_id or None,
         started_at=execution.started_at,
         finished_at=execution.finished_at,
@@ -516,7 +523,17 @@ def _response_timeline_entries(
     decision: ApprovalDecision | None,
     execution: ResponseExecutionRef | None,
 ) -> list[WorkspaceTimelineEntry]:
-    """Deterministic response timeline entries derived from persisted facts only."""
+    """Deterministic response timeline entries derived from persisted facts only.
+
+    The timeline never invents state (spec §6):
+
+    * ``APPROVED`` with NO execution projection means the human authorized the exact
+      contract and the durable SUBMIT command is queued — the workspace may say
+      "approved; submission queued", but there is no external execution id to show;
+    * once the projection row exists, the provider execution identity is REAL and the
+      provider status (QUEUED/RUNNING/SUCCEEDED/FAILED) is displayed against it;
+    * the proposal id is never passed off as an execution identity.
+    """
     from ...domain.response.aggregate import ResponseProposal
 
     if not isinstance(proposal, ResponseProposal):
@@ -568,57 +585,75 @@ def _response_timeline_entries(
                 safe_metadata={"actor": decision.actor_subject_id},
             )
         )
-    if execution is not None:
-        ref = execution.execution_id or str(proposal.id)
+
+    if execution is None:
+        # No provider execution exists. The durable local submission intent is a
+        # persisted fact (the immutable approval decision), so the timeline can say
+        # so — without fabricating an external execution identity.
+        if decision is not None and decision.decision == "APPROVE":
+            entries.append(
+                WorkspaceTimelineEntry(
+                    kind=TL_RESPONSE_EXECUTION_QUEUED,
+                    occurred_at=decision.decided_at,
+                    title="Response approved; submission queued",
+                    status=_EXEC_AWAITING_SUBMISSION,
+                    ref_type="response_proposal",
+                    ref_id=str(proposal.id),
+                )
+            )
+        return entries
+
+    # A REAL provider execution identity exists from here on.
+    ref = execution.execution_id
+    entries.append(
+        WorkspaceTimelineEntry(
+            kind=TL_RESPONSE_EXECUTION_QUEUED,
+            occurred_at=execution.submitted_at,
+            title="Response execution submitted",
+            status=_EXEC_QUEUED,
+            ref_type="response_execution",
+            ref_id=ref,
+        )
+    )
+    if execution.started_at is not None and execution.status != _EXEC_QUEUED:
         entries.append(
             WorkspaceTimelineEntry(
-                kind=TL_RESPONSE_EXECUTION_QUEUED,
-                occurred_at=execution.submitted_at,
-                title="Response execution queued",
-                status=_EXEC_QUEUED,
+                kind=TL_RESPONSE_EXECUTION_STARTED,
+                occurred_at=execution.started_at,
+                title="Response execution started",
+                status=execution.status,
                 ref_type="response_execution",
                 ref_id=ref,
             )
         )
-        if execution.started_at is not None and execution.status != _EXEC_QUEUED:
-            entries.append(
-                WorkspaceTimelineEntry(
-                    kind=TL_RESPONSE_EXECUTION_STARTED,
-                    occurred_at=execution.started_at,
-                    title="Response execution started",
-                    status=execution.status,
-                    ref_type="response_execution",
-                    ref_id=ref,
-                )
+    if execution.finished_at is not None and execution.status in (
+        _EXEC_SUCCEEDED,
+        _EXEC_FAILED,
+    ):
+        succeeded = execution.status == _EXEC_SUCCEEDED
+        entries.append(
+            WorkspaceTimelineEntry(
+                kind=(
+                    TL_RESPONSE_EXECUTION_SUCCEEDED
+                    if succeeded
+                    else TL_RESPONSE_EXECUTION_FAILED
+                ),
+                occurred_at=execution.finished_at,
+                title=(
+                    "Response execution succeeded"
+                    if succeeded
+                    else "Response execution failed"
+                ),
+                status=execution.status,
+                ref_type="response_execution",
+                ref_id=ref,
+                safe_metadata=(
+                    {"error_code": execution.safe_error_code}
+                    if execution.safe_error_code
+                    else {}
+                ),
             )
-        if execution.finished_at is not None and execution.status in (
-            _EXEC_SUCCEEDED,
-            _EXEC_FAILED,
-        ):
-            succeeded = execution.status == _EXEC_SUCCEEDED
-            entries.append(
-                WorkspaceTimelineEntry(
-                    kind=(
-                        TL_RESPONSE_EXECUTION_SUCCEEDED
-                        if succeeded
-                        else TL_RESPONSE_EXECUTION_FAILED
-                    ),
-                    occurred_at=execution.finished_at,
-                    title=(
-                        "Response execution succeeded"
-                        if succeeded
-                        else "Response execution failed"
-                    ),
-                    status=execution.status,
-                    ref_type="response_execution",
-                    ref_id=ref,
-                    safe_metadata=(
-                        {"error_code": execution.safe_error_code}
-                        if execution.safe_error_code
-                        else {}
-                    ),
-                )
-            )
+        )
     return entries
 
 

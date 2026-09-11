@@ -1,19 +1,23 @@
-"""P2 response workflow integration over real Postgres.
+"""P2 response workflow integration over real Postgres (spec §2/§3/§5/§6).
 
 End-to-end through the real HTTP boundary + real repository stack:
-create proposal → approval → durable queue → response worker → (fake) HISIEM SOAR
-→ execution status → workspace projection → audit timeline.
+create proposal → human decision → durable SUBMIT → durable OBSERVE → (fake) HISIEM
+SOAR → execution projection → workspace projection → audit timeline.
 
-The HISIEM investigation side is faked (FakeHisiem + scripted model); the SOAR
-side is a FakeSoar injected into the response dispatcher. All Copilot persistence
+The HISIEM investigation side is faked (FakeHisiem + scripted model); the SOAR side
+is a FakeSoar injected into the two response dispatchers. All Copilot persistence
 (RESPONSE tables, outbox, domain_event) is real PostgreSQL. Skipped when the DB is
 unreachable.
+
+Determinism: the reconciliation cadence is configured to 0 seconds, so a durable
+observation becomes claimable immediately. Nothing here sleeps on wall-clock time.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -24,7 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from hisiem_soc_copilot.api.app import create_app
 from hisiem_soc_copilot.application.errors import ExternalServiceError
+from hisiem_soc_copilot.application.ports.soar import SoarExecutionResult
 from hisiem_soc_copilot.config import Settings
+from hisiem_soc_copilot.infrastructure.durable.dispatcher import _MAX_ATTEMPTS
 from tests.fixtures.fakes import FakeSoar
 from tests.fixtures.hisiem_fake import FakeHisiem
 from tests.fixtures.ssh_models import GroundedSshModel
@@ -68,6 +74,8 @@ def _settings() -> Settings:
     s.langgraph.database_url = s.database.database_url
     s.auth.trusted_context_provider = "hisiem_bearer"
     s.auth.hisiem_service_token_env = _ENV_NAME
+    # Deterministic reconciliation: a durable observation is immediately claimable.
+    s.app.response_observe_interval_seconds = 0.0
     return s
 
 
@@ -129,10 +137,67 @@ def _script() -> dict[str, Any]:
 
 
 class _Harness:
-    def __init__(self, client: httpx.AsyncClient, container: Any, soar: FakeSoar) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        container: Any,
+        soar: FakeSoar,
+        hisiem: FakeHisiem,
+        session_factory: Any,
+    ) -> None:
         self.client = client
         self.container = container
         self.soar = soar
+        self.hisiem = hisiem
+        self._session_factory = session_factory
+
+    def arm_investigation_model(self) -> None:
+        """Give the NEXT investigation its own scripted model.
+
+        The script is consumed turn by turn, so a second investigation (e.g. a
+        second proposal on the same alert) would otherwise finalize with no tool
+        call and therefore no evidence to support a proposal.
+        """
+        self.container.dispatcher = self.container.outbox_dispatcher(
+            hisiem=self.hisiem, model=GroundedSshModel(script=_script())
+        )
+
+    async def drain_submit(self) -> int:
+        return await self.container.response_submit_dispatcher.drain_once()
+
+    async def drain_observe(self) -> int:
+        return await self.container.response_observe_dispatcher.drain_once()
+
+    async def scalar(self, sql: str, **params: Any) -> Any:
+        async with self._session_factory() as session:
+            result = await session.execute(text(sql), params)
+            row = result.first()
+            return None if row is None else row[0]
+
+    async def rows(self, sql: str, **params: Any) -> list[tuple[Any, ...]]:
+        async with self._session_factory() as session:
+            result = await session.execute(text(sql), params)
+            return [tuple(r) for r in result.all()]
+
+    def restart_workers(self, *, status_sequence: list[str] | None = None) -> FakeSoar:
+        """Simulate a PROCESS RESTART: brand-new runners over the same durable state."""
+        soar = FakeSoar(
+            submit_result=SoarExecutionResult(
+                execution_id="hisiem-exec-restart", status="RUNNING"
+            ),
+            status_sequence=status_sequence,
+        )
+        self.container.response_submit_dispatcher = (
+            self.container.response_submit_outbox_dispatcher(
+                soar=soar, observe_delay_seconds=0.0
+            )
+        )
+        self.container.response_observe_dispatcher = (
+            self.container.response_observe_outbox_dispatcher(
+                soar=soar, observe_delay_seconds=0.0
+            )
+        )
+        return soar
 
 
 @pytest_asyncio.fixture
@@ -156,7 +221,9 @@ async def harness(
             await session.commit()
 
     engine = create_async_engine(settings.database.database_url)
-    factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    factory = async_sessionmaker(
+        bind=engine, class_=AsyncSession, expire_on_commit=False
+    )
     await _truncate(factory)
 
     app = create_app(settings)
@@ -164,32 +231,48 @@ async def harness(
         container = app.state.container
         hisiem = FakeHisiem(alert_id=_ALERT)
         container.hisiem_adapter = hisiem  # type: ignore[assignment]
-        container.dispatcher = container.outbox_dispatcher(
-            hisiem=hisiem, model=GroundedSshModel(script=_script())
-        )
         soar = FakeSoar()
-        container.response_dispatcher = container.response_outbox_dispatcher(soar=soar)
+        container.response_submit_dispatcher = (
+            container.response_submit_outbox_dispatcher(
+                soar=soar, observe_delay_seconds=0.0
+            )
+        )
+        container.response_observe_dispatcher = (
+            container.response_observe_outbox_dispatcher(
+                soar=soar, observe_delay_seconds=0.0
+            )
+        )
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-            yield _Harness(c, container, soar)
+            harness = _Harness(c, container, soar, hisiem, factory)
+            harness.arm_investigation_model()
+            yield harness
         await _truncate(factory)
     await engine.dispose()
 
 
-async def _completed_investigation(harness: _Harness) -> str:
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+async def _completed_investigation(
+    harness: _Harness, *, alert: str = _ALERT
+) -> str:
     res = await harness.client.post(
         "/api/v1/investigations",
         json={
             "source_alert_ref": {
                 "provider": "hisiem",
                 "resource_type": "alert",
-                "address_id": _ALERT,
+                "address_id": alert,
             }
         },
         headers=_headers(),
     )
     assert res.status_code == 201, res.text
     investigation_id = res.json()["investigation_id"]
+    harness.arm_investigation_model()
     await harness.container.dispatcher.drain_once()
     return investigation_id
 
@@ -203,17 +286,17 @@ async def _workspace(harness: _Harness, investigation_id: str) -> dict[str, Any]
 
 
 async def _create_proposal(
-    harness: _Harness, investigation_id: str, evidence_ids: list[str], *, reason: str = "contain"
+    harness: _Harness,
+    investigation_id: str,
+    evidence_ids: list[str],
+    *,
+    reason: str = "contain",
 ) -> dict[str, Any]:
+    """POST a proposal. NOTE: the body carries NO target — it is server-derived."""
     res = await harness.client.post(
         f"/api/v1/investigations/{investigation_id}/response-proposals",
         json={
             "action_key": "START_SOAR_PLAYBOOK",
-            "target": {
-                "provider": "hisiem",
-                "resource_type": "alert",
-                "address_id": _ALERT,
-            },
             "evidence_ids": evidence_ids,
             "parameters": {"playbook_id": _PLAYBOOK_ID},
             "reason": reason,
@@ -222,6 +305,111 @@ async def _create_proposal(
     )
     assert res.status_code == 201, res.text
     return res.json()["proposal"]
+
+
+async def _proposal_with_approval(
+    harness: _Harness, *, alert: str = _ALERT
+) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    investigation_id = await _completed_investigation(harness, alert=alert)
+    ws = await _workspace(harness, investigation_id)
+    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
+    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
+    ws2 = await _workspace(harness, investigation_id)
+    approval = ws2["response"]["proposals"][0]["approval"]
+    return investigation_id, proposal, approval, ws2
+
+
+async def _approve(
+    harness: _Harness, approval: dict[str, Any], proposal: dict[str, Any]
+) -> httpx.Response:
+    return await harness.client.post(
+        f"/api/v1/investigations/response-approvals/{approval['request_id']}/approve",
+        json={
+            "decision": "APPROVE",
+            "expected_revision": proposal["revision"],
+            "expected_content_hash": proposal["content_hash"],
+        },
+        headers=_headers(actor="operator"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# §1 — the trusted proposal-input boundary
+# ---------------------------------------------------------------------------
+
+
+async def test_proposal_body_cannot_carry_a_target(harness: _Harness) -> None:
+    """A caller-supplied target FAILS LOUDLY instead of being silently ignored."""
+    investigation_id = await _completed_investigation(harness)
+    ws = await _workspace(harness, investigation_id)
+    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
+
+    res = await harness.client.post(
+        f"/api/v1/investigations/{investigation_id}/response-proposals",
+        json={
+            "action_key": "START_SOAR_PLAYBOOK",
+            "target": {
+                "provider": "hisiem",
+                "resource_type": "alert",
+                "address_id": "some-other-alert",
+            },
+            "evidence_ids": evidence_ids,
+            "parameters": {"playbook_id": _PLAYBOOK_ID},
+            "reason": "contain",
+        },
+        headers=_headers(),
+    )
+    assert res.status_code == 422, res.text
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_proposal"
+    ) == 0
+
+
+async def test_proposal_target_is_the_persisted_source_alert(harness: _Harness) -> None:
+    _, proposal, _, ws = await _proposal_with_approval(harness)
+
+    persisted = await harness.rows(
+        "SELECT provider, resource_type, address_id, business_id "
+        "FROM copilot.response_proposal_target WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    )
+    # Exactly ONE target, and it is the persisted source alert of the investigation
+    # the proposal hangs off — nothing the browser could have named or forged.
+    assert persisted == [("hisiem", "alert", _ALERT, None)]
+    targets = ws["response"]["proposals"][0]["target_refs"]
+    assert len(targets) == 1
+    assert targets[0]["address_id"] == _ALERT
+
+
+async def test_out_of_scope_evidence_is_rejected(harness: _Harness) -> None:
+    investigation_id = await _completed_investigation(harness)
+
+    res = await harness.client.post(
+        f"/api/v1/investigations/{investigation_id}/response-proposals",
+        json={
+            "action_key": "START_SOAR_PLAYBOOK",
+            "evidence_ids": [str(uuid4())],
+            "parameters": {"playbook_id": _PLAYBOOK_ID},
+            "reason": "contain",
+        },
+        headers=_headers(),
+    )
+    assert res.status_code == 400, res.text
+    assert res.json()["code"] == "RESPONSE_EVIDENCE_INVALID"
+    # No existence oracle: the message states the RULE and never whether a row
+    # exists, so the endpoint cannot be probed for other tenants' data.
+    assert "does not exist" not in res.text.lower()
+    assert res.json()["message"] == (
+        "supporting evidence must reference evidence recorded on this investigation"
+    )
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_proposal"
+    ) == 0
+
+
+# ---------------------------------------------------------------------------
+# §2 / §5 — approval queues a SUBMISSION; only the worker creates the provider ref
+# ---------------------------------------------------------------------------
 
 
 async def test_proposal_requires_approval_and_projects_to_workspace(
@@ -245,30 +433,16 @@ async def test_proposal_requires_approval_and_projects_to_workspace(
     assert p["approval"]["expected_revision"] == proposal["revision"]
     # No execution exists before a human decides.
     assert p["execution"] is None
-    # Audit timeline carries the response events.
     kinds = {t["kind"] for t in ws2["timeline"]}
     assert any(k.startswith("RESPONSE_") for k in kinds)
 
 
-async def test_approval_queues_execution_worker_settles_and_projects(
+async def test_approval_queues_submission_and_creates_no_execution(
     harness: _Harness,
 ) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
 
-    approve = await harness.client.post(
-        f"/api/v1/investigations/response-approvals/{approval['request_id']}/approve",
-        json={
-            "decision": "APPROVE",
-            "expected_revision": proposal["revision"],
-            "expected_content_hash": proposal["content_hash"],
-        },
-        headers=_headers(actor="operator"),
-    )
+    approve = await _approve(harness, approval, proposal)
     assert approve.status_code == 200, approve.text
     body = approve.json()
     assert body["execution_queued"] is True
@@ -276,35 +450,263 @@ async def test_approval_queues_execution_worker_settles_and_projects(
 
     # No SOAR call happened inside the HTTP request (durable queue only).
     assert harness.soar.submitted == []
+    # …and NO provider execution reference was fabricated.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
 
-    # The durable worker performs the one approved side effect.
-    drained = await harness.container.response_dispatcher.drain_once()
-    assert drained == 1
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["status"] == "APPROVED"
+    # No fake external execution id may be shown while nothing was submitted.
+    assert p["execution"] is None
+    queued = [
+        t for t in ws["timeline"] if t["kind"] == "RESPONSE_EXECUTION_QUEUED"
+    ]
+    assert len(queued) == 1
+    assert queued[0]["status"] == "AWAITING_SUBMISSION"
+    assert queued[0]["ref_id"] == proposal["proposal_id"]
+
+    # The investigation lifecycle is untouched by approval (§5).
+    assert await harness.scalar(
+        "SELECT status FROM copilot.investigation WHERE id = :iid",
+        iid=investigation_id,
+    ) == "COMPLETED"
+
+
+async def test_submit_then_observe_settles_with_a_real_execution_id(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+
+    assert await harness.drain_submit() == 1
     assert len(harness.soar.submitted) == 1
     expected_key = f"response:tenant-a:{proposal['proposal_id']}"
     assert harness.soar.submitted[0]["submission_key"] == expected_key
 
-    ws3 = await _workspace(harness, investigation_id)
-    p = ws3["response"]["proposals"][0]
-    assert p["status"] == "APPROVED"
-    assert p["approval"]["decision"]["decision"] == "APPROVE"
-    assert p["approval"]["decision"]["actor_subject_id"] == "operator"
-    assert p["execution"] is not None
+    execution_id = await harness.scalar(
+        "SELECT execution_id FROM copilot.response_execution_ref "
+        "WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    )
+    assert execution_id  # non-empty, real provider identity
+    assert execution_id == "hisiem-exec-1"
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["status"] == "SUBMITTED"  # a REAL lifecycle state (§5)
     assert p["execution"]["status"] == "SUCCEEDED"
+    assert p["execution"]["external_execution_id"] == execution_id
     assert p["execution"]["finished_at"] is not None
 
-    # A second drain is a no-op (published) → still exactly one SOAR submission.
-    assert await harness.container.response_dispatcher.drain_once() == 0
+    # The observe delivery settles; a further drain is a no-op.
+    assert await harness.drain_submit() == 0
     assert len(harness.soar.submitted) == 1
 
 
+async def test_two_approvals_before_any_drain_do_not_collide(harness: _Harness) -> None:
+    """Approving A and B with nothing drained must not collide on provider identity."""
+    harness.soar.submit_sequence = [
+        SoarExecutionResult(execution_id="hisiem-exec-A", status="SUCCEEDED"),
+        SoarExecutionResult(execution_id="hisiem-exec-B", status="SUCCEEDED"),
+    ]
+
+    # Two INDEPENDENT investigations (the first is already COMPLETED, so the
+    # alert is free again) — nothing is drained between their approvals.
+    inv_a, proposal_a, approval_a, _ = await _proposal_with_approval(harness)
+    inv_b, proposal_b, approval_b, _ = await _proposal_with_approval(harness)
+    assert inv_a != inv_b
+
+    assert (await _approve(harness, approval_a, proposal_a)).status_code == 200
+    # The OLD model wrote a provider reference with an EMPTY execution id at approval
+    # time, so this second approval would have raised UNIQUE(provider, execution_id).
+    # It must succeed.
+    second = await _approve(harness, approval_b, proposal_b)
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "APPROVED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+
+    # Drain both; each gets its OWN real provider execution.
+    assert await harness.drain_submit() == 2
+    assert len(harness.soar.submitted) == 2
+    keys = {call["submission_key"] for call in harness.soar.submitted}
+    assert keys == {
+        f"response:tenant-a:{proposal_a['proposal_id']}",
+        f"response:tenant-a:{proposal_b['proposal_id']}",
+    }
+    execution_ids = {
+        await harness.scalar(
+            "SELECT execution_id FROM copilot.response_execution_ref "
+            "WHERE proposal_id = :pid",
+            pid=proposal_a["proposal_id"],
+        ),
+        await harness.scalar(
+            "SELECT execution_id FROM copilot.response_execution_ref "
+            "WHERE proposal_id = :pid",
+            pid=proposal_b["proposal_id"],
+        ),
+    }
+    assert execution_ids == {"hisiem-exec-A", "hisiem-exec-B"}
+    assert await harness.scalar(
+        "SELECT count(DISTINCT execution_id) FROM copilot.response_execution_ref"
+    ) == 2
+    # At most one provider execution per proposal.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 2
+
+
+async def test_duplicate_submit_delivery_never_double_executes(harness: _Harness) -> None:
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    # Re-arm the exact same durable delivery (as a crash/redelivery would).
+    await harness.scalar(
+        "UPDATE copilot.outbox_message SET status = 'PENDING', available_at = now() "
+        "WHERE destination = 'response.execution.submit' RETURNING id"
+    )
+    await harness.drain_submit()
+
+    assert len(harness.soar.submitted) == 1
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 1
+
+
+# ---------------------------------------------------------------------------
+# §3 — durable reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def test_long_running_execution_is_reconciled_across_restarts(
+    harness: _Harness,
+) -> None:
+    """A legitimately RUNNING playbook must NEVER dead-letter, and must survive restarts."""
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(execution_id="hisiem-exec-1", status="RUNNING"),
+        status_sequence=["RUNNING"] * (_MAX_ATTEMPTS + 2),
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    # Many reconciliation cycles — far more than _MAX_ATTEMPTS.
+    for _ in range(_MAX_ATTEMPTS + 2):
+        await harness.drain_observe()
+
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.observe' AND status = 'DEAD_LETTER'"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message WHERE status = 'FAILED'"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "RUNNING"
+
+    # Restart: a brand-new worker with no in-memory state finishes the job.
+    restart_soar = harness.restart_workers(status_sequence=["SUCCEEDED"])
+    await harness.drain_observe()
+
+    assert restart_soar.status_calls == ["hisiem-exec-1"]
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "SUCCEEDED"
+
+
+async def test_a_terminal_execution_is_not_re_observed(harness: _Harness) -> None:
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(execution_id="hisiem-exec-1", status="RUNNING"),
+        status_sequence=["SUCCEEDED"],
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    await harness.drain_observe()
+
+    # A terminal execution no longer schedules observation.
+    assert await harness.drain_observe() == 0
+    assert soar.status_calls == ["hisiem-exec-1"]
+
+
+async def test_observation_never_re_posts_the_execution(harness: _Harness) -> None:
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    await harness.drain_observe()
+    await harness.drain_observe()
+
+    assert len(harness.soar.submitted) == 1
+
+
+# ---------------------------------------------------------------------------
+# §5 — the investigation lifecycle is independent and never reopened
+# ---------------------------------------------------------------------------
+
+
+async def test_response_proposal_id_is_linked_without_reopening(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+
+    linked = await harness.scalar(
+        "SELECT response_proposal_id FROM copilot.investigation WHERE id = :iid",
+        iid=investigation_id,
+    )
+    assert str(linked) == proposal["proposal_id"]
+
+    before = await harness.scalar(
+        "SELECT status || '|' || termination_reason FROM copilot.investigation "
+        "WHERE id = :iid",
+        iid=investigation_id,
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    await harness.drain_observe()
+
+    after = await harness.scalar(
+        "SELECT status || '|' || termination_reason FROM copilot.investigation "
+        "WHERE id = :iid",
+        iid=investigation_id,
+    )
+    # Approval, submission and observation never change Investigation.status.
+    assert after == before
+    assert after.startswith("COMPLETED|")
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.investigation WHERE status IN "
+        "('WAITING_APPROVAL','EXECUTING_RESPONSE')"
+    ) == 0
+
+
 async def test_reject_produces_zero_executions(harness: _Harness) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
 
     reject = await harness.client.post(
         f"/api/v1/investigations/response-approvals/{approval['request_id']}/reject",
@@ -319,24 +721,25 @@ async def test_reject_produces_zero_executions(harness: _Harness) -> None:
     assert reject.status_code == 200, reject.text
     assert reject.json()["execution_queued"] is False
 
-    # Nothing was queued → draining the worker finds no work and SOAR is untouched.
-    assert await harness.container.response_dispatcher.drain_once() == 0
+    assert await harness.drain_submit() == 0
+    assert await harness.drain_observe() == 0
     assert harness.soar.submitted == []
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "REJECTED"
 
-    ws3 = await _workspace(harness, investigation_id)
-    p = ws3["response"]["proposals"][0]
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
     assert p["status"] == "REJECTED"
-    assert p["approval"]["decision"]["decision"] == "REJECT"
     assert p["execution"] is None
 
 
 async def test_stale_contract_approval_is_rejected(harness: _Harness) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
 
     res = await harness.client.post(
         f"/api/v1/investigations/response-approvals/{approval['request_id']}/approve",
@@ -349,18 +752,16 @@ async def test_stale_contract_approval_is_rejected(harness: _Harness) -> None:
     )
     assert res.status_code == 409, res.text
     assert res.json()["code"] == "APPROVAL_CONTRACT_MISMATCH"
-    # No execution queued by a mismatched contract.
-    assert await harness.container.response_dispatcher.drain_once() == 0
+    assert await harness.drain_submit() == 0
     assert harness.soar.submitted == []
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == 0
 
 
 async def test_decision_body_mismatch_with_route_is_rejected(harness: _Harness) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
 
     # Route says approve, body says reject → refused (no smuggling).
     res = await harness.client.post(
@@ -376,10 +777,7 @@ async def test_decision_body_mismatch_with_route_is_rejected(harness: _Harness) 
 
 
 async def test_response_workflow_is_tenant_scoped(harness: _Harness) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    await _create_proposal(harness, investigation_id, evidence_ids)
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
 
     # A valid service credential asserting a different tenant cannot see or act on it.
     foreign = await harness.client.get(
@@ -389,24 +787,40 @@ async def test_response_workflow_is_tenant_scoped(harness: _Harness) -> None:
     assert foreign.status_code == 404
     assert investigation_id not in foreign.text
 
-
-async def test_response_timeline_is_deterministic(harness: _Harness) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
-    await harness.client.post(
+    foreign_approve = await harness.client.post(
         f"/api/v1/investigations/response-approvals/{approval['request_id']}/approve",
         json={
             "decision": "APPROVE",
             "expected_revision": proposal["revision"],
             "expected_content_hash": proposal["content_hash"],
         },
-        headers=_headers(actor="operator"),
+        headers=_headers(tenant="tenant-b", actor="operator"),
     )
-    await harness.container.response_dispatcher.drain_once()
+    assert foreign_approve.status_code == 404
+    assert await harness.drain_submit() == 0
+    assert harness.soar.submitted == []
+
+
+async def test_response_workflow_rejects_a_missing_service_credential(
+    harness: _Harness,
+) -> None:
+    """§43/§44 — a bad/absent S2S credential is exactly one generic 401."""
+    investigation_id = await _completed_investigation(harness)
+
+    res = await harness.client.get(
+        f"/api/v1/investigations/{investigation_id}/workspace",
+        headers=_headers(bearer=None),
+    )
+    assert res.status_code == 401, res.text
+    assert res.json()["code"] == "SERVICE_AUTHENTICATION_FAILED"
+    assert res.json()["message"] == "service authentication failed"
+
+
+async def test_response_timeline_is_deterministic(harness: _Harness) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    await harness.drain_observe()
 
     first = (await _workspace(harness, investigation_id))["timeline"]
     second = (await _workspace(harness, investigation_id))["timeline"]
@@ -418,37 +832,95 @@ async def test_response_timeline_is_deterministic(harness: _Harness) -> None:
     assert occurred == sorted(occurred)
 
 
-async def test_soar_definitive_failure_settles_execution_failed(
+# ---------------------------------------------------------------------------
+# §2 — decisive failure paths
+# ---------------------------------------------------------------------------
+
+
+async def test_definitive_submit_failure_dead_letters_without_a_fake_ref(
     harness: _Harness,
 ) -> None:
-    investigation_id = await _completed_investigation(harness)
-    ws = await _workspace(harness, investigation_id)
-    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
-    proposal = await _create_proposal(harness, investigation_id, evidence_ids)
-    ws2 = await _workspace(harness, investigation_id)
-    approval = ws2["response"]["proposals"][0]["approval"]
-    # Swap in a SOAR that definitively rejects the submission.
-    harness.container.response_dispatcher = harness.container.response_outbox_dispatcher(
-        soar=FakeSoar(
-            raise_on_submit=ExternalServiceError(
-                "bad playbook", service="hisiem", code="HTTP_422"
-            )
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=FakeSoar(
+                raise_on_submit=ExternalServiceError(
+                    "bad playbook", service="hisiem", code="HTTP_422"
+                )
+            ),
+            observe_delay_seconds=0.0,
         )
     )
 
-    await harness.client.post(
-        f"/api/v1/investigations/response-approvals/{approval['request_id']}/approve",
-        json={
-            "decision": "APPROVE",
-            "expected_revision": proposal["revision"],
-            "expected_content_hash": proposal["content_hash"],
-        },
-        headers=_headers(actor="operator"),
-    )
-    await harness.container.response_dispatcher.drain_once()
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
 
-    ws3 = await _workspace(harness, investigation_id)
-    execution = ws3["response"]["proposals"][0]["execution"]
+    # No provider execution exists, so NO provider identity may be persisted.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "APPROVED"
+    assert await harness.scalar(
+        "SELECT status FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == "DEAD_LETTER"
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["execution"] is None  # no fabricated execution identity
+
+
+async def test_transient_submit_failure_stays_queued(harness: _Harness) -> None:
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=FakeSoar(
+                raise_on_submit=ExternalServiceError(
+                    "unavailable", service="hisiem", code="HTTP_503"
+                )
+            ),
+            observe_delay_seconds=0.0,
+        )
+    )
+
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == "FAILED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+
+
+async def test_observed_provider_failure_settles_the_execution(harness: _Harness) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(execution_id="hisiem-exec-1", status="RUNNING"),
+        status_sequence=["FAILED"],
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    await harness.drain_observe()
+
+    ws = await _workspace(harness, investigation_id)
+    execution = ws["response"]["proposals"][0]["execution"]
     assert execution is not None
     assert execution["status"] == "FAILED"
-    assert execution["safe_error_code"] == "HTTP_422"
+    assert execution["finished_at"] is not None
+    assert execution["external_execution_id"] == "hisiem-exec-1"

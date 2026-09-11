@@ -11,7 +11,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
-from ...domain.investigation.value_objects import ExternalResourceRef
 from ...domain.response.enums import ApprovalDecisionKind
 
 
@@ -19,16 +18,20 @@ from ...domain.response.enums import ApprovalDecisionKind
 class CreateResponseProposal:
     """Derive + policy-validate + persist a typed response proposal.
 
-    Deterministic: the caller supplies the bounded action contract directly (no
-    model round). ``target_ref`` and ``evidence_ids`` must already be resolved and
-    belong to the investigation's tenant.
+    The command intentionally carries NO target: the action target is DERIVED
+    server-side from the persisted ``Investigation.source_alert_ref`` inside the
+    handler. A caller can therefore not choose, forge, or influence the resource an
+    approved action would hit (spec §1) — there is no field for it.
+
+    ``evidence_ids`` are UNVERIFIED caller strings at this boundary; the handler
+    resolves them authoritatively through the tenant+investigation scoped evidence
+    repository and persists only the resolved identities.
     """
 
     tenant_id: str
     investigation_id: UUID
     action_key: str
-    target_ref: ExternalResourceRef
-    evidence_ids: tuple[UUID, ...]
+    evidence_ids: tuple[str, ...]
     parameters: dict[str, object]
     reason: str
     initiated_by_subject: str

@@ -147,6 +147,12 @@ class ApplicationSettings(BaseSettings):
     # actions through the SOAR port). Separate flag so a deployment can run graph
     # dispatch without the response worker (and tests stay deterministic).
     enable_response_worker: bool = False
+    # Reconciliation cadence for a SUBMITTED SOAR execution. A non-terminal
+    # execution is re-observed on this interval by DURABLE scheduling (a future
+    # ``available_at``), never by a retry exception, so a playbook may legitimately
+    # run for minutes or hours without exhausting the outbox attempt budget. Tests
+    # set it to 0 to drive reconciliation deterministically.
+    response_observe_interval_seconds: float = 15.0
 
 
 class SoarSettings(BaseSettings):

@@ -62,7 +62,11 @@ class FakeOutboxStore:
     _seq = 0
 
     def enqueue(
-        self, event_id: UUID, *, destination: str = "investigation.graph.run"
+        self,
+        event_id: UUID,
+        *,
+        destination: str = "investigation.graph.run",
+        available_at: Any = None,
     ) -> None:
         self._seq += 1
         self.rows[event_id] = {
@@ -74,7 +78,7 @@ class FakeOutboxStore:
             "locked_at": None,
             "locked_by": None,
             "lease_token": None,
-            "available_at": self.now,
+            "available_at": available_at if available_at is not None else self.now,
         }
 
     def advance(self, seconds: float) -> None:
@@ -212,16 +216,44 @@ class FakeOutboxStore:
 
 
 
+#: Mirrors ``_EVENT_DESTINATIONS`` in the SQLAlchemy ledger. Kept in sync by
+#: ``tests/unit/agent/test_fake_ledger_destinations.py`` so the fake can never
+#: silently stop enqueueing a delivery the real ledger would enqueue.
+FAKE_EVENT_DESTINATIONS: dict[str, str] = {
+    "investigation_created": "investigation.graph.run",
+    "response_execution_queued": "response.execution.submit",
+    "response_execution_submitted": "response.execution.observe",
+    "response_execution_observed": "response.execution.observe",
+}
+
+
 @dataclass
 class FakeEventLedger:
-    """In-memory domain_event store (no real outbox dispatch)."""
+    """In-memory domain_event store.
+
+    When an ``outbox`` store is attached it mirrors the real ledger's behaviour:
+    an event whose type has a destination also enqueues one outbox delivery,
+    honouring a delayed ``available_at`` (used by durable reconciliation).
+    """
 
     events: list[Any] = field(default_factory=list)
     revisions: dict[UUID, int] = field(default_factory=dict)
+    outbox: Any = None
 
-    async def append(self, event: Any, *, aggregate_revision: int) -> None:
+    async def append(
+        self,
+        event: Any,
+        *,
+        aggregate_revision: int,
+        available_at: Any = None,
+    ) -> None:
         self.events.append(event)
         self.revisions[event.aggregate_id] = aggregate_revision
+        destination = FAKE_EVENT_DESTINATIONS.get(event.event_type)
+        if destination is not None and self.outbox is not None:
+            self.outbox.enqueue(
+                event.event_id, destination=destination, available_at=available_at
+            )
 
     async def get(self, *, event_id: UUID) -> DomainEventEnvelope | None:
         for event in self.events:
@@ -466,8 +498,26 @@ class FakeInvestigationRepository:
 
 
 class FakeEvidenceRepository:
-    def __init__(self) -> None:
+    """In-memory evidence store, tenant-scoped exactly like the SQL implementation.
+
+    The SQL repository resolves a tenant by JOINing ``investigation``; the fake
+    mirrors that by consulting the (shared) investigation store, so a foreign
+    tenant's evidence can never resolve through ``find_by_ids``. Without the
+    investigations reference the fake would be MORE permissive than production and
+    would silently pass tenant-isolation tests it should fail.
+    """
+
+    def __init__(
+        self, investigations: FakeInvestigationRepository | None = None
+    ) -> None:
         self._store: dict[UUID, Evidence] = {}
+        self._investigations = investigations
+
+    def _in_tenant(self, *, tenant_id: str, investigation_id: UUID) -> bool:
+        if self._investigations is None:
+            return True
+        inv = self._investigations._store.get(investigation_id)
+        return inv is not None and inv.tenant_id == tenant_id
 
     async def add(self, evidence: Evidence) -> None:
         self._store[evidence.id] = evidence
@@ -475,6 +525,10 @@ class FakeEvidenceRepository:
     async def list_by_investigation(
         self, *, tenant_id: str, investigation_id: UUID
     ) -> list[Evidence]:
+        if not self._in_tenant(
+            tenant_id=tenant_id, investigation_id=investigation_id
+        ):
+            return []
         return [e for e in self._store.values() if e.investigation_id == investigation_id]
 
     async def find_existing_dedup_keys(
@@ -489,6 +543,10 @@ class FakeEvidenceRepository:
     async def find_by_ids(
         self, *, tenant_id: str, investigation_id: UUID, evidence_ids: list[UUID]
     ) -> list[Evidence]:
+        if not self._in_tenant(
+            tenant_id=tenant_id, investigation_id=investigation_id
+        ):
+            return []
         return [
             e
             for e in self._store.values()
@@ -633,8 +691,24 @@ class FakeResultRepository:
 
 
 class FakeResponseProposalRepository:
-    def __init__(self) -> None:
+    """In-memory proposal store, tenant-scoped exactly like the SQL repository.
+
+    The SQL repository scopes every read by JOINing ``investigation`` for the
+    tenant; the fake mirrors that through the (shared) investigation store so a
+    wrong-tenant lookup can never resolve. Without the reference the fake would be
+    MORE permissive than production and would silently pass tenant-isolation tests
+    it should fail.
+    """
+
+    def __init__(self, investigations: FakeInvestigationRepository | None = None) -> None:
         self._store: dict[UUID, ResponseProposal] = {}
+        self._investigations = investigations
+
+    def in_tenant(self, proposal: ResponseProposal, tenant_id: str) -> bool:
+        if self._investigations is None:
+            return True
+        inv = self._investigations._store.get(proposal.investigation_id)
+        return inv is not None and inv.tenant_id == tenant_id
 
     async def add(self, proposal: ResponseProposal) -> None:
         self._store[proposal.id] = proposal
@@ -645,13 +719,18 @@ class FakeResponseProposalRepository:
     async def get(
         self, *, tenant_id: str, proposal_id: UUID
     ) -> ResponseProposal | None:
-        return self._store.get(proposal_id)
+        proposal = self._store.get(proposal_id)
+        if proposal is None or not self.in_tenant(proposal, tenant_id):
+            return None
+        return proposal
 
     async def get_by_investigation(
         self, *, tenant_id: str, investigation_id: UUID
     ) -> ResponseProposal | None:
         for proposal in self._store.values():
-            if proposal.investigation_id == investigation_id:
+            if proposal.investigation_id == investigation_id and self.in_tenant(
+                proposal, tenant_id
+            ):
                 return proposal
         return None
 
@@ -659,15 +738,26 @@ class FakeResponseProposalRepository:
         self, *, tenant_id: str, result_id: UUID
     ) -> ResponseProposal | None:
         for proposal in self._store.values():
-            if proposal.result_id == result_id:
+            if proposal.result_id == result_id and self.in_tenant(proposal, tenant_id):
                 return proposal
         return None
 
 
 class FakeResponseApprovalRepository:
-    def __init__(self) -> None:
+    """In-memory approval store, tenant-scoped via the owning proposal."""
+
+    def __init__(
+        self, proposals: FakeResponseProposalRepository | None = None
+    ) -> None:
         self._requests: dict[UUID, ApprovalRequest] = {}
         self._decisions: dict[UUID, ApprovalDecision] = {}
+        self._proposals = proposals
+
+    def _request_in_tenant(self, request: ApprovalRequest, tenant_id: str) -> bool:
+        if self._proposals is None:
+            return True
+        proposal = self._proposals._store.get(request.proposal_id)
+        return proposal is not None and self._proposals.in_tenant(proposal, tenant_id)
 
     async def add_request(self, request: ApprovalRequest) -> None:
         self._requests[request.id] = request
@@ -675,13 +765,18 @@ class FakeResponseApprovalRepository:
     async def get_request(
         self, *, tenant_id: str, approval_request_id: UUID
     ) -> ApprovalRequest | None:
-        return self._requests.get(approval_request_id)
+        request = self._requests.get(approval_request_id)
+        if request is None or not self._request_in_tenant(request, tenant_id):
+            return None
+        return request
 
     async def get_request_by_proposal(
         self, *, tenant_id: str, proposal_id: UUID
     ) -> ApprovalRequest | None:
         for request in self._requests.values():
-            if request.proposal_id == proposal_id:
+            if request.proposal_id == proposal_id and self._request_in_tenant(
+                request, tenant_id
+            ):
                 return request
         return None
 
@@ -697,8 +792,19 @@ class FakeResponseApprovalRepository:
 
 
 class FakeResponseExecutionRepository:
-    def __init__(self) -> None:
+    """In-memory execution-ref store, tenant-scoped via the owning proposal."""
+
+    def __init__(
+        self, proposals: FakeResponseProposalRepository | None = None
+    ) -> None:
         self._store: dict[UUID, ResponseExecutionRef] = {}
+        self._proposals = proposals
+
+    def _in_tenant(self, execution: ResponseExecutionRef, tenant_id: str) -> bool:
+        if self._proposals is None:
+            return True
+        proposal = self._proposals._store.get(execution.proposal_id)
+        return proposal is not None and self._proposals.in_tenant(proposal, tenant_id)
 
     async def add(self, execution: ResponseExecutionRef) -> None:
         self._store[execution.proposal_id] = execution
@@ -709,13 +815,18 @@ class FakeResponseExecutionRepository:
     async def get_by_proposal(
         self, *, tenant_id: str, proposal_id: UUID
     ) -> ResponseExecutionRef | None:
-        return self._store.get(proposal_id)
+        execution = self._store.get(proposal_id)
+        if execution is None or not self._in_tenant(execution, tenant_id):
+            return None
+        return execution
 
     async def get_by_execution_id(
         self, *, tenant_id: str, execution_id: str
     ) -> ResponseExecutionRef | None:
         for execution in self._store.values():
-            if execution.execution_id == execution_id:
+            if execution.execution_id == execution_id and self._in_tenant(
+                execution, tenant_id
+            ):
                 return execution
         return None
 
@@ -733,12 +844,16 @@ class FakeSoar:
         *,
         submit_result: SoarExecutionResult | None = None,
         status_sequence: list[str] | None = None,
+        submit_sequence: list[SoarExecutionResult] | None = None,
         raise_on_submit: Exception | None = None,
         raise_on_status: Exception | None = None,
     ) -> None:
         self.submit_result = submit_result or SoarExecutionResult(
             execution_id="hisiem-exec-1", status="SUCCEEDED"
         )
+        #: Successive submit results, drained one per ``submit_execution`` call. Used
+        #: to prove two proposals get DISTINCT real provider execution identities.
+        self.submit_sequence = list(submit_sequence or [])
         self.status_sequence = list(status_sequence or [])
         self.raise_on_submit = raise_on_submit
         self.raise_on_status = raise_on_status
@@ -766,6 +881,8 @@ class FakeSoar:
         )
         if self.raise_on_submit is not None:
             raise self.raise_on_submit
+        if self.submit_sequence:
+            return self.submit_sequence.pop(0)
         return self.submit_result
 
     async def get_execution_status(
@@ -801,7 +918,7 @@ class FakeUnitOfWork:
         )
 
         self.investigations: InvestigationRepository = FakeInvestigationRepository()
-        self.evidence: EvidenceRepository = FakeEvidenceRepository()
+        self.evidence: EvidenceRepository = FakeEvidenceRepository(self.investigations)
         self.findings: FindingRepository = FakeFindingRepository()
         self.hypotheses: HypothesisRepository = FakeHypothesisRepository()
         self.hypothesis_assessments: HypothesisAssessmentRepository = (
@@ -810,15 +927,16 @@ class FakeUnitOfWork:
         self.plan_revisions: PlanRevisionRepository = FakePlanRevisionRepository()
         self.results: ResultRepository = FakeResultRepository()
         self.response_proposals: ResponseProposalRepository = (
-            FakeResponseProposalRepository()
+            FakeResponseProposalRepository(self.investigations)
         )
         self.response_approvals: ResponseApprovalRepository = (
-            FakeResponseApprovalRepository()
+            FakeResponseApprovalRepository(self.response_proposals)
         )
         self.response_executions: ResponseExecutionRepository = (
-            FakeResponseExecutionRepository()
+            FakeResponseExecutionRepository(self.response_proposals)
         )
-        self.events = FakeEventLedger()
+        self.outbox = FakeOutboxStore()
+        self.events = FakeEventLedger(outbox=self.outbox)
         self.command_receipts = FakeCommandReceiptStore()
         self.bindings = FakeOrchestrationBindingStore()
         self.tool_invocations = FakeToolInvocationStore()
@@ -858,16 +976,23 @@ class FakeUnitOfWorkFactory:
 
     def __init__(self) -> None:
         self._investigations = FakeInvestigationRepository()
-        self._evidence = FakeEvidenceRepository()
+        self._evidence = FakeEvidenceRepository(self._investigations)
         self._findings = FakeFindingRepository()
         self._hypotheses = FakeHypothesisRepository()
         self._assessments = FakeHypothesisAssessmentRepository(self._hypotheses)
         self._plans = FakePlanRevisionRepository()
         self._results = FakeResultRepository()
-        self._response_proposals = FakeResponseProposalRepository()
-        self._response_approvals = FakeResponseApprovalRepository()
-        self._response_executions = FakeResponseExecutionRepository()
-        self.events = FakeEventLedger()
+        self._response_proposals = FakeResponseProposalRepository(
+            self._investigations
+        )
+        self._response_approvals = FakeResponseApprovalRepository(
+            self._response_proposals
+        )
+        self._response_executions = FakeResponseExecutionRepository(
+            self._response_proposals
+        )
+        self.outbox = FakeOutboxStore()
+        self.events = FakeEventLedger(outbox=self.outbox)
         self.command_receipts = FakeCommandReceiptStore()
         self.bindings = FakeOrchestrationBindingStore()
         self.tool_invocations = FakeToolInvocationStore()

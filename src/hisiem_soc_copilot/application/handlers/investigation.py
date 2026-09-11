@@ -401,7 +401,6 @@ class InvestigationCommandHandler:
         if investigation.status in (
             InvestigationStatus.CREATED,
             InvestigationStatus.RUNNING,
-            InvestigationStatus.WAITING_APPROVAL,
         ):
             actor = ActorRef(
                 subject_id=command.initiated_by_subject,

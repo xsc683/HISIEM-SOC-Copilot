@@ -13,6 +13,17 @@ from uuid import UUID
 from ..shared.identifiers import utc_now
 
 
+def submission_key(tenant_id: str, proposal_id: UUID) -> str:
+    """Stable idempotency identity for ONE logical provider execution.
+
+    Deterministic across worker retries and crashes — the same proposal always
+    presents the same key to HISIEM, so a replay converges on one provider
+    execution instead of creating a second one. It is presented as the
+    ``Idempotency-Key`` header (and must stay within HISIEM's 128-char bound).
+    """
+    return f"response:{tenant_id}:{proposal_id}"
+
+
 @dataclass(frozen=True)
 class ApprovalRequest:
     """An approval request bound to an exact proposal content revision/hash."""

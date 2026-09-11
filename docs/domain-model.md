@@ -609,21 +609,23 @@ ResponseProposal 1 ── 0..1 ResponseExecutionRef
 
 ## 33. Investigation Status
 
-V1 业务状态：
+V1 业务状态（仅描述调查本身）：
 
 ```text
 CREATED
 RUNNING
-WAITING_APPROVAL
-EXECUTING_RESPONSE
 COMPLETED
 FAILED
 CANCELLED
 ```
 
-这些状态表示业务生命周期。
+这些状态表示 Investigation 自身的业务生命周期。
 
-PLANNING、TOOL_CALLING、LLM_REASONING、RAG_RETRIEVAL、VERIFYING_NODE 等运行时概念不得作为 Investigation Status。
+`WAITING_APPROVAL`、`EXECUTING_RESPONSE` 等响应工作流状态**不属于** Investigation Status。
+Response 是 Investigation 到达 `COMPLETED` **之后**才开始的独立聚合生命周期；
+审批、驳回、提交、执行观察均**不得改变** `Investigation.status`。
+
+PLANNING、TOOL_CALLING、LLM_REASONING、RAG_RETRIEVAL、VERIFYING_NODE 等运行时概念同样不得作为 Investigation Status。
 
 ## 34. Investigation Phase
 
@@ -652,29 +654,49 @@ Phase 可以循环；Status 保持稳定。
           / verify │
                loop
                     │
-             ┌──────┴──────┐
-             │             │
-             ▼             ▼
-        COMPLETED    WAITING_APPROVAL
-                           │
-                   ┌───────┴───────┐
-                   │               │
-                reject          approve
-                   │               │
-                   ▼               ▼
-              COMPLETED    EXECUTING_RESPONSE
-                                   │
-                         execution terminal
-                                   │
-                                   ▼
-                              COMPLETED
+                    ▼
+                COMPLETED
 ```
 
-额外终止路径：CREATED / RUNNING / WAITING_APPROVAL → CANCELLED。
+额外终止路径：CREATED / RUNNING → CANCELLED。
 
 系统不可恢复错误：CREATED / RUNNING → FAILED。
 
+响应工作流是**独立于本状态机**的聚合生命周期，从 `COMPLETED` 之后开始，见 §35.1。
+本状态机不再包含任何响应节点。
+
+## 35.1 Response 工作流生命周期（独立聚合）
+
+Response 工作流在 Investigation 到达 `COMPLETED` 之后才开始，并且**永不回写** `Investigation.status`。
+
+```text
+ResponseProposal
+   CREATED ──▶ WAITING_APPROVAL ──▶ APPROVED ──▶ SUBMITTED
+      │               │
+      │               └──▶ REJECTED / DENIED
+      └──▶ DENIED
+```
+
+| 状态 | 含义 | 允许操作 |
+|---|---|---|
+| CREATED | 已创建，尚未进入审批 | Read |
+| WAITING_APPROVAL | 已有 ApprovalRequest，等待人工决策 | Approve、Reject、Read |
+| APPROVED | 人工已批准；提交命令已持久化，但尚未取得 HISIEM 执行引用 | Read |
+| REJECTED | 人工驳回 | Read |
+| DENIED | 策略拒绝 | Read |
+| SUBMITTED | HISIEM 已返回真实 `execution_id`，Copilot 持有 ResponseExecutionRef | Read、Observe |
+
+关键不变量：`APPROVED` 且 `execution_ref` 为空时，本地只有一份**持久化提交意图**，
+此时不得展示任何外部执行编号（也不得用 `proposal_id` 顶替）；
+`SUBMITTED` 必须携带非空 `execution_ref`。
+
+响应审批事务内只允许：持久化 ApprovalDecision、`WAITING_APPROVAL → APPROVED`、
+持久化 `response_execution_queued` 事件、原子写入 outbox 投递；**不得**在该事务内创建 ResponseExecutionRef。
+ResponseExecutionRef 只能在提交 worker 拿到 HISIEM 返回的**真实非空 execution_id** 之后创建。
+
 ## 36. 合法状态转换
+
+### 36.1 Investigation 聚合合法转换
 
 | From | Command | To |
 |---|---|---|
@@ -682,16 +704,18 @@ Phase 可以循环；Status 保持稳定。
 | CREATED | CancelInvestigation | CANCELLED |
 | CREATED | FailStart | FAILED |
 | RUNNING | ContinueInvestigation | RUNNING |
-| RUNNING | FinalizeWithoutResponse | COMPLETED |
-| RUNNING | RequestResponseApproval | WAITING_APPROVAL |
+| RUNNING | FinalizeInvestigationResult | COMPLETED |
 | RUNNING | CancelInvestigation | CANCELLED |
 | RUNNING | FailInvestigation | FAILED |
-| WAITING_APPROVAL | RejectResponse | COMPLETED |
-| WAITING_APPROVAL | ApproveResponse | EXECUTING_RESPONSE |
-| WAITING_APPROVAL | CancelInvestigation | CANCELLED |
-| EXECUTING_RESPONSE | ObserveTerminalExecution | COMPLETED |
 
 未列出的状态转换全部非法。终态 `COMPLETED / FAILED / CANCELLED` 不得恢复。
+
+Investigation 聚合上**不存在** `RequestResponseApproval` / `RejectResponse` / `ApproveResponse` / `ObserveTerminalExecution` 命令：
+响应审批与执行只作用于 Response 聚合，不会产生任何 Investigation 状态迁移。
+
+### 36.2 Response 聚合合法转换
+
+见 §35.1。这些转换不出现在 §36.1，因为它们不改变 `Investigation.status`。
 
 ## 37. Status 操作约束
 
@@ -699,13 +723,16 @@ Phase 可以循环；Status 保持稳定。
 |---|---|
 | CREATED | Start、Cancel |
 | RUNNING | Read Tool、Add Evidence、Revise Plan、Assess Hypothesis、Create Finding、Finalize、Cancel |
-| WAITING_APPROVAL | Approve、Reject、Cancel、Read |
-| EXECUTING_RESPONSE | Observe Execution、Read |
-| COMPLETED | Read only |
+| COMPLETED | Read only；可作为 Response 聚合的归属对象 |
 | FAILED | Read only |
 | CANCELLED | Read only |
 
-进入 EXECUTING_RESPONSE 后，`Cancel Investigation` 不再允许。未来如需取消 SOAR Execution，必须提供独立业务命令。
+Investigation 到达终态后**不再接受任何状态变更**。
+Response 聚合通过 `link_response_proposal` 与已完成的 Investigation 建立关联：
+仅允许 COMPLETED；已有值时同值幂等、异值确定性冲突；
+且不得改变 `status` / `finished_at` / `termination_reason`，也不得重新打开已终止的 Investigation。
+
+SOAR Execution 的取消不属于 Investigation 命令；未来如需取消，必须提供独立的 Response 业务命令。
 
 ## 38. FAILED 与 INCONCLUSIVE
 

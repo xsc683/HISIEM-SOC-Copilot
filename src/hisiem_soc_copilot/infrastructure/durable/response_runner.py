@@ -1,22 +1,32 @@
-"""Durable response-execution worker.
+"""Durable response-execution workers: SUBMIT and OBSERVE.
 
-Consumes a ``response_execution_queued`` outbox delivery and performs the ONE
-approved side effect through the :class:`SoarPort`. It is UNTRUSTED-INPUT-FREE: it
-is handed only persisted identifiers (proposal_id, tenant_id) and RELOADS the
-authoritative approved contract from the database before submitting — it never
-executes a payload carried in the queue, and it NEVER calls the LLM (spec §16/§17).
+The response side effect has TWO distinct durable responsibilities (spec §3):
 
-Idempotency: the stable ``submission_key`` on the execution ref is presented to
-HISIEM on every (re)submission, so a retry converges on ONE provider execution.
-A definitive provider rejection is persisted as FAILED (and the outbox row is
-acknowledged); a transport/transient error is re-raised so the dispatcher retries
-with backoff (spec §25/§26/§48).
+``ResponseSubmitRunner`` (destination ``response.execution.submit``)
+    Consumes a ``response_execution_queued`` delivery and performs the ONE approved
+    submission. It RELOADS the authoritative approved contract from the database
+    (never a queue payload), presents the STABLE deterministic ``submission_key`` as
+    HISIEM's idempotency key, and only after HISIEM returns a REAL, non-empty
+    execution id does it create the ``ResponseExecutionRef`` and transition the
+    proposal APPROVED → SUBMITTED — in the same local transaction. It never calls
+    the LLM (spec §16/§17).
+
+``ResponseObserveRunner`` (destination ``response.execution.observe``)
+    Advances an ALREADY-SUBMITTED execution toward a terminal state with at most a
+    small bounded number of HISIEM GETs per delivery. A terminal provider status is
+    settled and reconciliation stops. A non-terminal status (QUEUED/RUNNING/
+    WAITING/WAITING_HUMAN) is persisted as an observation and the next observation is
+    DURABLY scheduled by appending ``response_execution_observed`` with a future
+    ``available_at`` — it is deliberately NOT signalled by raising a retry exception,
+    because a legitimately RUNNING execution is not a failure and must never exhaust
+    ``_MAX_ATTEMPTS`` into DEAD_LETTER. Reconciliation therefore survives process
+    restart and an execution may run for minutes or hours without being lost.
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from ...application.errors import ExternalServiceError
@@ -25,87 +35,207 @@ from ...application.ports.unit_of_work import UnitOfWork
 from ...domain.response.aggregate import ResponseProposal
 from ...domain.response.enums import ResponseProposalStatus
 from ...domain.response.events import (
+    ResponseEvent,
     response_execution_failed,
+    response_execution_observed,
     response_execution_started,
+    response_execution_submitted,
     response_execution_succeeded,
 )
-from ...domain.response.value_objects import ResponseExecutionRef
+from ...domain.response.value_objects import ResponseExecutionRef, submission_key
 from ...domain.shared.identifiers import utc_now
 from .investigation_runner import NonRetryableRunError
 
+_PROVIDER = "hisiem"
 _TERMINAL = {"SUCCEEDED", "FAILED"}
 # A definitive (non-retryable) provider rejection: a bad request/action/target.
 _DEFINITIVE_CODES = {"SOAR_NOT_FOUND", "SOAR_CONFIGURATION"}
+# 4xx responses that are nevertheless TRANSIENT: the provider is throttling us or
+# the request timed out in flight. Classifying them as definitive would permanently
+# settle a still-RUNNING provider execution as FAILED (observe) or dead-letter a
+# perfectly valid approved submission (submit) — the provider, which owns the
+# execution, would then disagree with our record forever. They stay retryable.
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429})
 
 
-class ResponseExecutionRunner:
-    """Reloads an approved proposal and submits it to HISIEM SOAR (durable)."""
+class ResponseSubmitRunner:
+    """Submits ONE approved proposal to HISIEM SOAR exactly once (idempotency-keyed)."""
 
     def __init__(
         self,
         *,
         unit_of_work_factory: Callable[[], UnitOfWork],
         soar: SoarPort,
-        max_poll_attempts: int = 30,
-        poll_interval_seconds: float = 1.0,
+        observe_delay_seconds: float = 15.0,
     ) -> None:
         self._uow_factory = unit_of_work_factory
         self._soar = soar
-        self._max_poll_attempts = max_poll_attempts
-        self._poll_interval = poll_interval_seconds
+        self._observe_delay = timedelta(seconds=observe_delay_seconds)
 
     async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
         proposal_id = UUID(aggregate_id)
-        loaded = await self._load(tenant_id=tenant_id, proposal_id=proposal_id)
-        if loaded is None:
-            # The queued event's proposal vanished — nothing to execute.
+        uow = self._uow_factory()
+        try:
+            proposal = await uow.response_proposals.get(
+                tenant_id=tenant_id, proposal_id=proposal_id
+            )
+            if proposal is None:
+                return  # the queued event's proposal vanished — nothing to submit
+            execution = await uow.response_executions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=proposal_id
+            )
+        finally:
+            await uow.close()
+
+        if execution is not None:
+            # A provider execution identity is already durably attached: a duplicate
+            # submit delivery CONVERGES (no-op) and never executes a second time.
             return
-        proposal, execution = loaded
-        if execution.status in _TERMINAL:
-            return  # already settled; a duplicate delivery is a no-op
-        if proposal.status != ResponseProposalStatus.APPROVED:
-            # A non-approved proposal must never execute — deterministic config fault.
-            # (``approval_request_id`` is a transient link set during the decide
-            # transaction; the authoritative, reloadable fact is the APPROVED status,
-            # which is reachable only through a recorded human approval.)
+        if proposal.status is ResponseProposalStatus.SUBMITTED:
+            # Already converged without a ref row: nothing to submit.
+            return
+        if proposal.status is not ResponseProposalStatus.APPROVED:
+            # Only a recorded human approval enqueues this delivery, so any other
+            # status is a deterministic fault — never retryable.
             raise NonRetryableRunError(code="RESPONSE_NOT_APPROVED")
 
         target_ref = proposal.target_refs[0] if proposal.target_refs else None
         if target_ref is None:
-            await self._fail_execution(
-                tenant_id, execution, "RESPONSE_NO_TARGET", "approved proposal has no target"
-            )
-            return
+            # No target ⇒ nothing may be submitted. There is no provider execution,
+            # therefore NO ResponseExecutionRef row is fabricated for this failure.
+            raise NonRetryableRunError(code="RESPONSE_NO_TARGET")
 
+        key = submission_key(tenant_id, proposal.id)
         try:
             result = await self._soar.submit_execution(
                 tenant_id=tenant_id,
                 proposal_id=proposal.id,
-                submission_key=execution.submission_key,
+                submission_key=key,
                 action_key=proposal.action_key,
                 parameters=dict(proposal.parameters),
                 target_ref=target_ref,
             )
         except ExternalServiceError as exc:
             if _is_definitive(exc):
-                await self._fail_execution(
-                    tenant_id,
-                    execution,
-                    exc.upstream_code or "SOAR_REJECTED",
-                    _safe_message(exc),
-                )
-                return
-            raise  # transient → dispatcher retries with backoff
+                # HISIEM definitively rejected the submission and created NO execution.
+                # The proposal therefore legitimately remains APPROVED (no provider
+                # execution identity exists to attach) and the delivery is dead-lettered
+                # with a bounded code — never retried, never given a fake execution id.
+                raise NonRetryableRunError(
+                    code=exc.upstream_code or "SOAR_REJECTED"
+                ) from None
+            raise  # transient → dispatcher retries with the SAME idempotency key
 
-        result = await self._poll_to_terminal(
-            tenant_id=tenant_id, execution_id=result.execution_id, last=result
+        if not result.execution_id:
+            # HISIEM's contract is to return a real execution id. An empty one would
+            # mean we cannot durably identify the execution, so we must not persist a
+            # fabricated/placeholder identity — retry (same key ⇒ same execution).
+            raise RuntimeError("SOAR submit returned no execution id")
+
+        await self._attach_and_mark_submitted(
+            tenant_id=tenant_id,
+            proposal=proposal,
+            key=key,
+            result=result,
         )
-        await self._settle(tenant_id, execution, result)
 
     # ------------------------------------------------------------------
-    async def _load(
-        self, *, tenant_id: str, proposal_id: UUID
-    ) -> tuple[ResponseProposal, ResponseExecutionRef] | None:
+    async def _attach_and_mark_submitted(
+        self,
+        *,
+        tenant_id: str,
+        proposal: ResponseProposal,
+        key: str,
+        result: SoarExecutionResult,
+    ) -> None:
+        """Create the provider projection + SUBMIT the proposal atomically.
+
+        Crash-after-provider-create-before-local-commit is safe: the retry presents
+        the SAME ``Idempotency-Key``, HISIEM returns the SAME execution, and this
+        local persist then completes — one logical execution, one provider execution.
+        """
+        now = utc_now()
+        terminal = result.status in _TERMINAL
+        execution = ResponseExecutionRef(
+            proposal_id=proposal.id,
+            provider=_PROVIDER,
+            execution_id=result.execution_id,
+            submission_key=key,
+            status=result.status,
+            submitted_at=now,
+            last_observed_at=now,
+            started_at=now,
+            finished_at=now if terminal else None,
+            safe_result=dict(result.safe_result) or None,
+            safe_error_code=result.safe_error_code,
+            safe_error_message=result.safe_error_message,
+        )
+
+        uow = self._uow_factory()
+        try:
+            reloaded = await uow.response_proposals.get(
+                tenant_id=tenant_id, proposal_id=proposal.id
+            )
+            if reloaded is None:
+                return
+            existing = await uow.response_executions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=proposal.id
+            )
+            if existing is not None:
+                # A concurrent delivery already attached a real execution: converge.
+                return
+            if reloaded.status is not ResponseProposalStatus.APPROVED:
+                # SUBMITTED already converged, or a decision changed underneath us:
+                # never submit a non-approved contract.
+                return
+
+            await uow.response_executions.add(execution)
+            reloaded.mark_submitted(execution)
+            await uow.response_proposals.update(reloaded)
+
+            await uow.events.append(
+                response_execution_started(proposal.id, tenant_id=tenant_id),
+                aggregate_revision=reloaded.lock_version,
+            )
+            if terminal:
+                await uow.events.append(
+                    _terminal_event(proposal.id, tenant_id, result),
+                    aggregate_revision=reloaded.lock_version,
+                )
+            else:
+                # Enqueues the FIRST observe delivery — durable reconciliation.
+                await uow.events.append(
+                    response_execution_submitted(
+                        proposal.id,
+                        external_execution_id=result.execution_id,
+                        tenant_id=tenant_id,
+                    ),
+                    aggregate_revision=reloaded.lock_version,
+                    available_at=utc_now() + self._observe_delay,
+                )
+            await uow.commit()
+        finally:
+            await uow.close()
+
+
+class ResponseObserveRunner:
+    """Reconciles ONE submitted execution toward a terminal state (durable)."""
+
+    def __init__(
+        self,
+        *,
+        unit_of_work_factory: Callable[[], UnitOfWork],
+        soar: SoarPort,
+        observe_delay_seconds: float = 15.0,
+        status_checks_per_delivery: int = 1,
+    ) -> None:
+        self._uow_factory = unit_of_work_factory
+        self._soar = soar
+        self._observe_delay = timedelta(seconds=observe_delay_seconds)
+        self._checks = max(1, status_checks_per_delivery)
+
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
+        proposal_id = UUID(aggregate_id)
         uow = self._uow_factory()
         try:
             proposal = await uow.response_proposals.get(
@@ -114,119 +244,220 @@ class ResponseExecutionRunner:
             execution = await uow.response_executions.get_by_proposal(
                 tenant_id=tenant_id, proposal_id=proposal_id
             )
-            if proposal is None or execution is None:
-                return None
-            return proposal, execution
         finally:
             await uow.close()
 
-    async def _poll_to_terminal(
-        self, *, tenant_id: str, execution_id: str, last: SoarExecutionResult
-    ) -> SoarExecutionResult:
-        result = last
-        for _ in range(self._max_poll_attempts):
-            if result.status in _TERMINAL:
-                return result
-            await asyncio.sleep(self._poll_interval)
-            result = await self._soar.get_execution_status(
-                tenant_id=tenant_id, execution_id=execution_id
-            )
-        return result
+        if proposal is None or execution is None:
+            return  # nothing submitted yet — a queued observe is a no-op
+        if execution.status in _TERMINAL:
+            # A terminal execution no longer schedules observation.
+            return
+        if proposal.status is not ResponseProposalStatus.SUBMITTED:
+            return
+        if not execution.execution_id:
+            raise NonRetryableRunError(code="RESPONSE_NO_EXECUTION_ID")
 
-    async def _settle(
+        last: SoarExecutionResult | None = None
+        for _ in range(self._checks):
+            try:
+                result = await self._soar.get_execution_status(
+                    tenant_id=tenant_id, execution_id=execution.execution_id
+                )
+            except ExternalServiceError as exc:
+                if _is_definitive(exc):
+                    await self._settle_terminal_failure(
+                        tenant_id=tenant_id,
+                        execution=execution,
+                        error_code=exc.upstream_code or "SOAR_REJECTED",
+                        error_message=_safe_message(exc),
+                    )
+                    return
+                raise  # transient → dispatcher retries with backoff
+
+            if result.status in _TERMINAL:
+                await self._settle_terminal(
+                    tenant_id=tenant_id, execution=execution, result=result
+                )
+                return
+            # Still running: keep the remaining (bounded) checks of THIS delivery,
+            # then hand off to the durable reschedule below.
+            last = result
+
+        assert last is not None  # _checks >= 1 guarantees at least one attempt
+        await self._settle_nonterminal(
+            tenant_id=tenant_id, execution=execution, result=last
+        )
+
+    # ------------------------------------------------------------------
+    async def _settle_nonterminal(
         self,
+        *,
+        tenant_id: str,
+        execution: ResponseExecutionRef,
+        result: SoarExecutionResult,
+    ) -> None:
+        """Persist the observation and DURABLY schedule the next one."""
+        now = utc_now()
+        observed = _observed_ref(execution, status=result.status, now=now, result=result)
+        uow = self._uow_factory()
+        try:
+            current = await uow.response_executions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=execution.proposal_id
+            )
+            if current is None or current.status in _TERMINAL:
+                return  # already settled by another delivery
+            await uow.response_executions.update(observed)
+            await uow.events.append(
+                response_execution_observed(
+                    execution.proposal_id,
+                    external_execution_id=execution.execution_id,
+                    status=result.status,
+                    tenant_id=tenant_id,
+                ),
+                aggregate_revision=0,
+                available_at=now + self._observe_delay,
+            )
+            await uow.commit()
+        finally:
+            await uow.close()
+
+    async def _settle_terminal(
+        self,
+        *,
         tenant_id: str,
         execution: ResponseExecutionRef,
         result: SoarExecutionResult,
     ) -> None:
         now = utc_now()
-        status = result.status if result.status in _TERMINAL else "RUNNING"
-        updated = ResponseExecutionRef(
-            proposal_id=execution.proposal_id,
-            provider=execution.provider,
-            execution_id=result.execution_id,
-            submission_key=execution.submission_key,
-            status=status,
-            submitted_at=execution.submitted_at,
-            last_observed_at=now,
-            started_at=execution.started_at or execution.submitted_at,
-            finished_at=now if status in _TERMINAL else None,
-            safe_result=dict(result.safe_result) or None,
-            safe_error_code=result.safe_error_code,
-            safe_error_message=result.safe_error_message,
+        settled = _observed_ref(
+            execution,
+            status=result.status,
+            now=now,
+            result=result,
+            finished_at=now,
         )
-        uow = self._uow_factory()
-        try:
-            await uow.response_executions.update(updated)
-            if status == "SUCCEEDED":
-                await uow.events.append(
-                    response_execution_succeeded(
-                        execution.proposal_id,
-                        external_execution_id=result.execution_id,
-                        tenant_id=tenant_id,
-                    ),
-                    aggregate_revision=0,
-                )
-            elif status == "RUNNING":
-                await uow.events.append(
-                    response_execution_started(
-                        execution.proposal_id, tenant_id=tenant_id
-                    ),
-                    aggregate_revision=0,
-                )
-            await uow.commit()
-        finally:
-            await uow.close()
+        await self._persist_terminal(
+            tenant_id=tenant_id,
+            execution=execution,
+            settled=settled,
+            event=_terminal_event(execution.proposal_id, tenant_id, result),
+        )
 
-    async def _fail_execution(
+    async def _settle_terminal_failure(
         self,
+        *,
         tenant_id: str,
         execution: ResponseExecutionRef,
         error_code: str,
         error_message: str,
     ) -> None:
         now = utc_now()
-        updated = ResponseExecutionRef(
-            proposal_id=execution.proposal_id,
-            provider=execution.provider,
-            execution_id=execution.execution_id,
-            submission_key=execution.submission_key,
+        settled = _observed_ref(
+            execution,
             status="FAILED",
-            submitted_at=execution.submitted_at,
-            last_observed_at=now,
-            started_at=execution.started_at or execution.submitted_at,
+            now=now,
+            result=None,
             finished_at=now,
             safe_error_code=error_code,
             safe_error_message=error_message,
         )
+        await self._persist_terminal(
+            tenant_id=tenant_id,
+            execution=execution,
+            settled=settled,
+            event=response_execution_failed(
+                execution.proposal_id, error_code=error_code, tenant_id=tenant_id
+            ),
+        )
+
+    async def _persist_terminal(
+        self,
+        *,
+        tenant_id: str,
+        execution: ResponseExecutionRef,
+        settled: ResponseExecutionRef,
+        event: ResponseEvent,
+    ) -> None:
         uow = self._uow_factory()
         try:
-            await uow.response_executions.update(updated)
-            await uow.events.append(
-                response_execution_failed(
-                    execution.proposal_id,
-                    error_code=error_code,
-                    tenant_id=tenant_id,
-                ),
-                aggregate_revision=0,
+            current = await uow.response_executions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=execution.proposal_id
             )
+            if current is None or current.status in _TERMINAL:
+                return  # idempotent: never re-settle a terminal execution
+            await uow.response_executions.update(settled)
+            await uow.events.append(event, aggregate_revision=0)
             await uow.commit()
         finally:
             await uow.close()
 
 
+def _observed_ref(
+    execution: ResponseExecutionRef,
+    *,
+    status: str,
+    now: datetime,
+    result: SoarExecutionResult | None,
+    finished_at: datetime | None = None,
+    safe_error_code: str | None = None,
+    safe_error_message: str | None = None,
+) -> ResponseExecutionRef:
+    return ResponseExecutionRef(
+        proposal_id=execution.proposal_id,
+        provider=execution.provider,
+        execution_id=execution.execution_id,
+        submission_key=execution.submission_key,
+        status=status,
+        submitted_at=execution.submitted_at,
+        last_observed_at=now,
+        started_at=execution.started_at or execution.submitted_at,
+        finished_at=finished_at,
+        safe_result=(
+            dict(result.safe_result) or None
+            if result is not None
+            else execution.safe_result
+        ),
+        safe_error_code=(
+            result.safe_error_code if result is not None else safe_error_code
+        ),
+        safe_error_message=(
+            result.safe_error_message if result is not None else safe_error_message
+        ),
+    )
+
+
+def _terminal_event(
+    proposal_id: UUID, tenant_id: str, result: SoarExecutionResult
+) -> ResponseEvent:
+    if result.status == "SUCCEEDED":
+        return response_execution_succeeded(
+            proposal_id,
+            external_execution_id=result.execution_id,
+            tenant_id=tenant_id,
+        )
+    return response_execution_failed(
+        proposal_id,
+        error_code=result.safe_error_code or "SOAR_EXECUTION_FAILED",
+        tenant_id=tenant_id,
+    )
+
+
 def _is_definitive(exc: ExternalServiceError) -> bool:
+    """Is this provider error a permanent rejection rather than a retryable blip?"""
     code = exc.upstream_code or ""
     if code in _DEFINITIVE_CODES:
         return True
     if code.startswith("HTTP_"):
         try:
-            return 400 <= int(code.removeprefix("HTTP_")) < 500
+            status = int(code.removeprefix("HTTP_"))
         except ValueError:
             return False
+        return 400 <= status < 500 and status not in _TRANSIENT_HTTP_STATUSES
     return False
 
 
 def _safe_message(exc: ExternalServiceError) -> str:
-    text = str(exc)
-    return text[:500]
+    return str(exc)[:500]
+
+
+__all__ = ["ResponseObserveRunner", "ResponseSubmitRunner"]

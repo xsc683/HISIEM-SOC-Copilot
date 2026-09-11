@@ -1,34 +1,24 @@
-"""Response workflow command-handler tests over in-memory fakes (P2).
+"""Response workflow command-handler tests over in-memory fakes (P2 closure).
 
-Covers the invariant "Agent recommends, human authorizes": every write requires an
-approval, approval binds the exact proposal revision+content_hash, reject produces
-zero execution, and a duplicate decision can never create a second logical
-execution.
+Covers the two load-bearing invariants:
+
+* "Agent can recommend; Agent cannot authorize." — every write requires an
+  immutable human approval, and approval binds the exact proposal revision+hash.
+* "Data can inform decisions; Data cannot authorize actions." — the action TARGET
+  is derived from the persisted Investigation source alert and the supporting
+  evidence is re-resolved authoritatively; no browser-supplied identity is ever
+  persisted (spec §1), and approval creates a durable SUBMISSION INTENT — never a
+  fabricated provider execution reference (spec §2).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
-from hisiem_soc_copilot.application.commands.response import (
-    CreateResponseProposal,
-    DecideResponseApproval,
-)
-from hisiem_soc_copilot.application.handlers.response import ResponseCommandHandler
-from hisiem_soc_copilot.domain.investigation.aggregate import Investigation
-from hisiem_soc_copilot.domain.investigation.entities import (
-    InvestigationResult,
-    Verdict,
-)
+from hisiem_soc_copilot.application.commands.response import DecideResponseApproval
 from hisiem_soc_copilot.domain.investigation.enums import VerdictDisposition
-from hisiem_soc_copilot.domain.investigation.value_objects import (
-    ActorRef,
-    BudgetLimits,
-    ExternalResourceRef,
-)
 from hisiem_soc_copilot.domain.response.actions import ResponseActionUnsupportedError
 from hisiem_soc_copilot.domain.response.enums import (
     ApprovalDecisionKind,
@@ -37,207 +27,398 @@ from hisiem_soc_copilot.domain.response.enums import (
 from hisiem_soc_copilot.domain.response.errors import (
     ApprovalContractError,
     ApprovalDecisionAlreadyExistsError,
+    ResponseEvidenceInvalidError,
+    ResponseInvestigationNotCompletedError,
 )
 from hisiem_soc_copilot.domain.shared.errors import DomainError
 from tests.fixtures.fakes import FakeUnitOfWorkFactory
+from tests.fixtures.response_flow import (
+    ALERT,
+    OTHER_TENANT,
+    TENANT,
+    approval_request_id,
+    approve,
+    create_proposal,
+    handler,
+    seed_investigation,
+    target,
+)
 
-TENANT = "tenant-a"
-ALERT = "alert-0001"
-T0 = datetime(2026, 9, 1, 10, 0, 0, tzinfo=UTC)
-PLAYBOOK_ID = "11111111-2222-3333-4444-555555555555"
-
-
-def _target() -> ExternalResourceRef:
-    return ExternalResourceRef(
-        provider="hisiem", resource_type="alert", address_id=ALERT, business_id="AL-1"
-    )
-
-
-async def _seed(
-    factory: FakeUnitOfWorkFactory,
-    *,
-    disposition: VerdictDisposition = VerdictDisposition.MALICIOUS,
-) -> UUID:
-    investigation_id = uuid4()
-    inv = Investigation.create(
-        id=investigation_id,
-        tenant_id=TENANT,
-        source_alert_ref=_target(),
-        initiated_by=ActorRef(subject_id="analyst", tenant_id=TENANT),
-        budget_limits=BudgetLimits(),
-        now=T0,
-    )
-    inv.start(actor=ActorRef(subject_id="analyst", tenant_id=TENANT), now=T0)
-    inv.complete_without_response()
-    result = InvestigationResult(
-        id=uuid4(),
-        investigation_id=investigation_id,
-        verdict=Verdict(
-            disposition=disposition, summary="s", confidence=0.8
-        ),
-        finding_ids=[],
-        created_at=T0,
-    )
-    uow = factory()
-    await uow.investigations.add(inv)
-    await uow.results.add(result)
-    return investigation_id
+# ---------------------------------------------------------------------------
+# §1.1 — the target is DERIVED, never accepted from the caller
+# ---------------------------------------------------------------------------
 
 
-def _handler(factory: FakeUnitOfWorkFactory) -> ResponseCommandHandler:
-    return ResponseCommandHandler(unit_of_work_factory=factory)
-
-
-async def _create(factory: FakeUnitOfWorkFactory, investigation_id: UUID):
-    return await _handler(factory).create_response_proposal(
-        CreateResponseProposal(
-            tenant_id=TENANT,
-            investigation_id=investigation_id,
-            action_key="START_SOAR_PLAYBOOK",
-            target_ref=_target(),
-            evidence_ids=(uuid4(),),
-            parameters={"playbook_id": PLAYBOOK_ID},
-            reason="contain the intrusion",
-            initiated_by_subject="analyst",
-        )
-    )
-
-
-async def test_create_proposal_requires_approval() -> None:
+async def test_proposal_target_is_derived_from_the_persisted_source_alert() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
+    investigation_id, _ = seed_investigation(factory)
 
-    proposal = await _create(factory, investigation_id)
+    proposal = await create_proposal(factory, investigation_id)
 
+    investigation = await factory().investigations.get(
+        tenant_id=TENANT, investigation_id=investigation_id
+    )
+    assert investigation is not None
+    assert proposal.target_refs == [investigation.source_alert_ref]
+    assert proposal.target_refs[0].address_id == ALERT
     assert proposal.status == ResponseProposalStatus.WAITING_APPROVAL
     assert proposal.policy_decision is not None
     assert proposal.policy_decision.value == "REQUIRE_APPROVAL"
-    assert proposal.approval_request_id is not None
-    # investigation links the proposal (no status mutation — COMPLETED is terminal)
-    inv = await factory().investigations.get(
-        tenant_id=TENANT, investigation_id=investigation_id
-    )
-    assert inv is not None and inv.response_proposal_id == proposal.id
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
-    )
-    assert request is not None
-    assert request.proposal_content_revision == proposal.content_revision
-    assert request.proposal_content_hash == proposal.content_hash
-    kinds = {e.event_type for e in factory.events.events}
-    assert {
-        "response_proposal_created",
-        "response_policy_decided",
-        "response_approval_requested",
-    } <= kinds
 
 
-async def test_create_proposal_is_idempotent_per_investigation() -> None:
+async def test_create_command_carries_no_target_field() -> None:
+    """Structural proof: there is no caller-supplied target to forge (spec §1.1)."""
+    import dataclasses
+
+    from hisiem_soc_copilot.application.commands.response import CreateResponseProposal
+
+    names = {f.name for f in dataclasses.fields(CreateResponseProposal)}
+    assert "target_ref" not in names
+    assert "target" not in names
+    assert {"action_key", "evidence_ids", "parameters", "reason"} <= names
+
+
+async def test_proposal_requires_a_completed_investigation() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    first = await _create(factory, investigation_id)
-    second = await _create(factory, investigation_id)
-    assert first.id == second.id
+    investigation_id, _ = seed_investigation(factory, completed=False)
+
+    with pytest.raises(ResponseInvestigationNotCompletedError):
+        await create_proposal(factory, investigation_id)
+
+
+# ---------------------------------------------------------------------------
+# §1.2 — authoritative evidence resolution
+# ---------------------------------------------------------------------------
+
+
+async def test_evidence_of_this_investigation_is_accepted_and_resolved() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+
+    # The SERVER-RESOLVED identity is persisted, not the caller's raw string.
+    assert proposal.evidence_ids == [evidence_id]
+
+
+async def test_unknown_evidence_id_is_rejected() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, _ = seed_investigation(factory)
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await create_proposal(factory, investigation_id, evidence_ids=(uuid4(),))
+
+
+async def test_evidence_of_another_investigation_is_rejected() -> None:
+    """Same tenant, different Investigation — never resolvable in scope."""
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, _ = seed_investigation(factory)
+    _other_id, other_evidence_id = seed_investigation(
+        factory, alert="alert-9999", business_id="AL-9"
+    )
+    assert other_evidence_id is not None
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await create_proposal(
+            factory, investigation_id, evidence_ids=(other_evidence_id,)
+        )
+
+
+async def test_foreign_tenant_evidence_is_rejected() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, _ = seed_investigation(factory)
+    _foreign_id, foreign_evidence_id = seed_investigation(
+        factory, tenant_id=OTHER_TENANT, alert="alert-7777", business_id="AL-7"
+    )
+    assert foreign_evidence_id is not None
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await create_proposal(
+            factory, investigation_id, evidence_ids=(foreign_evidence_id,)
+        )
+
+
+async def test_mixed_scope_evidence_is_rejected_as_a_whole() -> None:
+    """One in-scope id cannot be used to smuggle an out-of-scope id through."""
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await create_proposal(
+            factory, investigation_id, evidence_ids=(evidence_id, uuid4())
+        )
+
+
+async def test_duplicate_evidence_ids_are_canonicalised_not_a_bypass() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id, evidence_id)
+    )
+    assert proposal.evidence_ids == [evidence_id]
+
+
+async def test_duplicate_cannot_smuggle_an_unresolvable_id_through() -> None:
+    """The canonicalised set is validated as a WHOLE — no count/set bypass."""
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await create_proposal(
+            factory,
+            investigation_id,
+            evidence_ids=(evidence_id, evidence_id, uuid4()),
+        )
+
+
+async def test_empty_evidence_is_rejected_by_the_handler() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, _ = seed_investigation(factory)
+
+    with pytest.raises(ResponseEvidenceInvalidError):
+        await handler(factory).create_response_proposal(
+            _command(investigation_id, evidence_ids=())
+        )
+
+
+def _command(investigation_id, *, evidence_ids: tuple[str, ...]):
+    from hisiem_soc_copilot.application.commands.response import CreateResponseProposal
+
+    return CreateResponseProposal(
+        tenant_id=TENANT,
+        investigation_id=investigation_id,
+        action_key="START_SOAR_PLAYBOOK",
+        evidence_ids=evidence_ids,
+        parameters={"playbook_id": "11111111-2222-3333-4444-555555555555"},
+        reason="contain the intrusion",
+        initiated_by_subject="analyst",
+    )
+
+
+# ---------------------------------------------------------------------------
+# bounded action contract + policy + investigation linkage
+# ---------------------------------------------------------------------------
 
 
 async def test_unsupported_action_is_rejected() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
     with pytest.raises(ResponseActionUnsupportedError):
-        await _handler(factory).create_response_proposal(
-            CreateResponseProposal(
-                tenant_id=TENANT,
-                investigation_id=investigation_id,
-                action_key="BLOCK_SOURCE_IP",
-                target_ref=_target(),
-                evidence_ids=(uuid4(),),
-                parameters={"ip": "203.0.113.9"},
-                reason="block attacker",
-                initiated_by_subject="analyst",
-            )
+        await create_proposal(
+            factory,
+            investigation_id,
+            evidence_ids=(evidence_id,),
+            action_key="BLOCK_SOURCE_IP",
+            parameters={"ip": "203.0.113.9"},
         )
 
 
 async def test_missing_required_parameter_is_rejected() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
     with pytest.raises(DomainError):
-        await _handler(factory).create_response_proposal(
-            CreateResponseProposal(
-                tenant_id=TENANT,
-                investigation_id=investigation_id,
-                action_key="START_SOAR_PLAYBOOK",
-                target_ref=_target(),
-                evidence_ids=(uuid4(),),
-                parameters={},
-                reason="missing playbook id",
-                initiated_by_subject="analyst",
-            )
+        await create_proposal(
+            factory, investigation_id, evidence_ids=(evidence_id,), parameters={}
         )
 
 
 async def test_inconclusive_verdict_is_policy_denied_without_approval() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(
+    investigation_id, evidence_id = seed_investigation(
         factory, disposition=VerdictDisposition.INCONCLUSIVE
     )
-    proposal = await _create(factory, investigation_id)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
     assert proposal.status == ResponseProposalStatus.DENIED
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
-    )
-    assert request is None
-
-
-async def test_approve_binds_exact_contract_and_queues_one_execution() -> None:
-    factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
-    )
-    assert request is not None
-
-    outcome = await _handler(factory).decide_response_approval(
-        DecideResponseApproval(
-            tenant_id=TENANT,
-            approval_request_id=request.id,
-            decision=ApprovalDecisionKind.APPROVE,
-            expected_revision=proposal.content_revision,
-            expected_content_hash=proposal.content_hash,
-            initiated_by_subject="operator",
+    assert (
+        await factory().response_approvals.get_request_by_proposal(
+            tenant_id=TENANT, proposal_id=proposal.id
         )
+        is None
     )
+
+
+async def test_create_proposal_is_idempotent_per_investigation() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    first = await create_proposal(factory, investigation_id, evidence_ids=(evidence_id,))
+    second = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+    assert first.id == second.id
+
+
+async def test_creating_a_proposal_links_it_to_the_investigation() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+
+    investigation = await factory().investigations.get(
+        tenant_id=TENANT, investigation_id=investigation_id
+    )
+    assert investigation is not None
+    assert investigation.response_proposal_id == proposal.id
+    # The association never reopens or perturbs the investigation lifecycle.
+    assert investigation.status.value == "COMPLETED"
+    assert investigation.finished_at is not None
+    assert investigation.termination_reason is not None
+
+
+# ---------------------------------------------------------------------------
+# §2 — approval = durable SUBMISSION INTENT, never a fabricated execution
+# ---------------------------------------------------------------------------
+
+
+async def test_approve_binds_exact_contract_and_creates_no_execution_ref() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+
+    outcome = await approve(factory, proposal)
+
     assert outcome.execution_queued is True
     assert outcome.proposal.status == ResponseProposalStatus.APPROVED
-
-    execution = await factory().response_executions.get_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
+    # HISIEM has not been called, so NO provider execution reference may exist.
+    assert (
+        await factory().response_executions.get_by_proposal(
+            tenant_id=TENANT, proposal_id=proposal.id
+        )
+        is None
     )
-    assert execution is not None and execution.status == "QUEUED"
-    queued = [
-        e for e in factory.events.events if e.event_type == "response_execution_queued"
-    ]
-    assert len(queued) == 1
     decisions = await factory().response_approvals.get_decision(
-        tenant_id=TENANT, approval_request_id=request.id
+        tenant_id=TENANT,
+        approval_request_id=await approval_request_id(
+            factory, proposal_id=proposal.id
+        ),
     )
     assert decisions is not None and decisions.actor_subject_id == "operator"
 
 
+async def test_approve_creates_exactly_one_durable_submission_outbox_row() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+    before = len(factory.outbox.rows)
+
+    await approve(factory, proposal)
+
+    queued = [
+        e for e in factory.events.events if e.event_type == "response_execution_queued"
+    ]
+    assert len(queued) == 1
+    # The event payload carries the STABLE submission key, never an execution id.
+    assert queued[0].payload["submission_key"] == f"response:{TENANT}:{proposal.id}"
+    rows = [
+        row
+        for row in factory.outbox.rows.values()
+        if row["destination"] == "response.execution.submit"
+    ]
+    assert len(rows) == 1
+    assert len(factory.outbox.rows) == before + 1
+
+
+async def test_two_approvals_before_any_provider_call_do_not_collide() -> None:
+    """No fabricated ``ResponseExecutionRef`` means no UNIQUE(provider, execution_id)
+    collision when two proposals are queued before either is submitted (spec §2)."""
+    factory = FakeUnitOfWorkFactory()
+    first_id, first_evidence = seed_investigation(factory, alert="alert-a", business_id="A")
+    second_id, second_evidence = seed_investigation(
+        factory, alert="alert-b", business_id="B"
+    )
+    assert first_evidence is not None and second_evidence is not None
+    first = await create_proposal(factory, first_id, evidence_ids=(first_evidence,))
+    second = await create_proposal(factory, second_id, evidence_ids=(second_evidence,))
+
+    await approve(factory, first)
+    await approve(factory, second)  # must NOT raise a uniqueness violation
+
+    assert (
+        await factory().response_executions.get_by_proposal(
+            tenant_id=TENANT, proposal_id=first.id
+        )
+        is None
+    )
+    assert (
+        await factory().response_executions.get_by_proposal(
+            tenant_id=TENANT, proposal_id=second.id
+        )
+        is None
+    )
+
+
+async def test_reject_records_decision_and_zero_submission() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+    request_id = await approval_request_id(factory, proposal_id=proposal.id)
+
+    outcome = await handler(factory).decide_response_approval(
+        DecideResponseApproval(
+            tenant_id=TENANT,
+            approval_request_id=request_id,
+            decision=ApprovalDecisionKind.REJECT,
+            expected_revision=proposal.content_revision,
+            expected_content_hash=proposal.content_hash,
+            initiated_by_subject="operator",
+            reason="insufficient evidence",
+        )
+    )
+    assert outcome.proposal.status == ResponseProposalStatus.REJECTED
+    assert outcome.execution_queued is False
+    assert (
+        await factory().response_executions.get_by_proposal(
+            tenant_id=TENANT, proposal_id=proposal.id
+        )
+        is None
+    )
+    assert not [
+        e for e in factory.events.events if e.event_type == "response_execution_queued"
+    ]
+    assert not [
+        row
+        for row in factory.outbox.rows.values()
+        if row["destination"] == "response.execution.submit"
+    ]
+
+
 async def test_stale_revision_is_contract_mismatch() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
     )
-    assert request is not None
     with pytest.raises(ApprovalContractError):
-        await _handler(factory).decide_response_approval(
+        await handler(factory).decide_response_approval(
             DecideResponseApproval(
                 tenant_id=TENANT,
-                approval_request_id=request.id,
+                approval_request_id=await approval_request_id(
+                    factory, proposal_id=proposal.id
+                ),
                 decision=ApprovalDecisionKind.APPROVE,
                 expected_revision=proposal.content_revision + 1,
                 expected_content_hash=proposal.content_hash,
@@ -248,17 +429,18 @@ async def test_stale_revision_is_contract_mismatch() -> None:
 
 async def test_stale_hash_is_contract_mismatch() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
     )
-    assert request is not None
     with pytest.raises(ApprovalContractError):
-        await _handler(factory).decide_response_approval(
+        await handler(factory).decide_response_approval(
             DecideResponseApproval(
                 tenant_id=TENANT,
-                approval_request_id=request.id,
+                approval_request_id=await approval_request_id(
+                    factory, proposal_id=proposal.id
+                ),
                 decision=ApprovalDecisionKind.APPROVE,
                 expected_revision=proposal.content_revision,
                 expected_content_hash="deadbeef",
@@ -267,61 +449,21 @@ async def test_stale_hash_is_contract_mismatch() -> None:
         )
 
 
-async def test_reject_records_decision_and_zero_execution() -> None:
-    factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
-    )
-    assert request is not None
-
-    outcome = await _handler(factory).decide_response_approval(
-        DecideResponseApproval(
-            tenant_id=TENANT,
-            approval_request_id=request.id,
-            decision=ApprovalDecisionKind.REJECT,
-            expected_revision=proposal.content_revision,
-            expected_content_hash=proposal.content_hash,
-            initiated_by_subject="operator",
-            reason="insufficient evidence",
-        )
-    )
-    assert outcome.proposal.status == ResponseProposalStatus.REJECTED
-    assert outcome.execution_queued is False
-    execution = await factory().response_executions.get_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
-    )
-    assert execution is None
-    assert not [
-        e for e in factory.events.events if e.event_type == "response_execution_queued"
-    ]
-
-
 async def test_conflicting_second_decision_is_rejected() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
     )
-    assert request is not None
-    handler = _handler(factory)
-    await handler.decide_response_approval(
-        DecideResponseApproval(
-            tenant_id=TENANT,
-            approval_request_id=request.id,
-            decision=ApprovalDecisionKind.APPROVE,
-            expected_revision=proposal.content_revision,
-            expected_content_hash=proposal.content_hash,
-            initiated_by_subject="operator",
-        )
-    )
+    request_id = await approval_request_id(factory, proposal_id=proposal.id)
+    await approve(factory, proposal)
+
     with pytest.raises(ApprovalDecisionAlreadyExistsError):
-        await handler.decide_response_approval(
+        await handler(factory).decide_response_approval(
             DecideResponseApproval(
                 tenant_id=TENANT,
-                approval_request_id=request.id,
+                approval_request_id=request_id,
                 decision=ApprovalDecisionKind.REJECT,
                 expected_revision=proposal.content_revision,
                 expected_content_hash=proposal.content_hash,
@@ -330,27 +472,69 @@ async def test_conflicting_second_decision_is_rejected() -> None:
         )
 
 
-async def test_duplicate_approve_is_idempotent_and_creates_one_execution() -> None:
+async def test_duplicate_approve_is_idempotent_and_queues_one_submission() -> None:
     factory = FakeUnitOfWorkFactory()
-    investigation_id = await _seed(factory)
-    proposal = await _create(factory, investigation_id)
-    request = await factory().response_approvals.get_request_by_proposal(
-        tenant_id=TENANT, proposal_id=proposal.id
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
     )
-    assert request is not None
-    handler = _handler(factory)
+    request_id = await approval_request_id(factory, proposal_id=proposal.id)
     command = DecideResponseApproval(
         tenant_id=TENANT,
-        approval_request_id=request.id,
+        approval_request_id=request_id,
         decision=ApprovalDecisionKind.APPROVE,
         expected_revision=proposal.content_revision,
         expected_content_hash=proposal.content_hash,
         initiated_by_subject="operator",
     )
-    await handler.decide_response_approval(command)
-    outcome = await handler.decide_response_approval(command)  # exact retry
+    await handler(factory).decide_response_approval(command)
+    outcome = await handler(factory).decide_response_approval(command)  # exact retry
+
     assert outcome.execution_queued is True
     queued = [
         e for e in factory.events.events if e.event_type == "response_execution_queued"
     ]
     assert len(queued) == 1  # no second logical execution
+
+
+async def test_foreign_tenant_cannot_create_a_proposal() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    from hisiem_soc_copilot.application.errors import NotFoundError
+
+    with pytest.raises(NotFoundError):
+        await create_proposal(
+            factory,
+            investigation_id,
+            tenant_id=OTHER_TENANT,
+            evidence_ids=(evidence_id,),
+        )
+
+
+async def test_foreign_tenant_cannot_approve() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+    request_id = await approval_request_id(factory, proposal_id=proposal.id)
+    from hisiem_soc_copilot.application.errors import NotFoundError
+
+    with pytest.raises(NotFoundError):
+        await handler(factory).decide_response_approval(
+            DecideResponseApproval(
+                tenant_id=OTHER_TENANT,
+                approval_request_id=request_id,
+                decision=ApprovalDecisionKind.APPROVE,
+                expected_revision=proposal.content_revision,
+                expected_content_hash=proposal.content_hash,
+                initiated_by_subject="operator",
+            )
+        )
+
+
+def test_source_alert_target_helper_matches_alerts() -> None:
+    assert target().address_id == ALERT

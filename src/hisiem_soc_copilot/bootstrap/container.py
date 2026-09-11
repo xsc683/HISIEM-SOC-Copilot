@@ -39,7 +39,10 @@ from ..infrastructure.durable.dispatcher import AsyncOutboxDispatcher
 from ..infrastructure.durable.investigation_runner import (
     AsyncInvestigationGraphRunner,
 )
-from ..infrastructure.durable.response_runner import ResponseExecutionRunner
+from ..infrastructure.durable.response_runner import (
+    ResponseObserveRunner,
+    ResponseSubmitRunner,
+)
 from ..infrastructure.hisiem.adapter import HisiemHttpAdapter
 from ..infrastructure.persistence.database import build_engine, build_session_factory
 from ..infrastructure.persistence.repositories.durable import SqlAlchemyOutboxStore
@@ -57,7 +60,8 @@ class Container:
         self.hisiem_adapter: HisiemHttpAdapter | None = None
         self.soar_adapter: HisiemSoarAdapter | None = None
         self.dispatcher: AsyncOutboxDispatcher | None = None
-        self.response_dispatcher: AsyncOutboxDispatcher | None = None
+        self.response_submit_dispatcher: AsyncOutboxDispatcher | None = None
+        self.response_observe_dispatcher: AsyncOutboxDispatcher | None = None
 
     # --- async resource lifecycle (called from lifespan) ---
     async def open(self) -> None:
@@ -76,12 +80,16 @@ class Container:
             # The SOAR adapter fails closed (blank bearer → ExternalServiceError) so
             # the response worker can never run without a service credential.
             self.soar_adapter = self.soar()
-            self.response_dispatcher = self.response_outbox_dispatcher()
-            await self.response_dispatcher.start()
+            self.response_submit_dispatcher = self.response_submit_outbox_dispatcher()
+            await self.response_submit_dispatcher.start()
+            self.response_observe_dispatcher = self.response_observe_outbox_dispatcher()
+            await self.response_observe_dispatcher.start()
 
     async def close(self) -> None:
-        if self.response_dispatcher is not None:
-            await self.response_dispatcher.stop()
+        if self.response_observe_dispatcher is not None:
+            await self.response_observe_dispatcher.stop()
+        if self.response_submit_dispatcher is not None:
+            await self.response_submit_dispatcher.stop()
         if self.dispatcher is not None:
             await self.dispatcher.stop()
         if self.soar_adapter is not None:
@@ -213,32 +221,80 @@ class Container:
             unit_of_work_factory=self.unit_of_work_factory(),
         )
 
-    def response_runner(self, *, soar: SoarPort | None = None) -> ResponseExecutionRunner:
-        adapter = soar if soar is not None else (
-            self.soar_adapter or self.soar()
-        )
-        return ResponseExecutionRunner(
+    def response_submit_runner(
+        self,
+        *,
+        soar: SoarPort | None = None,
+        observe_delay_seconds: float | None = None,
+    ) -> ResponseSubmitRunner:
+        return ResponseSubmitRunner(
             unit_of_work_factory=self.unit_of_work_factory(),
-            soar=adapter,
+            soar=self._resolve_soar(soar),
+            observe_delay_seconds=self._observe_delay(observe_delay_seconds),
         )
 
-    def response_outbox_dispatcher(
-        self, *, soar: SoarPort | None = None
+    def response_observe_runner(
+        self,
+        *,
+        soar: SoarPort | None = None,
+        observe_delay_seconds: float | None = None,
+    ) -> ResponseObserveRunner:
+        return ResponseObserveRunner(
+            unit_of_work_factory=self.unit_of_work_factory(),
+            soar=self._resolve_soar(soar),
+            observe_delay_seconds=self._observe_delay(observe_delay_seconds),
+        )
+
+    def _observe_delay(self, override: float | None) -> float:
+        if override is not None:
+            return override
+        return self.settings.app.response_observe_interval_seconds
+
+    def _resolve_soar(self, soar: SoarPort | None) -> SoarPort:
+        return soar if soar is not None else (self.soar_adapter or self.soar())
+
+    def response_submit_outbox_dispatcher(
+        self,
+        *,
+        soar: SoarPort | None = None,
+        observe_delay_seconds: float | None = None,
     ) -> AsyncOutboxDispatcher:
-        """Build the durable dispatcher for the response-execution destination."""
+        """Build the durable dispatcher for the response SUBMIT destination."""
         from ..infrastructure.durable.dispatcher import (
-            RESPONSE_DESTINATION,
+            RESPONSE_SUBMIT_DESTINATION,
             SqlAlchemyOutboxResolver,
         )
 
-        resolver = SqlAlchemyOutboxResolver(self.session_factory())
-        runner = self.response_runner(soar=soar)
         return AsyncOutboxDispatcher(
             outbox_store=self.outbox_store(),
-            resolver=resolver,
-            runner=runner,
-            worker_name="copilot-response-dispatcher",
-            destination=RESPONSE_DESTINATION,
+            resolver=SqlAlchemyOutboxResolver(self.session_factory()),
+            runner=self.response_submit_runner(
+                soar=soar, observe_delay_seconds=observe_delay_seconds
+            ),
+            worker_name="copilot-response-submit-dispatcher",
+            destination=RESPONSE_SUBMIT_DESTINATION,
+        )
+
+    def response_observe_outbox_dispatcher(
+        self,
+        *,
+        soar: SoarPort | None = None,
+        observe_delay_seconds: float | None = None,
+    ) -> AsyncOutboxDispatcher:
+        """Build the durable dispatcher for the response OBSERVE destination."""
+        from ..infrastructure.durable.dispatcher import (
+            RESPONSE_OBSERVE_DESTINATION,
+            SqlAlchemyOutboxResolver,
+        )
+
+        return AsyncOutboxDispatcher(
+            outbox_store=self.outbox_store(),
+            resolver=SqlAlchemyOutboxResolver(self.session_factory()),
+            runner=self.response_observe_runner(
+                soar=soar, observe_delay_seconds=observe_delay_seconds
+            ),
+            worker_name="copilot-response-observe-dispatcher",
+            destination=RESPONSE_OBSERVE_DESTINATION,
         )
 
     def _resolve_hisiem_service_token(self) -> str:

@@ -9,12 +9,17 @@ import enum
 
 
 class InvestigationStatus(enum.StrEnum):
-    """Business lifecycle status (never runtime phases like PLANNING/TOOL_CALLING)."""
+    """Business lifecycle status of the INVESTIGATION-ANALYSIS lifecycle only.
+
+    The response workflow (proposal -> approval -> SOAR execution) is an
+    INDEPENDENT post-completion aggregate lifecycle owned by ``ResponseProposal``
+    and ``ResponseExecutionRef``. An Investigation therefore never enters an
+    approval/execution status: approval, rejection, and provider execution state
+    never change ``Investigation.status`` (domain-model.md §33-§38).
+    """
 
     CREATED = "CREATED"
     RUNNING = "RUNNING"
-    WAITING_APPROVAL = "WAITING_APPROVAL"
-    EXECUTING_RESPONSE = "EXECUTING_RESPONSE"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -32,8 +37,6 @@ class InvestigationStatus(enum.StrEnum):
         return self in {
             InvestigationStatus.CREATED,
             InvestigationStatus.RUNNING,
-            InvestigationStatus.WAITING_APPROVAL,
-            InvestigationStatus.EXECUTING_RESPONSE,
         }
 
 
@@ -51,8 +54,6 @@ class TerminationReason(enum.StrEnum):
     """Optional reason recorded when an investigation reaches a terminal status."""
 
     COMPLETED_WITHOUT_RESPONSE = "COMPLETED_WITHOUT_RESPONSE"
-    COMPLETED_AFTER_APPROVAL = "COMPLETED_AFTER_APPROVAL"
-    COMPLETED_AFTER_REJECTION = "COMPLETED_AFTER_REJECTION"
     CANCELLED_BY_USER = "CANCELLED_BY_USER"
     FAILED_START = "FAILED_START"
     FAILED_FATAL = "FAILED_FATAL"

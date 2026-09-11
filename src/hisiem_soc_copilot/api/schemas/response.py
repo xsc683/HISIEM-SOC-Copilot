@@ -10,31 +10,38 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...domain.response.aggregate import ResponseProposal
 from ..schemas.workspace import ResponseProposalSchema
 
 
-class ResponseTargetRequest(BaseModel):
-    provider: str
-    resource_type: str
-    address_id: str
-    business_id: str | None = None
-
-
 class CreateResponseProposalRequest(BaseModel):
-    """Derive one typed proposal from a bounded action contract."""
+    """Bounded action contract for deriving one typed proposal.
 
-    action_key: str
-    target: ResponseTargetRequest
-    evidence_ids: list[str]
+    There is deliberately NO ``target`` field. The action target is DERIVED
+    server-side from the persisted Investigation's authoritative
+    ``source_alert_ref``; a browser cannot name, forge, or influence the resource
+    an approved action would hit. ``model_config`` forbids extra properties so a
+    caller that still sends ``target`` / ``tenant_id`` / ``actor`` **fails loudly**
+    with a 422 instead of having the field silently ignored (spec §1.1).
+
+    Likewise there is no tenant, actor, or approval-authority field: all three are
+    server-derived from the authenticated TrustedContext.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_key: str = Field(min_length=1, max_length=64)
+    evidence_ids: list[str] = Field(min_length=1)
     parameters: dict[str, str] = Field(default_factory=dict)
     reason: str = Field(min_length=1, max_length=500)
 
 
 class DecideApprovalRequest(BaseModel):
     """One immutable human decision bound to the exact proposal contract."""
+
+    model_config = ConfigDict(extra="forbid")
 
     decision: str  # APPROVE | REJECT
     expected_revision: int

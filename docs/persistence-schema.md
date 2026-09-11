@@ -196,11 +196,44 @@ budget_limits JSONB NOT NULL
 termination_reason VARCHAR(64) NULL
 
 lock_version BIGINT NOT NULL DEFAULT 0
+result_id UUID NULL
+response_proposal_id UUID NULL
 
 created_at TIMESTAMPTZ NOT NULL
 started_at TIMESTAMPTZ NULL
 finished_at TIMESTAMPTZ NULL
 cancelled_at TIMESTAMPTZ NULL
+```
+
+Status（Investigation Analysis Lifecycle）：
+
+```text
+CREATED
+RUNNING
+COMPLETED
+FAILED
+CANCELLED
+```
+
+约束：
+
+```text
+CHECK (status IN ('CREATED','RUNNING','COMPLETED','FAILED','CANCELLED'))
+```
+
+`WAITING_APPROVAL` / `EXECUTING_RESPONSE` 不属于 Investigation Status。响应工作流
+（Proposal → Approval → SOAR Execution）是由 `response_proposal` /
+`response_execution_ref` 拥有的**独立后置生命周期**：审批、拒绝与 Provider 执行状态
+永不改变 `investigation.status`。
+
+`response_proposal_id` 是 COMPLETED Investigation 到其 ResponseProposal 的单向关联
+（one-way link），同样不属于生命周期状态：
+
+```text
+至多设置一次
+相同 proposal id 重复设置 ⇒ 幂等（不写入）
+不同 proposal id ⇒ 确定性冲突（绝不静默覆盖）
+设置时不得修改 status / finished_at / termination_reason，不得重开 terminal Investigation
 ```
 
 V1 固定：
@@ -214,19 +247,18 @@ source_resource_type = alert
 
 ### Active Investigation Constraint
 
-Active Status：
+Active Status（仅 Investigation Analysis Lifecycle）：
 
 ```text
 CREATED
 RUNNING
-WAITING_APPROVAL
-EXECUTING_RESPONSE
 ```
 
-数据库必须建立 Partial Unique Index：
+数据库必须建立 Partial Unique Index（名称保持 `uq_investigation_active_alert`，Unit of
+Work 依赖该名称把 IntegrityError 翻译为确定性 409）：
 
 ```sql
-CREATE UNIQUE INDEX uq_active_investigation_alert
+CREATE UNIQUE INDEX uq_investigation_active_alert
 ON copilot.investigation (
     tenant_id,
     source_provider,
@@ -235,9 +267,7 @@ ON copilot.investigation (
 )
 WHERE status IN (
     'CREATED',
-    'RUNNING',
-    'WAITING_APPROVAL',
-    'EXECUTING_RESPONSE'
+    'RUNNING'
 );
 ```
 
@@ -568,6 +598,16 @@ REJECTED
 SUBMITTED
 ```
 
+约束：
+
+```text
+CHECK (status IN ('CREATED','DENIED','WAITING_APPROVAL','APPROVED','REJECTED','SUBMITTED'))
+```
+
+`SUBMITTED` 是真实的生命周期状态（不是死状态）：只有 durable submit worker 拿到
+HISIEM 返回的**真实非空 `execution_id`** 并写入 `response_execution_ref` 之后，
+Proposal 才会进入 `SUBMITTED`（见 §23）。
+
 Policy：
 
 ```text
@@ -681,9 +721,23 @@ proposal_id UUID PK FK
 provider VARCHAR(32) NOT NULL
 execution_id TEXT NOT NULL
 submission_key TEXT NOT NULL
-last_observed_status VARCHAR(32) NOT NULL
+status VARCHAR(32) NOT NULL
 submitted_at TIMESTAMPTZ NOT NULL
 last_observed_at TIMESTAMPTZ NOT NULL
+started_at TIMESTAMPTZ NULL
+finished_at TIMESTAMPTZ NULL
+safe_result JSONB NULL
+safe_error_code TEXT NULL
+safe_error_message TEXT NULL
+```
+
+Status：
+
+```text
+QUEUED
+RUNNING
+SUCCEEDED
+FAILED
 ```
 
 约束：
@@ -693,11 +747,23 @@ UNIQUE(provider, execution_id)
 UNIQUE(submission_key)
 ```
 
-`submission_key`：
+**行存在性规则：该表不存在 placeholder / `pending-{proposal_id}` 行。**
+`response_execution_ref` 行只在 HISIEM 返回**真实非空 `execution_id`** 之后，由 durable
+submit worker 在同一本地事务中创建，并同时把 Proposal 从 `APPROVED` 推进到 `SUBMITTED`。
+因此 `UNIQUE(provider, execution_id)` 与 `UNIQUE(submission_key)` 是真正的 Provider
+引用唯一性约束，而不是占位符的唯一性。
+
+Proposal 处于 `APPROVED` 且**没有** `response_execution_ref` 行，是正常的
+"approved, awaiting submission" 状态；若 HISIEM 明确拒绝该次提交（未创建 execution），
+Proposal 合法地保持 `APPROVED`，绝不伪造 execution id。
+
+`submission_key`（稳定提交 / 幂等身份）：
 
 ```text
-proposal:{proposal_id}:execute:{content_revision}
+response:{tenant_id}:{proposal_id}
 ```
+
+该值作为 HISIEM 的 `Idempotency-Key` 请求头提交，必须保持在 HISIEM 的 128 字符上限内。
 
 真正 SOAR Execution 的 Source of Truth 始终是 HISIEM。
 
@@ -821,6 +887,23 @@ published_at TIMESTAMPTZ NULL
 last_error_code VARCHAR(128) NULL
 created_at TIMESTAMPTZ NOT NULL
 ```
+
+Destination（Event Type → Outbox Destination）：
+
+```text
+investigation_created            → investigation.graph.run
+response_execution_queued        → response.execution.submit
+response_execution_submitted     → response.execution.observe
+response_execution_observed      → response.execution.observe
+```
+
+响应执行的 durable 语义：`response.execution.submit` 与 `response.execution.observe`
+是**两个独立职责** —— submit 仅在一次性提交时获取真实 Provider execution id；
+observe 只推进一个已经提交的 execution。一个合法但非终态的 Provider execution
+（QUEUED/RUNNING/…）通过追加 `response_execution_observed` 并把新 outbox 行的
+`available_at` 设为**未来时刻**来重新调度（durable delayed observation），
+**绝不允许**靠耗尽 attempts 把该投递重试到 `DEAD_LETTER` —— 一个正在运行中的
+execution 不是失败。
 
 Status：
 
@@ -990,19 +1073,29 @@ External Read / Computation
 
 ## 32. SOAR Side Effect Transaction
 
-`SubmitApprovedResponse` 使用外部幂等边界：
+`SubmitApprovedResponse` 使用外部幂等边界。实际实现分为两段：审批事务只记录
+**durable submission intent**（不调用 HISIEM、不写入 execution ref），真正的提交由
+durable submit worker 在数据库事务之外完成：
 
 ```text
-1. Read and validate approved Proposal
-2. Derive stable submission_key
-3. Check existing ResponseExecutionRef
-4. Close local transaction
-5. Call HISIEM SOAR using stable request identity
-6. Open new transaction
-7. Insert ResponseExecutionRef
-8. Insert ResponseExecutionSubmitted Event
-9. Insert CommandReceipt
-10. Commit
+Approval 事务（短事务，禁止 SOAR 调用）
+1. Persist ApprovalDecision
+2. proposal APPROVED
+3. Append ResponseApprovalDecided
+4. Append ResponseExecutionQueued（携带稳定 submission_key）
+5. Insert outbox_message → response.execution.submit
+6. Commit
+
+Durable submit worker（事务外调用 HISIEM）
+7. Reload approved Proposal（权威契约来自数据库，不来自队列 payload）
+8. Derive stable submission_key
+9. Check existing ResponseExecutionRef —— 已存在则收敛（no-op），绝不第二次执行
+10. Call HISIEM SOAR with Idempotency-Key = submission_key
+11. Open new transaction
+12. Insert ResponseExecutionRef（仅当 HISIEM 返回真实非空 execution_id）
+13. proposal APPROVED → SUBMITTED + Append ResponseExecutionStarted
+    （Provider 非终态时同时 Append ResponseExecutionSubmitted）
+14. Commit
 ```
 
 如果 SOAR 已接受请求但 Copilot 在持久化 execution ref 前崩溃，重试必须使用相同 `submission_key`，由 HISIEM 去重并恢复同一 execution，禁止生成第二次实际响应。
@@ -1178,7 +1271,7 @@ one result per investigation
 one response proposal per investigation/result
 one approval request per proposal
 one approval decision per request
-one execution ref per proposal
+one execution ref per proposal（仅在真实 provider execution id 存在后创建，无 placeholder 行）
 unique plan revision
 unique hypothesis assessment revision
 evidence deduplication

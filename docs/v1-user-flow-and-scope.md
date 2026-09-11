@@ -10,7 +10,7 @@
 
 V1 仅解决一个完整业务场景：**Security Alert Investigation**。
 
-SOC Analyst 从 HISIEM Alert 发起调查，SOC Copilot 自动获取权威上下文、规划调查、调用读取型安全能力收集 Evidence、验证安全假设并形成 Investigation Result；如需要响应，则生成 Response Proposal，经人工审批后交由 HISIEM SOAR 执行。
+SOC Analyst 从 HISIEM Alert 发起调查，SOC Copilot 自动获取权威上下文、规划调查、调用读取型安全能力收集 Evidence、验证安全假设并形成 Investigation Result；Investigation 到达 `COMPLETED` 之后，如需要响应，才由独立于 Investigation 生命周期的 Response Proposal 生命周期生成提案，经人工审批后由持久化 outbox 提交 HISIEM SOAR 执行。
 
 核心闭环：
 
@@ -29,6 +29,8 @@ Evaluate Hypotheses
     ↓
 Produce Investigation Result
     ↓
+Investigation COMPLETED
+    ↓
 Response Needed?
    /            \
  No             Yes
@@ -39,12 +41,12 @@ Response Needed?
  │          /          \
  │       Reject       Approve
  │          │             ↓
+ │          │      Durable Outbox Submit
+ │          │             ↓
  │          │         HISIEM SOAR
  │          │             ↓
  │          │      Execution Result
  └──────────┴─────────────┘
-              ↓
-          Completed
 ```
 
 ## 3. 参与者
@@ -59,7 +61,7 @@ Response Needed?
 - 查看 Plan、Evidence、Findings、Verdict 和 Uncertainties。
 - 查看 Response Proposal。
 - 在具有权限时批准或拒绝响应。
-- 取消尚未进入响应执行阶段的 Investigation。
+- 取消仍处于 `CREATED` / `RUNNING` 的 Investigation。
 
 ### 3.2 Senior SOC Analyst / Incident Responder
 
@@ -103,6 +105,7 @@ Verdict
 Uncertainty
 Response Proposal
 Approval Request
+Response Execution Projection
 Investigation History
 ```
 
@@ -325,6 +328,8 @@ Risk
 
 Response Proposal 必须引用支持其必要性的 Evidence。
 
+浏览器提交只接受有界提案契约：`action_key`、`evidence_ids`、`parameters`、`reason`；执行目标由服务端依据已持久化的 Investigation source-alert reference 推导，浏览器不得提交 `provider` / `resource_type` / `address_id` / `business_id` / `tenant_id` / `actor` 等越界字段；越界字段必须显式拒绝（HISIEM BFF 返回 400，Copilot 返回 422），不得静默丢弃。SOAR Playbook 只能从已发布且启用的 Playbook 下拉列表中选择，不接受自由文本。
+
 ## 9. V1 响应安全边界
 
 V1 固定规则：
@@ -353,7 +358,7 @@ V1 不提供低风险写操作自动放行。
 
 ## 10. Human Approval
 
-进入执行路径的 Response Proposal 必须进入 `WAITING_APPROVAL`。
+进入执行路径的 Response Proposal 必须进入 `WAITING_APPROVAL`；该状态属于 ResponseProposal 聚合，不是 Investigation 状态，审批、驳回、提交与执行观察均不得改变 Investigation 状态。
 
 审批人可以：
 
@@ -362,7 +367,11 @@ APPROVE
 REJECT
 ```
 
-批准后交由 HISIEM SOAR 执行；拒绝后不产生 Side Effect，且不改变已经形成的 Investigation Result。
+审批 HTTP 请求本身不执行任何响应：该事务内只持久化不可变审批决策、将 Proposal 由 `WAITING_APPROVAL` 迁移到 `APPROVED`、持久化 `response_execution_queued` 领域事件、原子写入 durable outbox 投递；**不得**在该请求内调用 SOAR，也**不得**创建执行引用。真正的提交由 durable outbox worker 稍后完成，携带稳定 `Idempotency-Key` = `response:{tenant_id}:{proposal_id}`。
+
+拒绝后不产生 Side Effect，Proposal 进入 `REJECTED`，且不改变已经形成的 Investigation Result。
+
+AUDIT 角色对整条响应流程只读，不得发起、批准、拒绝或提交响应。
 
 ## 11. SOAR Execution
 
@@ -388,7 +397,19 @@ persist execution
 record execution result
 ```
 
-SOC Copilot 不实现第二套响应工作流执行引擎。
+SOC Copilot 不实现第二套响应工作流执行引擎。HISIEM 拥有实际执行：执行器、凭据与具体动作实现都在 HISIEM 侧；Copilot 只保存持久化提交意图、执行引用投影与审计事实，HISIEM 不会回调 Copilot 获取授权。
+
+批准后的提交与观察由两个独立职责的 durable outbox destination 承担：
+
+```text
+response.execution.submit
+→ submit worker：仅在一次性提交中取得真实 Provider execution id
+
+response.execution.observe
+→ observe / reconcile worker：只推进一个已经提交的 execution
+```
+
+Provider 返回的合法非终态（如 `RUNNING`）不是失败：应通过把新 outbox 投递的 `available_at` 设为未来时刻做 durable 延迟观察，绝不允许靠耗尽 attempts 重试到 `DEAD_LETTER`。
 
 ## 12. Investigation Result 与 Response Execution Result
 
@@ -415,17 +436,17 @@ Response 执行失败不得改变 Investigation Result。
 
 ## 13. Investigation 生命周期
 
-V1 对外状态：
+V1 对外状态（仅描述调查本身）：
 
 ```text
 CREATED
 RUNNING
-WAITING_APPROVAL
-EXECUTING_RESPONSE
 COMPLETED
 FAILED
 CANCELLED
 ```
+
+`WAITING_APPROVAL`、`EXECUTING_RESPONSE` 等响应工作流状态不属于 Investigation Status：响应是 Investigation 到达 `COMPLETED` 之后才开始的独立聚合生命周期（见 §14），审批、驳回、提交与执行观察均不得改变 `Investigation.status`。
 
 内部运行阶段使用独立 Phase 表达：
 
@@ -449,18 +470,22 @@ CREATED
 
 RUNNING
   ├─ Continue → RUNNING
-  ├─ Finalize without Response → COMPLETED
-  ├─ Request Approval → WAITING_APPROVAL
+  ├─ Finalize → COMPLETED
   ├─ Cancel → CANCELLED
   └─ Fatal Failure → FAILED
 
-WAITING_APPROVAL
-  ├─ Reject → COMPLETED
-  ├─ Approve → EXECUTING_RESPONSE
-  └─ Cancel → CANCELLED
+ResponseProposal（Investigation 到达 COMPLETED 之后才开始的独立聚合，不属于 Investigation 状态机）
+  CREATED
+    ├─ Request Approval → WAITING_APPROVAL
+    └─ Deny → DENIED
 
-EXECUTING_RESPONSE
-  └─ Response reaches terminal state → COMPLETED
+  WAITING_APPROVAL
+    ├─ Approve → APPROVED
+    ├─ Reject → REJECTED
+    └─ Deny → DENIED
+
+  APPROVED
+    └─ Durable Submit 取得真实 execution_id → SUBMITTED
 ```
 
 以下状态为终态：
@@ -524,6 +549,8 @@ Result
 ```
 
 不得展示模型内部私有 Chain-of-Thought。
+
+Proposal 处于 `APPROVED` 且执行引用为空时，响应区域只展示「已批准 / 等待提交」；此时不得展示任何外部执行编号，也不得用 `proposal_id` 顶替执行编号（执行引用只在 HISIEM 返回真实非空 execution id 之后才存在）。
 
 ## 17. V1 用户操作
 
@@ -707,6 +734,8 @@ Assess compromise hypotheses
 Grounded Findings
     ↓
 Verdict
+    ↓
+Investigation COMPLETED
     ↓
 Response Proposal
     ↓

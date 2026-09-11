@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import UUID
 
-from ..shared.errors import StateTransitionError
+from ..shared.errors import DomainError, StateTransitionError
 from ..shared.identifiers import utc_now
 from . import events as ev
 from .enums import (
@@ -31,19 +31,14 @@ _TRANSITIONS: dict[InvestigationStatus, dict[str, InvestigationStatus]] = {
     InvestigationStatus.RUNNING: {
         "continue": InvestigationStatus.RUNNING,
         "finalize_without_response": InvestigationStatus.COMPLETED,
-        "request_response_approval": InvestigationStatus.WAITING_APPROVAL,
         "cancel": InvestigationStatus.CANCELLED,
         "fail": InvestigationStatus.FAILED,
     },
-    InvestigationStatus.WAITING_APPROVAL: {
-        "reject_response": InvestigationStatus.COMPLETED,
-        "approve_response": InvestigationStatus.EXECUTING_RESPONSE,
-        "cancel": InvestigationStatus.CANCELLED,
-    },
-    InvestigationStatus.EXECUTING_RESPONSE: {
-        "observe_terminal_execution": InvestigationStatus.COMPLETED,
-    },
 }
+# NOTE: there is deliberately NO approval/execution status here. The response
+# workflow is an independent post-completion aggregate lifecycle (see
+# ``InvestigationStatus``); an Investigation never transitions because a proposal
+# was approved, rejected, or executed.
 
 
 @dataclass
@@ -138,24 +133,37 @@ class Investigation:
             "finalize_without_response", TerminationReason.COMPLETED_WITHOUT_RESPONSE
         )
 
-    def request_response_approval(self) -> None:
-        self._transition("request_response_approval", None)
+    def link_response_proposal(self, proposal_id: UUID) -> bool:
+        """Associate a post-investigation response proposal (one-time, immutable).
 
-    def reject_response(self) -> None:
-        self._transition(
-            "reject_response", TerminationReason.COMPLETED_AFTER_REJECTION
-        )
+        Lifecycle-vs-association rule (domain-model.md §37): a terminal
+        Investigation's LIFECYCLE STATE is immutable — it never reopens, and
+        ``status`` / ``finished_at`` / ``termination_reason`` are never touched
+        here. Establishing the single post-investigation response association is
+        explicitly allowed, once, and is the ONLY post-terminal write.
 
-    def approve_response(self) -> None:
-        self._transition("approve_response", None)
-
-    def observe_terminal_execution(self) -> None:
-        self._transition(
-            "observe_terminal_execution", TerminationReason.COMPLETED_AFTER_APPROVAL
+        Returns ``True`` when the association was newly established and ``False``
+        when it was already identical (idempotent replay). A DIFFERENT proposal id
+        is a deterministic conflict — never a silent overwrite.
+        """
+        if self.status is not InvestigationStatus.COMPLETED:
+            raise StateTransitionError(
+                aggregate_type="investigation",
+                current_status=self.status.value,
+                command="link_response_proposal",
+            )
+        if self.response_proposal_id is None:
+            self.response_proposal_id = proposal_id
+            self._bump()
+            return True
+        if self.response_proposal_id == proposal_id:
+            return False
+        raise DomainError(
+            "investigation already has a different response proposal associated"
         )
 
     def cancel(self, *, actor: ActorRef | None = None) -> None:
-        """Cancel while in CREATED/RUNNING/WAITING_APPROVAL (never EXECUTING_RESPONSE)."""
+        """Cancel while in CREATED/RUNNING."""
         self._transition(
             "cancel",
             TerminationReason.CANCELLED_BY_USER,
@@ -192,8 +200,6 @@ class Investigation:
             InvestigationStatus.CANCELLED,
         ):
             self.finished_at = now
-        if self.status in (InvestigationStatus.EXECUTING_RESPONSE,):
-            self.phase = None
         self.termination_reason = reason
         self._bump()
         self._pending_events.append(

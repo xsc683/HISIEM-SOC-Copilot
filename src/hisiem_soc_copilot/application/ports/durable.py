@@ -131,8 +131,19 @@ class EventLedger(Protocol):
     """Append-only domain-event + outbox persistence inside one transaction."""
 
     async def append(
-        self, event: AppendableEvent, *, aggregate_revision: int
-    ) -> None: ...
+        self,
+        event: AppendableEvent,
+        *,
+        aggregate_revision: int,
+        available_at: datetime | None = None,
+    ) -> None:
+        """Append the event; when it has an outbox destination, enqueue a delivery.
+
+        ``available_at`` lets a caller schedule a DELAYED delivery (used by durable
+        execution reconciliation to re-observe a still-running provider execution
+        later) without introducing a second queue framework. ``None`` means
+        "deliverable now".
+        """
 
     async def get(self, *, event_id: UUID) -> DomainEventEnvelope | None: ...
 

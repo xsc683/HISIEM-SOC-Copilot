@@ -26,8 +26,6 @@ from .base import CopilotBase
 ACTIVE_INVESTIGATION_STATUSES = (
     "CREATED",
     "RUNNING",
-    "WAITING_APPROVAL",
-    "EXECUTING_RESPONSE",
 )
 _ALL_INVESTIGATION_STATUSES = ACTIVE_INVESTIGATION_STATUSES + (
     "COMPLETED",
@@ -47,9 +45,7 @@ class InvestigationRow(CopilotBase):
             "source_resource_type",
             "source_address_id",
             unique=True,
-            postgresql_where=text(
-                "status IN ('CREATED','RUNNING','WAITING_APPROVAL','EXECUTING_RESPONSE')"
-            ),
+            postgresql_where=text("status IN ('CREATED','RUNNING')"),
         ),
         Index(
             "ix_investigation_tenant_status_created",

@@ -34,7 +34,12 @@ logger = logging.getLogger(__name__)
 # event→destination map that enqueues these lives in
 # ``infrastructure.persistence.repositories.durable._EVENT_DESTINATIONS``.
 INVESTIGATION_DESTINATION = "investigation.graph.run"
-RESPONSE_DESTINATION = "response.execution.run"
+# The response side effect is split into TWO durable responsibilities (spec §3):
+# SUBMIT obtains the real provider execution id exactly once (idempotency-keyed);
+# OBSERVE advances an already-submitted execution toward a terminal state. Each
+# destination has its own dispatcher/worker so neither can starve the other.
+RESPONSE_SUBMIT_DESTINATION = "response.execution.submit"
+RESPONSE_OBSERVE_DESTINATION = "response.execution.observe"
 _DISPATCHER_DESTINATION = INVESTIGATION_DESTINATION
 _MAX_ATTEMPTS = 10
 _LEASE_TIMEOUT_SECONDS = 60

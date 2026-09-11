@@ -140,7 +140,7 @@ Persistence/API integration tests skip automatically when PostgreSQL is not reac
 
 Implemented in this skeleton:
 
-- Pure domain: `Investigation` state machine (CREATED → RUNNING → {COMPLETED, WAITING_APPROVAL, CANCELLED, FAILED}), `ResponseProposal` + policy (DENY / REQUIRE_APPROVAL only), Evidence/Finding/Result/Approval invariants.
+- Pure domain: `Investigation` state machine (CREATED → RUNNING → {COMPLETED, FAILED, CANCELLED}; the response workflow is an independent post-completion aggregate lifecycle), `ResponseProposal` + policy (DENY / REQUIRE_APPROVAL only), Evidence/Finding/Result/Approval invariants.
 - Application: `StartAlertInvestigation` / `CancelInvestigation` commands + handler, read service, tenant-scoped repository ports, UoW port.
 - Persistence: all `copilot` tables + the documented constraints, explicit ORM↔domain mappers, SqlAlchemyUnitOfWork with optimistic locking.
 - HISIEM adapter (read-only alert hydration), LangGraph checkpointer wiring, minimal compiled graph seam.

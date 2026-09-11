@@ -83,15 +83,63 @@ def response_approval_decided(
 def response_execution_queued(
     aggregate_id: UUID,
     *,
-    execution_id: UUID,
+    submission_key: str,
     tenant_id: str | None = None,
 ) -> ResponseEvent:
-    """The ONLY response event that enqueues an outbox delivery (durable worker)."""
+    """Durable local SUBMISSION INTENT — enqueues the submit delivery.
+
+    This is deliberately NOT a provider execution reference: at approval time no
+    provider execution exists yet, and fabricating one (``execution_id=""`` or a
+    ``pending-...`` sentinel) would both lie about provider identity and collide on
+    the ``(provider, execution_id)`` uniqueness. The local submission intent is
+    fully represented by the ApprovalDecision + APPROVED proposal + this event +
+    its outbox row, keyed by the stable ``submission_key``.
+    """
     return ResponseEvent(
         event_type="response_execution_queued",
         aggregate_id=aggregate_id,
         tenant_id=tenant_id,
-        payload={"execution_id": str(execution_id)},
+        payload={"submission_key": submission_key},
+    )
+
+
+def response_execution_submitted(
+    aggregate_id: UUID,
+    *,
+    external_execution_id: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """HISIEM accepted the submission and a REAL execution id is durably known.
+
+    Enqueues the first OBSERVE delivery — reconciliation is a durable, resumable
+    responsibility, never an in-process polling loop.
+    """
+    return ResponseEvent(
+        event_type="response_execution_submitted",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={"external_execution_id": external_execution_id},
+    )
+
+
+def response_execution_observed(
+    aggregate_id: UUID,
+    *,
+    external_execution_id: str,
+    status: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """A non-terminal provider observation that durably re-schedules the next one.
+
+    A legitimately RUNNING/WAITING/WAITING_HUMAN execution is NOT a failure: it is
+    persisted as an observation and re-enqueued with a future ``available_at``
+    instead of raising a retry exception that would eventually dead-letter it.
+    """
+    return ResponseEvent(
+        event_type="response_execution_observed",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={"external_execution_id": external_execution_id, "status": status},
     )
 
 
