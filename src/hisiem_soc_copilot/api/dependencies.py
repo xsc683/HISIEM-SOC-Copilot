@@ -16,6 +16,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from ..application.handlers.investigation import InvestigationCommandHandler
+from ..application.handlers.response import ResponseCommandHandler
 from ..application.ports.trust import TrustedContext, TrustedContextProvider
 from ..application.services.investigation_service import InvestigationReadService
 from ..application.services.workspace_service import InvestigationWorkspaceService
@@ -59,6 +60,10 @@ def command_handler(request: Request) -> InvestigationCommandHandler:
     return _container(request).investigation_command_handler()
 
 
+def response_command_handler(request: Request) -> ResponseCommandHandler:
+    return _container(request).response_command_handler()
+
+
 def read_service(request: Request) -> InvestigationReadService:
     return _container(request).investigation_read_service()
 
@@ -80,6 +85,9 @@ def dispatcher(request: Request) -> object:
 # Depends() markers: FastAPI must resolve these as dependencies, not treat the
 # service classes as request/response fields.
 CommandHandlerDep = Annotated[InvestigationCommandHandler, Depends(command_handler)]
+ResponseCommandHandlerDep = Annotated[
+    ResponseCommandHandler, Depends(response_command_handler)
+]
 ReadServiceDep = Annotated[InvestigationReadService, Depends(read_service)]
 WorkspaceServiceDep = Annotated[
     InvestigationWorkspaceService, Depends(workspace_service)

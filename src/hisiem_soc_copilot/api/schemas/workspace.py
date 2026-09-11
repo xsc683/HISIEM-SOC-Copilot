@@ -19,17 +19,23 @@ from pydantic import BaseModel
 from ...application.queries.workspace import (
     AlertInvestigationLookup,
     InvestigationWorkspaceReadModel,
+    WorkspaceApproval,
+    WorkspaceApprovalDecision,
     WorkspaceAssessment,
     WorkspaceAttackMapping,
     WorkspaceEvidence,
     WorkspaceEvidenceRelation,
     WorkspaceEvidenceSource,
+    WorkspaceExecution,
     WorkspaceFinding,
     WorkspaceHypothesis,
     WorkspaceInvestigation,
     WorkspacePlanRevision,
     WorkspacePlanStep,
+    WorkspaceResponseProjection,
+    WorkspaceResponseProposal,
     WorkspaceResponseRecommendation,
+    WorkspaceResponseTarget,
     WorkspaceResult,
     WorkspaceSourceAlertRef,
     WorkspaceTimelineEntry,
@@ -373,6 +379,163 @@ class TimelineEntrySchema(BaseModel):
         )
 
 
+class ResponseTargetSchema(BaseModel):
+    provider: str
+    resource_type: str
+    address_id: str
+    business_id: str | None = None
+
+    @classmethod
+    def from_read_model(cls, value: WorkspaceResponseTarget) -> ResponseTargetSchema:
+        return cls(
+            provider=value.provider,
+            resource_type=value.resource_type,
+            address_id=value.address_id,
+            business_id=value.business_id,
+        )
+
+
+class ApprovalDecisionSchema(BaseModel):
+    decision: str
+    actor_subject_id: str
+    actor_display_name: str | None = None
+    reason: str | None = None
+    decided_at: datetime
+
+    @classmethod
+    def from_read_model(
+        cls, value: WorkspaceApprovalDecision
+    ) -> ApprovalDecisionSchema:
+        return cls(
+            decision=value.decision,
+            actor_subject_id=value.actor_subject_id,
+            actor_display_name=value.actor_display_name,
+            reason=value.reason,
+            decided_at=value.decided_at,
+        )
+
+
+class ApprovalSchema(BaseModel):
+    request_id: str
+    status: str
+    requested_at: datetime
+    requested_reason: str
+    expected_revision: int
+    expected_content_hash: str
+    decision: ApprovalDecisionSchema | None = None
+
+    @classmethod
+    def from_read_model(cls, value: WorkspaceApproval) -> ApprovalSchema:
+        return cls(
+            request_id=str(value.request_id),
+            status=value.status,
+            requested_at=value.requested_at,
+            requested_reason=value.requested_reason,
+            expected_revision=value.expected_revision,
+            expected_content_hash=value.expected_content_hash,
+            decision=(
+                ApprovalDecisionSchema.from_read_model(value.decision)
+                if value.decision is not None
+                else None
+            ),
+        )
+
+
+class ExecutionSchema(BaseModel):
+    provider: str
+    status: str
+    submitted_at: datetime
+    last_observed_at: datetime
+    external_execution_id: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    safe_result: dict[str, Any] = {}
+    safe_error_code: str | None = None
+    safe_error_message: str | None = None
+
+    @classmethod
+    def from_read_model(cls, value: WorkspaceExecution) -> ExecutionSchema:
+        return cls(
+            provider=value.provider,
+            status=value.status,
+            submitted_at=value.submitted_at,
+            last_observed_at=value.last_observed_at,
+            external_execution_id=value.external_execution_id,
+            started_at=value.started_at,
+            finished_at=value.finished_at,
+            safe_result=value.safe_result,
+            safe_error_code=value.safe_error_code,
+            safe_error_message=value.safe_error_message,
+        )
+
+
+class ResponseProposalSchema(BaseModel):
+    proposal_id: str
+    revision: int
+    content_hash: str
+    status: str
+    action_key: str
+    parameters: dict[str, Any] = {}
+    reason: str
+    target_refs: list[ResponseTargetSchema] = []
+    evidence_ids: list[str] = []
+    policy_decision: str | None = None
+    policy_reason: str | None = None
+    created_at: datetime | None = None
+    approval: ApprovalSchema | None = None
+    execution: ExecutionSchema | None = None
+
+    @classmethod
+    def from_read_model(
+        cls, value: WorkspaceResponseProposal
+    ) -> ResponseProposalSchema:
+        return cls(
+            proposal_id=str(value.proposal_id),
+            revision=value.revision,
+            content_hash=value.content_hash,
+            status=value.status,
+            action_key=value.action_key,
+            parameters=value.parameters,
+            reason=value.reason,
+            target_refs=[
+                ResponseTargetSchema.from_read_model(t) for t in value.target_refs
+            ],
+            evidence_ids=[str(e) for e in value.evidence_ids],
+            policy_decision=value.policy_decision,
+            policy_reason=value.policy_reason,
+            created_at=value.created_at,
+            approval=(
+                ApprovalSchema.from_read_model(value.approval)
+                if value.approval is not None
+                else None
+            ),
+            execution=(
+                ExecutionSchema.from_read_model(value.execution)
+                if value.execution is not None
+                else None
+            ),
+        )
+
+
+class ResponseProjectionSchema(BaseModel):
+    recommendations: list[ResponseRecommendationSchema] = []
+    proposals: list[ResponseProposalSchema] = []
+
+    @classmethod
+    def from_read_model(
+        cls, value: WorkspaceResponseProjection
+    ) -> ResponseProjectionSchema:
+        return cls(
+            recommendations=[
+                ResponseRecommendationSchema.from_read_model(r)
+                for r in value.recommendations
+            ],
+            proposals=[
+                ResponseProposalSchema.from_read_model(p) for p in value.proposals
+            ],
+        )
+
+
 class InvestigationWorkspaceResponse(BaseModel):
     investigation: InvestigationHeader
     source_alert_ref: SourceAlertRefSchema
@@ -381,6 +544,7 @@ class InvestigationWorkspaceResponse(BaseModel):
     hypotheses: list[HypothesisSchema] = []
     findings: list[FindingSchema] = []
     result: ResultSchema | None = None
+    response: ResponseProjectionSchema = ResponseProjectionSchema()
     tool_activity: list[ToolActivitySchema] = []
     timeline: list[TimelineEntrySchema] = []
 
@@ -406,6 +570,7 @@ class InvestigationWorkspaceResponse(BaseModel):
                 if value.result is not None
                 else None
             ),
+            response=ResponseProjectionSchema.from_read_model(value.response),
             tool_activity=[
                 ToolActivitySchema.from_read_model(t) for t in value.tool_activity
             ],

@@ -17,9 +17,11 @@ Processing order is mandatory (never trust headers first, authenticate later):
     4. require tenant AND actor to be present
     5. construct the ``TrustedContext``
 
-Credential comparison is constant-time (``hmac.compare_digest``), and every
-failure raises the SAME generic :class:`ServiceAuthenticationError` so a caller
-cannot distinguish "almost right" / "wrong length" / "wrong prefix".
+Credential comparison is constant-time (``hmac.compare_digest``), and EVERY
+request-time failure (missing/malformed/invalid credential, missing tenant,
+missing actor) raises :class:`ServiceAuthenticationError` with the SAME constant
+message (:data:`SERVICE_AUTHENTICATION_FAILED_MESSAGE`) so an unauthenticated
+remote caller cannot distinguish which verification stage failed — no oracle.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import hmac
 from starlette.requests import Request
 
 from ...application.ports.trust import (
+    SERVICE_AUTHENTICATION_FAILED_MESSAGE,
     ServiceAuthenticationError,
     TrustedContext,
     TrustedContextProvider,
@@ -46,7 +49,8 @@ class HisiemServiceTrustedContextProvider(TrustedContextProvider):
 
     def __init__(self, request: Request, *, expected_token: str) -> None:
         if not expected_token:
-            # Fail closed: a provider with no credential must never accept a caller.
+            # Configuration defect (no remote caller observes this): a distinct,
+            # operator-facing message is safe here and aids diagnosis.
             raise ServiceAuthenticationError("service credential is not configured")
         self._request = request
         self._expected_token = expected_token
@@ -54,14 +58,13 @@ class HisiemServiceTrustedContextProvider(TrustedContextProvider):
     async def resolve(self) -> TrustedContext:
         provided = self._bearer_credential()
         if not hmac.compare_digest(provided, self._expected_token):
-            raise ServiceAuthenticationError("invalid service credential")
-
+            raise _reject()
         tenant = self._request.headers.get(TENANT_HEADER, "").strip()
         if not tenant:
-            raise ServiceAuthenticationError("missing tenant identity")
+            raise _reject()
         subject = self._request.headers.get(ACTOR_SUBJECT_HEADER, "").strip()
         if not subject:
-            raise ServiceAuthenticationError("missing actor identity")
+            raise _reject()
         display = self._request.headers.get(ACTOR_DISPLAY_NAME_HEADER, "").strip() or None
         return TrustedContext(
             tenant_id=tenant,
@@ -74,15 +77,25 @@ class HisiemServiceTrustedContextProvider(TrustedContextProvider):
 
         Scheme matching is case-insensitive per HTTP conventions; the token
         contents are compared exactly. Any other scheme (Basic/Token/Service/…),
-        a missing header, or an ambiguous/multi-part value is rejected.
+        a missing header, or an ambiguous/multi-part value is rejected — with the
+        same generic failure as every other request-time rejection.
         """
         raw = self._request.headers.get(_AUTHORIZATION_HEADER)
         if not raw:
-            raise ServiceAuthenticationError("missing service credential")
+            raise _reject()
         parts = raw.split()
         if len(parts) != 2 or parts[0].lower() != _BEARER_SCHEME:
-            raise ServiceAuthenticationError("malformed service credential")
+            raise _reject()
         token = parts[1]
         if not token:
-            raise ServiceAuthenticationError("missing service credential")
+            raise _reject()
         return token
+
+
+def _reject() -> ServiceAuthenticationError:
+    """One generic failure for every request-time service-auth rejection.
+
+    Never distinguishes missing vs malformed vs invalid credential, nor missing
+    tenant vs missing actor — the HTTP boundary is not an authentication oracle.
+    """
+    return ServiceAuthenticationError(SERVICE_AUTHENTICATION_FAILED_MESSAGE)

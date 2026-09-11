@@ -46,15 +46,25 @@ class ApprovalDecision:
 
 @dataclass(frozen=True)
 class ResponseExecutionRef:
-    """Projection of a HISIEM SOAR execution (never the SOAR source of truth)."""
+    """Projection of a HISIEM SOAR execution (never the SOAR source of truth).
+
+    ``status`` is a :class:`ResponseExecutionStatus` value. ``safe_result`` holds
+    bounded, non-secret result facts only; ``safe_error_code``/``safe_error_message``
+    hold a normalized failure summary — never a raw upstream body.
+    """
 
     proposal_id: UUID
     provider: str
     execution_id: str
     submission_key: str
-    last_observed_status: str
+    status: str
     submitted_at: datetime
     last_observed_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    safe_result: dict[str, object] | None = None
+    safe_error_code: str | None = None
+    safe_error_message: str | None = None
 
 
 @dataclass(frozen=True)

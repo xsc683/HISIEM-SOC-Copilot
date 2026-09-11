@@ -42,14 +42,20 @@ class UntrustedRequestError(DomainError):
     code = "UNTRUSTED_REQUEST"
 
 
+#: The single generic message every request-time service-auth failure emits, so
+#: the HTTP boundary is never an authentication oracle (missing vs malformed vs
+#: invalid credential, missing tenant vs missing actor are indistinguishable).
+SERVICE_AUTHENTICATION_FAILED_MESSAGE = "service authentication failed"
+
+
 class ServiceAuthenticationError(UntrustedRequestError):
     """Raised when the HISIEM service caller cannot be authenticated.
 
     Distinct from a generic untrusted request: this is a service-to-service
     authentication failure (missing/invalid service credential, or a missing
-    server-asserted tenant/actor) and maps to HTTP 401. The message is generic —
-    it never reveals whether a credential was close, wrong-length, or which part
-    of the identity was missing.
+    server-asserted tenant/actor) and maps to HTTP 401. Request-time failures all
+    carry :data:`SERVICE_AUTHENTICATION_FAILED_MESSAGE`; only a startup
+    configuration defect (no remote caller) may carry a diagnostic message.
     """
 
     code = "SERVICE_AUTHENTICATION_FAILED"

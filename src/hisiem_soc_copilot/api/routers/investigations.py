@@ -17,16 +17,30 @@ from ...application.commands.investigation import (
     CancelInvestigation,
     StartAlertInvestigation,
 )
+from ...application.commands.response import (
+    CreateResponseProposal,
+    DecideResponseApproval,
+)
+from ...application.handlers.response import ResponseCommandHandler
+from ...application.ports.trust import TrustedContext
 from ...domain.investigation.value_objects import ExternalResourceRef
+from ...domain.response.enums import ApprovalDecisionKind
 from ..dependencies import (
     CommandHandlerDep,
     ReadServiceDep,
+    ResponseCommandHandlerDep,
     TrustedContextDep,
     WorkspaceServiceDep,
 )
 from ..schemas.common import (
     InvestigationResponse,
     StartInvestigationRequest,
+)
+from ..schemas.response import (
+    ApprovalDecisionResponse,
+    CreateResponseProposalRequest,
+    DecideApprovalRequest,
+    ResponseProposalResponse,
 )
 from ..schemas.workspace import (
     AlertInvestigationLookupResponse,
@@ -147,3 +161,105 @@ async def cancel_investigation(
         tenant_id=context.tenant_id, investigation_id=investigation.id
     )
     return InvestigationResponse.from_read_model(rm)
+
+
+@router.post(
+    "/{investigation_id}/response-proposals",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ResponseProposalResponse,
+)
+async def create_response_proposal(
+    investigation_id: Annotated[UUID4, Path()],
+    body: CreateResponseProposalRequest,
+    context: TrustedContextDep,
+    response_handler: ResponseCommandHandlerDep,
+) -> ResponseProposalResponse:
+    """Derive + policy-validate + persist one typed response proposal.
+
+    Deterministic: the caller supplies the bounded action contract; no model round.
+    Tenant and actor are server-derived — never taken from the body.
+    """
+    command = CreateResponseProposal(
+        tenant_id=context.tenant_id,
+        investigation_id=UUID(str(investigation_id)),
+        action_key=body.action_key,
+        target_ref=ExternalResourceRef(
+            provider=body.target.provider,
+            resource_type=body.target.resource_type,
+            address_id=body.target.address_id,
+            business_id=body.target.business_id,
+        ),
+        evidence_ids=tuple(UUID(e) for e in body.evidence_ids),
+        parameters=dict(body.parameters),
+        reason=body.reason,
+        initiated_by_subject=context.actor_subject_id,
+        initiated_by_display_name=context.actor_display_name,
+    )
+    proposal = await response_handler.create_response_proposal(command)
+    return ResponseProposalResponse.from_domain(proposal)
+
+
+@router.post(
+    "/response-approvals/{approval_request_id}/approve",
+    response_model=ApprovalDecisionResponse,
+)
+async def approve_response(
+    approval_request_id: Annotated[UUID4, Path()],
+    body: DecideApprovalRequest,
+    context: TrustedContextDep,
+    response_handler: ResponseCommandHandlerDep,
+) -> ApprovalDecisionResponse:
+    """Record an immutable APPROVE decision; the side effect is queued, not run here."""
+    return await _decide(
+        approval_request_id, body, context, response_handler, ApprovalDecisionKind.APPROVE
+    )
+
+
+@router.post(
+    "/response-approvals/{approval_request_id}/reject",
+    response_model=ApprovalDecisionResponse,
+)
+async def reject_response(
+    approval_request_id: Annotated[UUID4, Path()],
+    body: DecideApprovalRequest,
+    context: TrustedContextDep,
+    response_handler: ResponseCommandHandlerDep,
+) -> ApprovalDecisionResponse:
+    """Record an immutable REJECT decision; ZERO execution is created."""
+    return await _decide(
+        approval_request_id, body, context, response_handler, ApprovalDecisionKind.REJECT
+    )
+
+
+async def _decide(
+    approval_request_id: UUID4,
+    body: DecideApprovalRequest,
+    context: TrustedContext,
+    response_handler: ResponseCommandHandler,
+    expected_kind: ApprovalDecisionKind,
+) -> ApprovalDecisionResponse:
+    # The route path selects the decision kind; reject a body that disagrees so a
+    # caller can never smuggle a different decision through the wrong route.
+    if body.decision.upper() != expected_kind.value:
+        from ...domain.shared.errors import DomainError
+
+        raise DomainError("decision does not match the requested approval action")
+    command = DecideResponseApproval(
+        tenant_id=context.tenant_id,
+        approval_request_id=UUID(str(approval_request_id)),
+        decision=expected_kind,
+        expected_revision=body.expected_revision,
+        expected_content_hash=body.expected_content_hash,
+        initiated_by_subject=context.actor_subject_id,
+        initiated_by_display_name=context.actor_display_name,
+        reason=body.reason,
+    )
+    outcome = await response_handler.decide_response_approval(command)
+    return ApprovalDecisionResponse.from_outcome(
+        proposal_id=str(outcome.proposal.id),
+        status=outcome.proposal.status.value,
+        decision=outcome.decision.decision,
+        decided_by=outcome.decision.actor_subject_id,
+        decided_at=outcome.decision.decided_at,
+        execution_queued=outcome.execution_queued,
+    )

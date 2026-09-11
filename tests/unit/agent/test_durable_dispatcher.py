@@ -37,14 +37,12 @@ class _CountingRunner:
         self.intervals: list[tuple[float, float]] = []
         self._delay = delay
 
-    async def run_investigation(
-        self, *, investigation_id: str, tenant_id: str
-    ) -> None:
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
         import asyncio
         import time
 
         start = time.monotonic()
-        self.started.append((investigation_id, tenant_id))
+        self.started.append((aggregate_id, tenant_id))
         await asyncio.sleep(self._delay)
         self.intervals.append((start, time.monotonic()))
 
@@ -132,18 +130,14 @@ async def test_terminal_investigation_is_not_dispatched_again() -> None:
 class _NonRetryableRunner:
     """A runner that raises a safe non-retryable run error (MODEL_CONFIGURATION)."""
 
-    async def run_investigation(
-        self, *, investigation_id: str, tenant_id: str
-    ) -> None:
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
         raise NonRetryableRunError(code="MODEL_CONFIGURATION")
 
 
 class _RecoverableRunner:
     """A runner that raises a generic (recoverable) exception."""
 
-    async def run_investigation(
-        self, *, investigation_id: str, tenant_id: str
-    ) -> None:
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
         raise RuntimeError("boom transient")
 
 

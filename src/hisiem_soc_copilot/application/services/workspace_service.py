@@ -27,24 +27,35 @@ from ...domain.investigation.entities import (
     PlanRevision,
 )
 from ...domain.investigation.value_objects import ExternalResourceRef
+from ...domain.response.value_objects import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ResponseExecutionRef,
+)
 from ..errors import NotFoundError
 from ..ports.durable import ToolInvocationRecord
 from ..ports.unit_of_work import UnitOfWork
 from ..queries.workspace import (
     AlertInvestigationLookup,
     InvestigationWorkspaceReadModel,
+    WorkspaceApproval,
+    WorkspaceApprovalDecision,
     WorkspaceAssessment,
     WorkspaceAttackMapping,
     WorkspaceEntityRef,
     WorkspaceEvidence,
     WorkspaceEvidenceRelation,
     WorkspaceEvidenceSource,
+    WorkspaceExecution,
     WorkspaceFinding,
     WorkspaceHypothesis,
     WorkspaceInvestigation,
     WorkspacePlanRevision,
     WorkspacePlanStep,
+    WorkspaceResponseProjection,
+    WorkspaceResponseProposal,
     WorkspaceResponseRecommendation,
+    WorkspaceResponseTarget,
     WorkspaceResult,
     WorkspaceSourceAlertRef,
     WorkspaceTimelineEntry,
@@ -68,8 +79,21 @@ TL_RESULT_FINALIZED = "RESULT_FINALIZED"
 TL_INVESTIGATION_COMPLETED = "INVESTIGATION_COMPLETED"
 TL_INVESTIGATION_CANCELLED = "INVESTIGATION_CANCELLED"
 TL_INVESTIGATION_FAILED = "INVESTIGATION_FAILED"
+# Response workflow timeline kinds (spec §38). Persisted-fact backed only.
+TL_RESPONSE_PROPOSAL_CREATED = "RESPONSE_PROPOSAL_CREATED"
+TL_RESPONSE_POLICY_EVALUATED = "RESPONSE_POLICY_EVALUATED"
+TL_APPROVAL_REQUESTED = "APPROVAL_REQUESTED"
+TL_RESPONSE_APPROVED = "RESPONSE_APPROVED"
+TL_RESPONSE_REJECTED = "RESPONSE_REJECTED"
+TL_RESPONSE_EXECUTION_QUEUED = "RESPONSE_EXECUTION_QUEUED"
+TL_RESPONSE_EXECUTION_STARTED = "RESPONSE_EXECUTION_STARTED"
+TL_RESPONSE_EXECUTION_SUCCEEDED = "RESPONSE_EXECUTION_SUCCEEDED"
+TL_RESPONSE_EXECUTION_FAILED = "RESPONSE_EXECUTION_FAILED"
 
 _TOOL_SUCCEEDED = "SUCCEEDED"
+_EXEC_SUCCEEDED = "SUCCEEDED"
+_EXEC_FAILED = "FAILED"
+_EXEC_QUEUED = "QUEUED"
 
 
 def _header(investigation: Investigation) -> WorkspaceInvestigation:
@@ -379,6 +403,225 @@ def _build_timeline(
     return entries
 
 
+def _response_projection(
+    *,
+    result: InvestigationResult | None,
+    proposal: object | None,
+    approval: ApprovalRequest | None,
+    decision: ApprovalDecision | None,
+    execution: ResponseExecutionRef | None,
+) -> WorkspaceResponseProjection:
+    """Build the Response projection: informational recommendations + typed proposals.
+
+    ``recommendations`` mirror the result's explanatory output (never executable);
+    ``proposals`` are the validated, approval-bound contracts (spec §4/§30).
+    """
+    recommendations: tuple[WorkspaceResponseRecommendation, ...] = ()
+    if result is not None:
+        recommendations = tuple(
+            WorkspaceResponseRecommendation(description=r.description, reason=r.reason)
+            for r in result.response_recommendations
+        )
+    proposals: tuple[WorkspaceResponseProposal, ...] = ()
+    if proposal is not None:
+        proposals = (_response_proposal(proposal, approval, decision, execution),)
+    return WorkspaceResponseProjection(
+        recommendations=recommendations, proposals=proposals
+    )
+
+
+def _response_proposal(
+    proposal: object,
+    approval: ApprovalRequest | None,
+    decision: ApprovalDecision | None,
+    execution: ResponseExecutionRef | None,
+) -> WorkspaceResponseProposal:
+    from ...domain.response.aggregate import ResponseProposal
+
+    assert isinstance(proposal, ResponseProposal)
+    return WorkspaceResponseProposal(
+        proposal_id=proposal.id,
+        revision=proposal.content_revision,
+        content_hash=proposal.content_hash,
+        status=proposal.status.value,
+        action_key=proposal.action_key,
+        parameters=dict(proposal.parameters),
+        reason=proposal.reason,
+        target_refs=tuple(
+            WorkspaceResponseTarget(
+                provider=t.provider,
+                resource_type=t.resource_type,
+                address_id=t.address_id,
+                business_id=t.business_id,
+            )
+            for t in proposal.target_refs
+        ),
+        evidence_ids=tuple(proposal.evidence_ids),
+        policy_decision=(
+            proposal.policy_decision.value if proposal.policy_decision else None
+        ),
+        policy_reason=proposal.policy_reason,
+        created_at=proposal.created_at,
+        approval=_workspace_approval(approval, decision),
+        execution=_workspace_execution(execution),
+    )
+
+
+def _workspace_approval(
+    approval: ApprovalRequest | None, decision: ApprovalDecision | None
+) -> WorkspaceApproval | None:
+    if approval is None:
+        return None
+    return WorkspaceApproval(
+        request_id=approval.id,
+        requested_at=approval.requested_at,
+        requested_reason=approval.requested_reason,
+        expected_revision=approval.proposal_content_revision,
+        expected_content_hash=approval.proposal_content_hash,
+        decision=(
+            WorkspaceApprovalDecision(
+                decision=decision.decision,
+                actor_subject_id=decision.actor_subject_id,
+                actor_display_name=decision.actor_display_name,
+                reason=decision.reason,
+                decided_at=decision.decided_at,
+            )
+            if decision is not None
+            else None
+        ),
+    )
+
+
+def _workspace_execution(execution: ResponseExecutionRef | None) -> WorkspaceExecution | None:
+    if execution is None:
+        return None
+    return WorkspaceExecution(
+        provider=execution.provider,
+        status=execution.status,
+        submitted_at=execution.submitted_at,
+        last_observed_at=execution.last_observed_at,
+        external_execution_id=execution.execution_id or None,
+        started_at=execution.started_at,
+        finished_at=execution.finished_at,
+        safe_result=dict(execution.safe_result or {}),
+        safe_error_code=execution.safe_error_code,
+        safe_error_message=execution.safe_error_message,
+    )
+
+
+def _response_timeline_entries(
+    *,
+    proposal: object | None,
+    approval: ApprovalRequest | None,
+    decision: ApprovalDecision | None,
+    execution: ResponseExecutionRef | None,
+) -> list[WorkspaceTimelineEntry]:
+    """Deterministic response timeline entries derived from persisted facts only."""
+    from ...domain.response.aggregate import ResponseProposal
+
+    if not isinstance(proposal, ResponseProposal):
+        return []
+    entries: list[WorkspaceTimelineEntry] = [
+        WorkspaceTimelineEntry(
+            kind=TL_RESPONSE_PROPOSAL_CREATED,
+            occurred_at=proposal.created_at,
+            title="Response proposal created",
+            ref_type="response_proposal",
+            ref_id=str(proposal.id),
+            safe_metadata={
+                "action_key": proposal.action_key,
+                "revision": proposal.content_revision,
+            },
+        )
+    ]
+    if proposal.policy_decision is not None:
+        entries.append(
+            WorkspaceTimelineEntry(
+                kind=TL_RESPONSE_POLICY_EVALUATED,
+                occurred_at=proposal.created_at,
+                title="Response policy evaluated",
+                status=proposal.policy_decision.value,
+                ref_type="response_proposal",
+                ref_id=str(proposal.id),
+            )
+        )
+    if approval is not None:
+        entries.append(
+            WorkspaceTimelineEntry(
+                kind=TL_APPROVAL_REQUESTED,
+                occurred_at=approval.requested_at,
+                title="Approval requested",
+                ref_type="response_approval",
+                ref_id=str(approval.id),
+            )
+        )
+    if decision is not None:
+        approved = decision.decision == "APPROVE"
+        entries.append(
+            WorkspaceTimelineEntry(
+                kind=TL_RESPONSE_APPROVED if approved else TL_RESPONSE_REJECTED,
+                occurred_at=decision.decided_at,
+                title="Response approved" if approved else "Response rejected",
+                status=decision.decision,
+                ref_type="approval_decision",
+                ref_id=str(decision.id),
+                safe_metadata={"actor": decision.actor_subject_id},
+            )
+        )
+    if execution is not None:
+        ref = execution.execution_id or str(proposal.id)
+        entries.append(
+            WorkspaceTimelineEntry(
+                kind=TL_RESPONSE_EXECUTION_QUEUED,
+                occurred_at=execution.submitted_at,
+                title="Response execution queued",
+                status=_EXEC_QUEUED,
+                ref_type="response_execution",
+                ref_id=ref,
+            )
+        )
+        if execution.started_at is not None and execution.status != _EXEC_QUEUED:
+            entries.append(
+                WorkspaceTimelineEntry(
+                    kind=TL_RESPONSE_EXECUTION_STARTED,
+                    occurred_at=execution.started_at,
+                    title="Response execution started",
+                    status=execution.status,
+                    ref_type="response_execution",
+                    ref_id=ref,
+                )
+            )
+        if execution.finished_at is not None and execution.status in (
+            _EXEC_SUCCEEDED,
+            _EXEC_FAILED,
+        ):
+            succeeded = execution.status == _EXEC_SUCCEEDED
+            entries.append(
+                WorkspaceTimelineEntry(
+                    kind=(
+                        TL_RESPONSE_EXECUTION_SUCCEEDED
+                        if succeeded
+                        else TL_RESPONSE_EXECUTION_FAILED
+                    ),
+                    occurred_at=execution.finished_at,
+                    title=(
+                        "Response execution succeeded"
+                        if succeeded
+                        else "Response execution failed"
+                    ),
+                    status=execution.status,
+                    ref_type="response_execution",
+                    ref_id=ref,
+                    safe_metadata=(
+                        {"error_code": execution.safe_error_code}
+                        if execution.safe_error_code
+                        else {}
+                    ),
+                )
+            )
+    return entries
+
+
 def _compose(
     *,
     investigation: Investigation,
@@ -389,6 +632,8 @@ def _compose(
     findings: list[Finding],
     result: InvestigationResult | None,
     tool_records: list[ToolInvocationRecord],
+    response: WorkspaceResponseProjection | None = None,
+    response_entries: list[WorkspaceTimelineEntry] | None = None,
 ) -> InvestigationWorkspaceReadModel:
     latest = _latest_assessments(assessments)
     result_finding_ids = set(result.finding_ids) if result is not None else set()
@@ -431,19 +676,26 @@ def _compose(
             for f in sorted(findings, key=lambda f: (f.created_at, str(f.id)))
         ),
         result=_result(result) if result is not None else None,
+        response=response or WorkspaceResponseProjection(),
         tool_activity=tuple(
             _tool_activity(r)
             for r in sorted(tool_records, key=lambda r: (r.started_at, str(r.id)))
         ),
         timeline=tuple(
-            _build_timeline(
-                investigation=investigation,
-                plan_revisions=plan_revisions,
-                evidence=evidence,
-                assessments=assessments,
-                findings=findings,
-                result=result,
-                tool_records=tool_records,
+            sorted(
+                [
+                    *_build_timeline(
+                        investigation=investigation,
+                        plan_revisions=plan_revisions,
+                        evidence=evidence,
+                        assessments=assessments,
+                        findings=findings,
+                        result=result,
+                        tool_records=tool_records,
+                    ),
+                    *(response_entries or []),
+                ],
+                key=lambda e: (e.occurred_at, e.kind, e.ref_id or "", e.title),
             )
         ),
     )
@@ -488,6 +740,23 @@ class InvestigationWorkspaceService:
             tool_records = await uow.tool_invocations.list_by_investigation(
                 tenant_id=tenant_id, investigation_id=investigation_id
             )
+            proposal = await uow.response_proposals.get_by_investigation(
+                tenant_id=tenant_id, investigation_id=investigation_id
+            )
+            approval = None
+            decision = None
+            execution = None
+            if proposal is not None:
+                approval = await uow.response_approvals.get_request_by_proposal(
+                    tenant_id=tenant_id, proposal_id=proposal.id
+                )
+                if approval is not None:
+                    decision = await uow.response_approvals.get_decision(
+                        tenant_id=tenant_id, approval_request_id=approval.id
+                    )
+                execution = await uow.response_executions.get_by_proposal(
+                    tenant_id=tenant_id, proposal_id=proposal.id
+                )
         finally:
             await uow.close()
 
@@ -500,6 +769,19 @@ class InvestigationWorkspaceService:
             findings=findings,
             result=result,
             tool_records=tool_records,
+            response=_response_projection(
+                result=result,
+                proposal=proposal,
+                approval=approval,
+                decision=decision,
+                execution=execution,
+            ),
+            response_entries=_response_timeline_entries(
+                proposal=proposal,
+                approval=approval,
+                decision=decision,
+                execution=execution,
+            ),
         )
 
     async def lookup_alert_investigation(

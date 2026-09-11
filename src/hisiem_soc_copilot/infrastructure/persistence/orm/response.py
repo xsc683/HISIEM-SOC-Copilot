@@ -140,6 +140,10 @@ class ResponseExecutionRefRow(CopilotBase):
     __table_args__ = (
         UniqueConstraint("provider", "execution_id", name="uq_response_execution_provider_id"),
         UniqueConstraint("submission_key", name="uq_response_execution_submission_key"),
+        CheckConstraint(
+            "status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED')",
+            name="response_execution_status_valid",
+        ),
     )
 
     proposal_id: Mapped[UUID] = mapped_column(
@@ -148,6 +152,11 @@ class ResponseExecutionRefRow(CopilotBase):
     provider: Mapped[str] = mapped_column(Text, nullable=False)
     execution_id: Mapped[str] = mapped_column(Text, nullable=False)
     submission_key: Mapped[str] = mapped_column(Text, nullable=False)
-    last_observed_status: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
     submitted_at: Mapped[datetime] = mapped_column(nullable=False)
     last_observed_at: Mapped[datetime] = mapped_column(nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    safe_result: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    safe_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    safe_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

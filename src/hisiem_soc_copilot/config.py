@@ -143,6 +143,30 @@ class ApplicationSettings(BaseSettings):
     # Run the durable outbox dispatcher worker in-process. Disabled by default so
     # tests never start a rogue background worker; a deployment enables it.
     enable_dispatcher: bool = False
+    # Run the durable RESPONSE-execution worker in-process (submit approved
+    # actions through the SOAR port). Separate flag so a deployment can run graph
+    # dispatch without the response worker (and tests stay deterministic).
+    enable_response_worker: bool = False
+
+
+class SoarSettings(BaseSettings):
+    """Copilot → HISIEM SOAR execution boundary (server-to-server).
+
+    The bearer credential is a server-only secret read from the environment
+    (``SOAR_BEARER_TOKEN``); it is never a config default, never logged, and never
+    persisted on a proposal/execution row. The adapter fails closed when it is
+    blank (a real provider is never built without credentials).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SOAR_",
+        env_file=".env",
+        extra="ignore",
+    )
+
+    base_url: str = Field(default="http://127.0.0.1:8080")
+    bearer_token: str = Field(default="")
+    timeout_seconds: float = Field(default=10.0)
 
 
 class AuthSettings(BaseSettings):
@@ -205,6 +229,7 @@ class Settings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     langgraph: LangGraphSettings = Field(default_factory=LangGraphSettings)
     hisiem: HisiemSettings = Field(default_factory=HisiemSettings)
+    soar: SoarSettings = Field(default_factory=SoarSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     agent_budget: AgentBudgetSettings = Field(default_factory=AgentBudgetSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)

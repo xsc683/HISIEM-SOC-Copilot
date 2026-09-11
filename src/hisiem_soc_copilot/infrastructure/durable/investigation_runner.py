@@ -77,6 +77,10 @@ class AsyncInvestigationGraphRunner:
         self._checkpoint_settings = checkpoint_settings
         self._checkpointer_factory = checkpointer_factory
 
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
+        """OutboxRunner entry point — the aggregate id IS the investigation id."""
+        await self.run_investigation(investigation_id=aggregate_id, tenant_id=tenant_id)
+
     async def run_investigation(
         self, *, investigation_id: str, tenant_id: str
     ) -> None:

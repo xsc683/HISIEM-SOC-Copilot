@@ -137,4 +137,8 @@ class ResponseProposal:
             )
         self.status = allowed[command]
         self.updated_at = utc_now()
-        self.lock_version += 1
+        # ``lock_version`` is the optimistic-lock token owned by the repository:
+        # it is read on load and incremented on persist (see the SQLAlchemy repo's
+        # UPDATE ... WHERE lock_version = <loaded>). The aggregate must NOT bump it
+        # here, or the repository's WHERE clause would compare against the already
+        # advanced value and every update would spuriously conflict.

@@ -16,10 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.requests import Request
 
 from ..application.handlers.investigation import InvestigationCommandHandler
+from ..application.handlers.response import ResponseCommandHandler
 from ..application.handlers.workflow import InvestigationWorkflowHandler
 from ..application.ports.durable import OutboxStore
 from ..application.ports.hisiem import HisiemPort
 from ..application.ports.model_provider import ModelProvider
+from ..application.ports.soar import SoarPort
 from ..application.ports.trust import (
     ServiceAuthenticationError,
     TrustedContextProvider,
@@ -37,10 +39,12 @@ from ..infrastructure.durable.dispatcher import AsyncOutboxDispatcher
 from ..infrastructure.durable.investigation_runner import (
     AsyncInvestigationGraphRunner,
 )
+from ..infrastructure.durable.response_runner import ResponseExecutionRunner
 from ..infrastructure.hisiem.adapter import HisiemHttpAdapter
 from ..infrastructure.persistence.database import build_engine, build_session_factory
 from ..infrastructure.persistence.repositories.durable import SqlAlchemyOutboxStore
 from ..infrastructure.persistence.unit_of_work import SqlAlchemyUnitOfWork
+from ..infrastructure.soar.adapter import HisiemSoarAdapter
 
 
 class Container:
@@ -51,7 +55,9 @@ class Container:
         self.copilot_engine: AsyncEngine | None = None
         self.copilot_sessions: async_sessionmaker[AsyncSession] | None = None
         self.hisiem_adapter: HisiemHttpAdapter | None = None
+        self.soar_adapter: HisiemSoarAdapter | None = None
         self.dispatcher: AsyncOutboxDispatcher | None = None
+        self.response_dispatcher: AsyncOutboxDispatcher | None = None
 
     # --- async resource lifecycle (called from lifespan) ---
     async def open(self) -> None:
@@ -66,10 +72,20 @@ class Container:
         if self.settings.app.enable_dispatcher:
             self.dispatcher = self.outbox_dispatcher()
             await self.dispatcher.start()
+        if self.settings.app.enable_response_worker:
+            # The SOAR adapter fails closed (blank bearer → ExternalServiceError) so
+            # the response worker can never run without a service credential.
+            self.soar_adapter = self.soar()
+            self.response_dispatcher = self.response_outbox_dispatcher()
+            await self.response_dispatcher.start()
 
     async def close(self) -> None:
+        if self.response_dispatcher is not None:
+            await self.response_dispatcher.stop()
         if self.dispatcher is not None:
             await self.dispatcher.stop()
+        if self.soar_adapter is not None:
+            await self.soar_adapter.close()
         if self.hisiem_adapter is not None:
             await self.hisiem_adapter.close()
         if self.copilot_engine is not None:
@@ -184,6 +200,45 @@ class Container:
             resolver=resolver,
             runner=runner,
             worker_name="copilot-dispatcher",
+        )
+
+    def soar(self) -> HisiemSoarAdapter:
+        """Build the HISIEM SOAR adapter (fails closed on a blank credential)."""
+        return HisiemSoarAdapter(settings=self.settings.soar)
+
+    def response_command_handler(self) -> ResponseCommandHandler:
+        if self.copilot_sessions is None:
+            raise RuntimeError("container must be opened before use")
+        return ResponseCommandHandler(
+            unit_of_work_factory=self.unit_of_work_factory(),
+        )
+
+    def response_runner(self, *, soar: SoarPort | None = None) -> ResponseExecutionRunner:
+        adapter = soar if soar is not None else (
+            self.soar_adapter or self.soar()
+        )
+        return ResponseExecutionRunner(
+            unit_of_work_factory=self.unit_of_work_factory(),
+            soar=adapter,
+        )
+
+    def response_outbox_dispatcher(
+        self, *, soar: SoarPort | None = None
+    ) -> AsyncOutboxDispatcher:
+        """Build the durable dispatcher for the response-execution destination."""
+        from ..infrastructure.durable.dispatcher import (
+            RESPONSE_DESTINATION,
+            SqlAlchemyOutboxResolver,
+        )
+
+        resolver = SqlAlchemyOutboxResolver(self.session_factory())
+        runner = self.response_runner(soar=soar)
+        return AsyncOutboxDispatcher(
+            outbox_store=self.outbox_store(),
+            resolver=resolver,
+            runner=runner,
+            worker_name="copilot-response-dispatcher",
+            destination=RESPONSE_DESTINATION,
         )
 
     def _resolve_hisiem_service_token(self) -> str:

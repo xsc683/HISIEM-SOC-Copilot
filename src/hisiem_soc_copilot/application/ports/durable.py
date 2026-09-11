@@ -17,6 +17,13 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from ...domain.investigation.events import InvestigationEvent
+from ...domain.response.events import ResponseEvent
+
+#: Domain events that may be appended to the ledger. ``InvestigationEvent`` and
+#: ``ResponseEvent`` share an identical structural shape (event_id / event_type /
+#: aggregate_type / aggregate_id / tenant_id / correlation_id / causation_id /
+#: actor_subject_id / occurred_at / payload), so the ledger treats them uniformly.
+AppendableEvent = InvestigationEvent | ResponseEvent
 
 
 @dataclass(frozen=True)
@@ -123,7 +130,9 @@ class OutboxRecord:
 class EventLedger(Protocol):
     """Append-only domain-event + outbox persistence inside one transaction."""
 
-    async def append(self, event: InvestigationEvent, *, aggregate_revision: int) -> None: ...
+    async def append(
+        self, event: AppendableEvent, *, aggregate_revision: int
+    ) -> None: ...
 
     async def get(self, *, event_id: UUID) -> DomainEventEnvelope | None: ...
 
@@ -210,7 +219,11 @@ class OutboxStore(Protocol):
         limit: int,
         available_before: datetime,
         lease_timeout_seconds: int = 60,
-    ) -> list[OutboxRecord]: ...
+        destination: str | None = None,
+    ) -> list[OutboxRecord]:
+        """Claim ready messages. ``destination`` (when set) scopes the claim to one
+        destination, so a dispatcher never claims another destination's rows."""
+        ...
 
     async def renew_lease(
         self,

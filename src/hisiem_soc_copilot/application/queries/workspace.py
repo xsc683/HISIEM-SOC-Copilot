@@ -196,6 +196,84 @@ class WorkspaceTimelineEntry:
 
 
 @dataclass(frozen=True)
+class WorkspaceResponseTarget:
+    provider: str
+    resource_type: str
+    address_id: str
+    business_id: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceApprovalDecision:
+    decision: str
+    actor_subject_id: str
+    actor_display_name: str | None
+    reason: str | None
+    decided_at: datetime
+
+
+@dataclass(frozen=True)
+class WorkspaceApproval:
+    """Approval contract + (optional) immutable decision for one proposal."""
+
+    request_id: UUID
+    requested_at: datetime
+    requested_reason: str
+    expected_revision: int
+    expected_content_hash: str
+    decision: WorkspaceApprovalDecision | None = None
+
+    @property
+    def status(self) -> str:
+        return "DECIDED" if self.decision is not None else "PENDING"
+
+
+@dataclass(frozen=True)
+class WorkspaceExecution:
+    provider: str
+    status: str
+    submitted_at: datetime
+    last_observed_at: datetime
+    external_execution_id: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    safe_result: dict[str, Any] = field(default_factory=dict)
+    safe_error_code: str | None = None
+    safe_error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceResponseProposal:
+    proposal_id: UUID
+    revision: int
+    content_hash: str
+    status: str
+    action_key: str
+    parameters: dict[str, Any]
+    reason: str
+    target_refs: tuple[WorkspaceResponseTarget, ...] = ()
+    evidence_ids: tuple[UUID, ...] = ()
+    policy_decision: str | None = None
+    policy_reason: str | None = None
+    created_at: datetime | None = None
+    approval: WorkspaceApproval | None = None
+    execution: WorkspaceExecution | None = None
+
+
+@dataclass(frozen=True)
+class WorkspaceResponseProjection:
+    """The Response tab projection: informational recommendations + typed proposals.
+
+    ``recommendations`` are the InvestigationResult's explanatory output (never
+    executable); ``proposals`` are the validated, approval-bound, executable
+    contracts. The two are deliberately SEPARATE (spec §4).
+    """
+
+    recommendations: tuple[WorkspaceResponseRecommendation, ...] = ()
+    proposals: tuple[WorkspaceResponseProposal, ...] = ()
+
+
+@dataclass(frozen=True)
 class InvestigationWorkspaceReadModel:
     """The full analyst-facing Workspace projection for one Investigation."""
 
@@ -206,6 +284,9 @@ class InvestigationWorkspaceReadModel:
     hypotheses: tuple[WorkspaceHypothesis, ...] = ()
     findings: tuple[WorkspaceFinding, ...] = ()
     result: WorkspaceResult | None = None
+    response: WorkspaceResponseProjection = field(
+        default_factory=WorkspaceResponseProjection
+    )
     tool_activity: tuple[WorkspaceToolActivity, ...] = ()
     timeline: tuple[WorkspaceTimelineEntry, ...] = ()
 

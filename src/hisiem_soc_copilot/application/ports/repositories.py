@@ -22,6 +22,12 @@ from ...domain.investigation.entities import (
 from ...domain.investigation.value_objects import (
     ExternalResourceRef,
 )
+from ...domain.response.aggregate import ResponseProposal
+from ...domain.response.value_objects import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ResponseExecutionRef,
+)
 
 
 class InvestigationRepository(Protocol):
@@ -157,3 +163,60 @@ class PlanRevisionRepository(Protocol):
     async def list_by_investigation(
         self, *, tenant_id: str, investigation_id: UUID
     ) -> list[PlanRevision]: ...
+
+
+class ResponseProposalRepository(Protocol):
+    """Tenant-scoped persistence for the ResponseProposal aggregate.
+
+    ``get``/``get_by_*`` return the proposal WITH its target refs and evidence
+    links loaded, so the approval content-hash contract can be re-verified and the
+    workspace projection rendered without a second round-trip.
+    """
+
+    async def add(self, proposal: ResponseProposal) -> None: ...
+
+    async def update(self, proposal: ResponseProposal) -> None: ...
+
+    async def get(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseProposal | None: ...
+
+    async def get_by_investigation(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> ResponseProposal | None: ...
+
+    async def get_by_result(
+        self, *, tenant_id: str, result_id: UUID
+    ) -> ResponseProposal | None: ...
+
+
+class ResponseApprovalRepository(Protocol):
+    async def add_request(self, request: ApprovalRequest) -> None: ...
+
+    async def get_request(
+        self, *, tenant_id: str, approval_request_id: UUID
+    ) -> ApprovalRequest | None: ...
+
+    async def get_request_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ApprovalRequest | None: ...
+
+    async def add_decision(self, decision: ApprovalDecision) -> None: ...
+
+    async def get_decision(
+        self, *, tenant_id: str, approval_request_id: UUID
+    ) -> ApprovalDecision | None: ...
+
+
+class ResponseExecutionRepository(Protocol):
+    async def add(self, execution: ResponseExecutionRef) -> None: ...
+
+    async def update(self, execution: ResponseExecutionRef) -> None: ...
+
+    async def get_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseExecutionRef | None: ...
+
+    async def get_by_execution_id(
+        self, *, tenant_id: str, execution_id: str
+    ) -> ResponseExecutionRef | None: ...

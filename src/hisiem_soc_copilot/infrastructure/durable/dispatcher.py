@@ -26,19 +26,35 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ...application.ports.durable import OutboxRecord, OutboxStore
 from ..persistence.orm.events import DomainEventRow
-from .investigation_runner import AsyncInvestigationGraphRunner, NonRetryableRunError
+from .investigation_runner import NonRetryableRunError
 
 logger = logging.getLogger(__name__)
 
-_DISPATCHER_DESTINATION = "investigation.graph.run"
+# Outbox destinations — one dispatcher claims exactly one destination. The
+# event→destination map that enqueues these lives in
+# ``infrastructure.persistence.repositories.durable._EVENT_DESTINATIONS``.
+INVESTIGATION_DESTINATION = "investigation.graph.run"
+RESPONSE_DESTINATION = "response.execution.run"
+_DISPATCHER_DESTINATION = INVESTIGATION_DESTINATION
 _MAX_ATTEMPTS = 10
 _LEASE_TIMEOUT_SECONDS = 60
 
 
 class Resolver(Protocol):
-    """Maps a claimed outbox record to the event's (tenant_id, investigation_id)."""
+    """Maps a claimed outbox record to the event's (tenant_id, aggregate_id)."""
 
     async def resolve(self, *, event_id: UUID) -> tuple[str, str] | None: ...
+
+
+class OutboxRunner(Protocol):
+    """A durable consumer for one outbox destination.
+
+    ``aggregate_id`` is the STRING id of the originating event's aggregate
+    (investigation_id for the graph runner, proposal_id for the response runner);
+    the runner reloads authoritative state from there — it never trusts a payload.
+    """
+
+    async def run(self, *, aggregate_id: str, tenant_id: str) -> None: ...
 
 
 class SqlAlchemyOutboxResolver:
@@ -60,15 +76,16 @@ class SqlAlchemyOutboxResolver:
 
 
 class AsyncOutboxDispatcher:
-    """Claims outbox rows and delivers each to the investigation runner."""
+    """Claims outbox rows for ONE destination and delivers them to its runner."""
 
     def __init__(
         self,
         *,
         outbox_store: OutboxStore,
         resolver: Resolver,
-        runner: AsyncInvestigationGraphRunner,
+        runner: OutboxRunner,
         worker_name: str,
+        destination: str = _DISPATCHER_DESTINATION,
         poll_interval_seconds: float = 1.0,
         batch_size: int = 8,
     ) -> None:
@@ -76,20 +93,21 @@ class AsyncOutboxDispatcher:
         self._resolver = resolver
         self._runner = runner
         self._worker = worker_name
+        self._destination = destination
         self._poll = poll_interval_seconds
         self._batch = batch_size
-        # in-process guard so one investigation is never double-run concurrently
+        # in-process guard so one aggregate is never double-run concurrently
         self._running: dict[UUID, asyncio.Lock] = {}
         self._guard = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
         self._stop = False
 
-    async def _lock_for(self, investigation_id: UUID) -> asyncio.Lock:
+    async def _lock_for(self, aggregate_id: UUID) -> asyncio.Lock:
         async with self._guard:
-            lock = self._running.get(investigation_id)
+            lock = self._running.get(aggregate_id)
             if lock is None:
                 lock = asyncio.Lock()
-                self._running[investigation_id] = lock
+                self._running[aggregate_id] = lock
             return lock
 
     async def drain_once(self) -> int:
@@ -100,6 +118,7 @@ class AsyncOutboxDispatcher:
             limit=self._batch,
             available_before=now,
             lease_timeout_seconds=_LEASE_TIMEOUT_SECONDS,
+            destination=self._destination,
         )
         if not claimed:
             return 0
@@ -110,7 +129,7 @@ class AsyncOutboxDispatcher:
         return delivered
 
     async def _deliver(self, record: OutboxRecord) -> None:
-        if record.destination != _DISPATCHER_DESTINATION:
+        if record.destination != self._destination:
             await self._outbox.mark_dead_letter(
                 outbox_id=record.id,
                 lease_token=record.lease_token,
@@ -131,41 +150,38 @@ class AsyncOutboxDispatcher:
                 published_at=datetime.now(UTC),
             )
             return
-        tenant_id, investigation_id = target
-        lock = await self._lock_for(UUID(investigation_id))
+        tenant_id, aggregate_id = target
+        lock = await self._lock_for(UUID(aggregate_id))
         async with lock:
             try:
-                # A long investigation (up to the runtime duration budget) must not
-                # be stolen by the fixed lease: renew the lease WHILE the run is in
-                # flight. Each renewal is token-fenced, so only the current owner
-                # extends the lease; a stale worker's renewal is a no-op.
+                # A long run (up to the runtime duration budget) must not be stolen
+                # by the fixed lease: renew the lease WHILE the run is in flight.
+                # Each renewal is token-fenced, so only the current owner extends
+                # the lease; a stale worker's renewal is a no-op.
                 await self._run_with_lease_renewal(
                     record,
-                    lambda: self._runner.run_investigation(
-                        investigation_id=investigation_id, tenant_id=tenant_id
+                    lambda: self._runner.run(
+                        aggregate_id=aggregate_id, tenant_id=tenant_id
                     ),
                 )
             except NonRetryableRunError as exc:
-                # A deterministic configuration failure (e.g. MODEL_CONFIGURATION)
-                # can never be fixed by retry/backoff — DEAD_LETTER immediately. The
-                # investigation was already marked FAILED/FAILED_FATAL by the runner;
-                # no retry loop, no provider exception text persisted.
+                # A deterministic configuration failure can never be fixed by
+                # retry/backoff — DEAD_LETTER immediately, no retry loop, no
+                # provider exception text persisted.
                 await self._outbox.mark_dead_letter(
                     outbox_id=record.id,
                     lease_token=record.lease_token,
                     error_code=exc.code,
                 )
                 logger.warning(
-                    "investigation %s run failed NON-RETRYABLE (%s); dead-lettered",
-                    investigation_id,
+                    "aggregate %s run failed NON-RETRYABLE (%s); dead-lettered",
+                    aggregate_id,
                     exc.code,
                 )
                 return
             except Exception as exc:  # recoverable: retry with backoff
                 await self._fail(record, "RUN_FAILED")
-                logger.warning(
-                    "investigation %s run failed: %s", investigation_id, exc
-                )
+                logger.warning("aggregate %s run failed: %s", aggregate_id, exc)
                 return
         await self._outbox.mark_published(
             outbox_id=record.id,

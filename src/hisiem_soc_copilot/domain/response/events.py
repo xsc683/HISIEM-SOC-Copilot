@@ -78,3 +78,57 @@ def response_approval_decided(
         actor_subject_id=actor_subject_id,
         payload={"request_id": str(request_id), "decision": decision},
     )
+
+
+def response_execution_queued(
+    aggregate_id: UUID,
+    *,
+    execution_id: UUID,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """The ONLY response event that enqueues an outbox delivery (durable worker)."""
+    return ResponseEvent(
+        event_type="response_execution_queued",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={"execution_id": str(execution_id)},
+    )
+
+
+def response_execution_started(
+    aggregate_id: UUID, *, tenant_id: str | None = None
+) -> ResponseEvent:
+    return ResponseEvent(
+        event_type="response_execution_started",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={},
+    )
+
+
+def response_execution_succeeded(
+    aggregate_id: UUID,
+    *,
+    external_execution_id: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    return ResponseEvent(
+        event_type="response_execution_succeeded",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={"external_execution_id": external_execution_id},
+    )
+
+
+def response_execution_failed(
+    aggregate_id: UUID,
+    *,
+    error_code: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    return ResponseEvent(
+        event_type="response_execution_failed",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={"error_code": error_code},
+    )

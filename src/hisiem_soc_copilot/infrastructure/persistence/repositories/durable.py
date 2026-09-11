@@ -18,6 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ....application.ports.durable import (
+    AppendableEvent,
     CommandReceiptRecord,
     CommandReceiptStore,
     DomainEventEnvelope,
@@ -30,7 +31,6 @@ from ....application.ports.durable import (
     ToolInvocationRecord,
     ToolInvocationStore,
 )
-from ....domain.investigation.events import InvestigationEvent
 from ..orm.events import (
     CommandReceiptRow,
     DomainEventRow,
@@ -40,14 +40,14 @@ from ..orm.events import (
 )
 from ..orm.investigation import InvestigationRow
 
-_OUTBOX_DESTINATION = "investigation.graph.run"
-
-# Events that must trigger an outbound delivery. In V1 the only outbox consumer
-# is the durable graph runner, which is launched once when an investigation is
-# created. Graph-internal events (phase/evidence/hypothesis/finding...) are
-# persisted as domain_event rows for audit but never enqueue a delivery, so a
-# running investigation does not pile up duplicate dispatch work.
-_ORCHESTRATION_EVENTS: frozenset[str] = frozenset({"investigation_created"})
+# Destination per outbox-triggering domain event. Only these events enqueue an
+# outbound delivery; every other event is persisted as an audit domain_event row
+# and never piles up dispatch work. Each destination is served by exactly one
+# dispatcher (which claims only its own destination).
+_EVENT_DESTINATIONS: dict[str, str] = {
+    "investigation_created": "investigation.graph.run",
+    "response_execution_queued": "response.execution.run",
+}
 
 
 class SqlAlchemyEventLedger(EventLedger):
@@ -57,7 +57,7 @@ class SqlAlchemyEventLedger(EventLedger):
         self._session = session
 
     async def append(
-        self, event: InvestigationEvent, *, aggregate_revision: int
+        self, event: AppendableEvent, *, aggregate_revision: int
     ) -> None:
         now = datetime.now(UTC)
         self._session.add(
@@ -76,12 +76,12 @@ class SqlAlchemyEventLedger(EventLedger):
                 occurred_at=event.occurred_at,
             )
         )
-        if event.event_type in _ORCHESTRATION_EVENTS:
+        if event.event_type in _EVENT_DESTINATIONS:
             self._session.add(
                 OutboxMessageRow(
                     id=uuid4(),
                     event_id=event.event_id,
-                    destination=_OUTBOX_DESTINATION,
+                    destination=_EVENT_DESTINATIONS[event.event_type],
                     status="PENDING",
                     attempt_count=0,
                     available_at=now,
@@ -385,6 +385,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
         limit: int,
         available_before: datetime,
         lease_timeout_seconds: int = 60,
+        destination: str | None = None,
     ) -> list[OutboxRecord]:
         """Atomically claim up to ``limit`` ready messages for one worker.
 
@@ -401,7 +402,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
         holder. Settlements must later present this token.
         """
         async with self._factory() as session:
-            rows = await session.execute(
+            statement = (
                 select(OutboxMessageRow)
                 .where(
                     or_(
@@ -421,8 +422,13 @@ class SqlAlchemyOutboxStore(OutboxStore):
                         ),
                     )
                 )
-                .order_by(OutboxMessageRow.created_at)
-                .limit(limit)
+            )
+            if destination is not None:
+                statement = statement.where(
+                    OutboxMessageRow.destination == destination
+                )
+            rows = await session.execute(
+                statement.order_by(OutboxMessageRow.created_at).limit(limit)
             )
             claimed: list[OutboxRecord] = []
             for row in rows.scalars().all():

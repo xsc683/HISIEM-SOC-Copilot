@@ -264,3 +264,47 @@ async def test_valid_bearer_does_not_bypass_tenant_isolation(
     )
     assert foreign.status_code == 404
     assert investigation_id not in foreign.text
+
+
+# §44: EVERY request-time service-auth failure must be externally
+# indistinguishable — same status, same code, same message — so the boundary
+# leaks no authentication oracle (which factor failed, or whether any did).
+_AUTH_FAILURE_VECTORS: dict[str, dict[str, str]] = {
+    "no_headers": {},
+    "headers_without_bearer": {"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "analyst"},
+    "wrong_bearer": {
+        "Authorization": "Bearer not-the-service-secret",
+        "X-Tenant-ID": "tenant-a",
+        "X-Actor-Subject": "analyst",
+    },
+    "valid_bearer_missing_tenant": {
+        "Authorization": f"Bearer {_SECRET}",
+        "X-Actor-Subject": "analyst",
+    },
+    "valid_bearer_missing_actor": {
+        "Authorization": f"Bearer {_SECRET}",
+        "X-Tenant-ID": "tenant-a",
+    },
+    "empty_bearer": {
+        "Authorization": "Bearer ",
+        "X-Tenant-ID": "tenant-a",
+        "X-Actor-Subject": "analyst",
+    },
+}
+
+
+@pytest.mark.parametrize("vector", list(_AUTH_FAILURE_VECTORS))
+async def test_auth_failures_are_indistinguishable(
+    boundary_client: tuple[httpx.AsyncClient, Any],
+    vector: str,
+) -> None:
+    client, _ = boundary_client
+    res = await client.get(
+        "/api/v1/investigations/lookup",
+        params={"provider": "hisiem", "resource_type": "alert", "address_id": _ALERT},
+        headers=_AUTH_FAILURE_VECTORS[vector],
+    )
+    assert res.status_code == 401, (vector, res.text)
+    body = res.json()
+    assert body["code"] == "SERVICE_AUTHENTICATION_FAILED", vector
+    assert body["message"] == "service authentication failed", vector

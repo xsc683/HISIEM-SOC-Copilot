@@ -24,6 +24,9 @@ from ...application.ports.repositories import (
     HypothesisRepository,
     InvestigationRepository,
     PlanRevisionRepository,
+    ResponseApprovalRepository,
+    ResponseExecutionRepository,
+    ResponseProposalRepository,
     ResultRepository,
 )
 from ...domain.investigation.errors import ActiveInvestigationExistsError
@@ -42,6 +45,11 @@ from .repositories.durable import (
     SqlAlchemyToolInvocationStore,
 )
 from .repositories.investigation import SqlAlchemyInvestigationRepository
+from .repositories.response import (
+    SqlAlchemyResponseApprovalRepository,
+    SqlAlchemyResponseExecutionRepository,
+    SqlAlchemyResponseProposalRepository,
+)
 
 # The partial unique index that guarantees at most one Active Investigation per
 # Tenant + Alert (persistence-schema.md §6). Only a conflict on THIS constraint is
@@ -83,6 +91,15 @@ class SqlAlchemyUnitOfWork:
             self._session
         )
         self.results: ResultRepository = SqlAlchemyResultRepository(self._session)
+        self.response_proposals: ResponseProposalRepository = (
+            SqlAlchemyResponseProposalRepository(self._session)
+        )
+        self.response_approvals: ResponseApprovalRepository = (
+            SqlAlchemyResponseApprovalRepository(self._session)
+        )
+        self.response_executions: ResponseExecutionRepository = (
+            SqlAlchemyResponseExecutionRepository(self._session)
+        )
         # Durable stores bound to the SAME session/transaction as the domain rows.
         self.events: EventLedger = SqlAlchemyEventLedger(self._session)
         self.command_receipts: CommandReceiptStore = SqlAlchemyCommandReceiptStore(

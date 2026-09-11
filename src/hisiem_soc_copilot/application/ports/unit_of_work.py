@@ -23,6 +23,9 @@ from .repositories import (
     HypothesisRepository,
     InvestigationRepository,
     PlanRevisionRepository,
+    ResponseApprovalRepository,
+    ResponseExecutionRepository,
+    ResponseProposalRepository,
     ResultRepository,
 )
 
@@ -45,6 +48,9 @@ class UnitOfWork(Protocol):
     hypothesis_assessments: HypothesisAssessmentRepository
     plan_revisions: PlanRevisionRepository
     results: ResultRepository
+    response_proposals: ResponseProposalRepository
+    response_approvals: ResponseApprovalRepository
+    response_executions: ResponseExecutionRepository
     events: EventLedger
     command_receipts: CommandReceiptStore
     bindings: OrchestrationBindingStore

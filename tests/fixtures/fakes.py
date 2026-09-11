@@ -20,6 +20,7 @@ from hisiem_soc_copilot.application.ports.durable import (
     OutboxRecord,
     ToolInvocationRecord,
 )
+from hisiem_soc_copilot.application.ports.soar import SoarExecutionResult
 from hisiem_soc_copilot.application.ports.unit_of_work import UnitOfWork
 from hisiem_soc_copilot.domain.investigation.aggregate import Investigation
 from hisiem_soc_copilot.domain.investigation.entities import (
@@ -32,6 +33,12 @@ from hisiem_soc_copilot.domain.investigation.entities import (
 )
 from hisiem_soc_copilot.domain.investigation.events import InvestigationEvent
 from hisiem_soc_copilot.domain.investigation.value_objects import ExternalResourceRef
+from hisiem_soc_copilot.domain.response.aggregate import ResponseProposal
+from hisiem_soc_copilot.domain.response.value_objects import (
+    ApprovalDecision,
+    ApprovalRequest,
+    ResponseExecutionRef,
+)
 
 
 @dataclass
@@ -82,6 +89,7 @@ class FakeOutboxStore:
         limit: int,
         available_before: Any,
         lease_timeout_seconds: int = 60,
+        destination: str | None = None,
     ) -> list[OutboxRecord]:
         # The fake owns its own clock (``self.now``) so tests can drive lease
         # expiry via ``advance()`` deterministically.
@@ -90,6 +98,7 @@ class FakeOutboxStore:
             self.rows[row_event_id]
             for row_event_id, row in self.rows.items()
             if self._claimable(row, lease_timeout_seconds)
+            and (destination is None or row["destination"] == destination)
         ]
         ready.sort(key=lambda r: r["event_id"])  # deterministic order
         claimed: list[OutboxRecord] = []
@@ -207,10 +216,10 @@ class FakeOutboxStore:
 class FakeEventLedger:
     """In-memory domain_event store (no real outbox dispatch)."""
 
-    events: list[InvestigationEvent] = field(default_factory=list)
+    events: list[Any] = field(default_factory=list)
     revisions: dict[UUID, int] = field(default_factory=dict)
 
-    async def append(self, event: InvestigationEvent, *, aggregate_revision: int) -> None:
+    async def append(self, event: Any, *, aggregate_revision: int) -> None:
         self.events.append(event)
         self.revisions[event.aggregate_id] = aggregate_revision
 
@@ -623,6 +632,152 @@ class FakeResultRepository:
         return None
 
 
+class FakeResponseProposalRepository:
+    def __init__(self) -> None:
+        self._store: dict[UUID, ResponseProposal] = {}
+
+    async def add(self, proposal: ResponseProposal) -> None:
+        self._store[proposal.id] = proposal
+
+    async def update(self, proposal: ResponseProposal) -> None:
+        self._store[proposal.id] = proposal
+
+    async def get(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseProposal | None:
+        return self._store.get(proposal_id)
+
+    async def get_by_investigation(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> ResponseProposal | None:
+        for proposal in self._store.values():
+            if proposal.investigation_id == investigation_id:
+                return proposal
+        return None
+
+    async def get_by_result(
+        self, *, tenant_id: str, result_id: UUID
+    ) -> ResponseProposal | None:
+        for proposal in self._store.values():
+            if proposal.result_id == result_id:
+                return proposal
+        return None
+
+
+class FakeResponseApprovalRepository:
+    def __init__(self) -> None:
+        self._requests: dict[UUID, ApprovalRequest] = {}
+        self._decisions: dict[UUID, ApprovalDecision] = {}
+
+    async def add_request(self, request: ApprovalRequest) -> None:
+        self._requests[request.id] = request
+
+    async def get_request(
+        self, *, tenant_id: str, approval_request_id: UUID
+    ) -> ApprovalRequest | None:
+        return self._requests.get(approval_request_id)
+
+    async def get_request_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ApprovalRequest | None:
+        for request in self._requests.values():
+            if request.proposal_id == proposal_id:
+                return request
+        return None
+
+    async def add_decision(self, decision: ApprovalDecision) -> None:
+        if decision.approval_request_id in self._decisions:
+            raise KeyError("approval decision already exists")
+        self._decisions[decision.approval_request_id] = decision
+
+    async def get_decision(
+        self, *, tenant_id: str, approval_request_id: UUID
+    ) -> ApprovalDecision | None:
+        return self._decisions.get(approval_request_id)
+
+
+class FakeResponseExecutionRepository:
+    def __init__(self) -> None:
+        self._store: dict[UUID, ResponseExecutionRef] = {}
+
+    async def add(self, execution: ResponseExecutionRef) -> None:
+        self._store[execution.proposal_id] = execution
+
+    async def update(self, execution: ResponseExecutionRef) -> None:
+        self._store[execution.proposal_id] = execution
+
+    async def get_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseExecutionRef | None:
+        return self._store.get(proposal_id)
+
+    async def get_by_execution_id(
+        self, *, tenant_id: str, execution_id: str
+    ) -> ResponseExecutionRef | None:
+        for execution in self._store.values():
+            if execution.execution_id == execution_id:
+                return execution
+        return None
+
+
+class FakeSoar:
+    """In-memory SoarPort for response-worker tests.
+
+    ``submit_result`` is returned by ``submit_execution``; ``status_sequence`` is
+    drained by ``get_execution_status`` (polling). ``raise_on_submit`` /
+    ``raise_on_status`` inject transport/definitive failures.
+    """
+
+    def __init__(
+        self,
+        *,
+        submit_result: SoarExecutionResult | None = None,
+        status_sequence: list[str] | None = None,
+        raise_on_submit: Exception | None = None,
+        raise_on_status: Exception | None = None,
+    ) -> None:
+        self.submit_result = submit_result or SoarExecutionResult(
+            execution_id="hisiem-exec-1", status="SUCCEEDED"
+        )
+        self.status_sequence = list(status_sequence or [])
+        self.raise_on_submit = raise_on_submit
+        self.raise_on_status = raise_on_status
+        self.submitted: list[dict[str, object]] = []
+        self.status_calls: list[str] = []
+
+    async def submit_execution(
+        self,
+        *,
+        tenant_id: str,
+        proposal_id: UUID,
+        submission_key: str,
+        action_key: str,
+        parameters: dict[str, object],
+        target_ref: object,
+    ) -> SoarExecutionResult:
+        self.submitted.append(
+            {
+                "tenant_id": tenant_id,
+                "proposal_id": proposal_id,
+                "submission_key": submission_key,
+                "action_key": action_key,
+                "parameters": dict(parameters),
+            }
+        )
+        if self.raise_on_submit is not None:
+            raise self.raise_on_submit
+        return self.submit_result
+
+    async def get_execution_status(
+        self, *, tenant_id: str, execution_id: str
+    ) -> SoarExecutionResult:
+        self.status_calls.append(execution_id)
+        if self.raise_on_status is not None:
+            raise self.raise_on_status
+        status = self.status_sequence.pop(0) if self.status_sequence else "SUCCEEDED"
+        return SoarExecutionResult(execution_id=execution_id, status=status)
+
+
 class FakeUnitOfWork:
     """In-memory UoW over all child repos (no real transaction).
 
@@ -639,6 +794,9 @@ class FakeUnitOfWork:
             HypothesisRepository,
             InvestigationRepository,
             PlanRevisionRepository,
+            ResponseApprovalRepository,
+            ResponseExecutionRepository,
+            ResponseProposalRepository,
             ResultRepository,
         )
 
@@ -651,6 +809,15 @@ class FakeUnitOfWork:
         )
         self.plan_revisions: PlanRevisionRepository = FakePlanRevisionRepository()
         self.results: ResultRepository = FakeResultRepository()
+        self.response_proposals: ResponseProposalRepository = (
+            FakeResponseProposalRepository()
+        )
+        self.response_approvals: ResponseApprovalRepository = (
+            FakeResponseApprovalRepository()
+        )
+        self.response_executions: ResponseExecutionRepository = (
+            FakeResponseExecutionRepository()
+        )
         self.events = FakeEventLedger()
         self.command_receipts = FakeCommandReceiptStore()
         self.bindings = FakeOrchestrationBindingStore()
@@ -697,6 +864,9 @@ class FakeUnitOfWorkFactory:
         self._assessments = FakeHypothesisAssessmentRepository(self._hypotheses)
         self._plans = FakePlanRevisionRepository()
         self._results = FakeResultRepository()
+        self._response_proposals = FakeResponseProposalRepository()
+        self._response_approvals = FakeResponseApprovalRepository()
+        self._response_executions = FakeResponseExecutionRepository()
         self.events = FakeEventLedger()
         self.command_receipts = FakeCommandReceiptStore()
         self.bindings = FakeOrchestrationBindingStore()
@@ -712,6 +882,9 @@ class FakeUnitOfWorkFactory:
         uow.hypothesis_assessments = self._assessments
         uow.plan_revisions = self._plans
         uow.results = self._results
+        uow.response_proposals = self._response_proposals
+        uow.response_approvals = self._response_approvals
+        uow.response_executions = self._response_executions
         uow.events = self.events
         uow.command_receipts = self.command_receipts
         uow.bindings = self.bindings
