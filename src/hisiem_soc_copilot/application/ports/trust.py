@@ -2,14 +2,18 @@
 
 The API and application depend on a ``TrustedContextProvider`` abstraction — never
 on raw request headers or a body. A ``TrustedContext`` is only ever produced by a
-provider that has authenticated the caller (currently a development/test-only
-adapter in ``infrastructure``); it is never declared by an ordinary client request
-(domain-model.md §44: tenant_id / initiated_by come from the authenticated
-principal, not from the request body or the model).
+provider that has authenticated the caller; it is never declared by an ordinary
+client request (domain-model.md §44: tenant_id / initiated_by come from the
+authenticated principal, not from the request body or the model).
 
-Production identity/auth is intentionally NOT implemented in this round; the
-provider seam exists so a real authenticator can be wired later without touching
-the API/application layers.
+Trust boundary (P1): the browser authenticates to HISIEM, never to Copilot.
+HISIEM authenticates to Copilot with a server-only service credential; ONLY after
+that service authentication succeeds may Copilot trust the ``X-Tenant-ID`` /
+``X-Actor-Subject`` context HISIEM supplies (see
+``infrastructure.auth.hisiem_service_provider.HisiemServiceTrustedContextProvider``).
+``HeaderTrustedContextProvider`` reads those headers with no authentication and is
+a development/test adapter only — it must never be selected for a production or
+integrated runtime.
 """
 
 from __future__ import annotations
@@ -36,6 +40,19 @@ class UntrustedRequestError(DomainError):
     """Raised when a request cannot be authenticated into a TrustedContext."""
 
     code = "UNTRUSTED_REQUEST"
+
+
+class ServiceAuthenticationError(UntrustedRequestError):
+    """Raised when the HISIEM service caller cannot be authenticated.
+
+    Distinct from a generic untrusted request: this is a service-to-service
+    authentication failure (missing/invalid service credential, or a missing
+    server-asserted tenant/actor) and maps to HTTP 401. The message is generic —
+    it never reveals whether a credential was close, wrong-length, or which part
+    of the identity was missing.
+    """
+
+    code = "SERVICE_AUTHENTICATION_FAILED"
 
 
 class TrustedContextProvider(Protocol):

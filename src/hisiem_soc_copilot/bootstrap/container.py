@@ -8,6 +8,7 @@ sessions, HTTP clients) are owned by the lifespan via open()/close().
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from functools import lru_cache
 
@@ -19,13 +20,19 @@ from ..application.handlers.workflow import InvestigationWorkflowHandler
 from ..application.ports.durable import OutboxStore
 from ..application.ports.hisiem import HisiemPort
 from ..application.ports.model_provider import ModelProvider
-from ..application.ports.trust import TrustedContextProvider
+from ..application.ports.trust import (
+    ServiceAuthenticationError,
+    TrustedContextProvider,
+)
 from ..application.ports.unit_of_work import UnitOfWork
 from ..application.services.investigation_service import InvestigationReadService
 from ..application.services.workspace_service import InvestigationWorkspaceService
 from ..config import Settings
 from ..domain.investigation.value_objects import BudgetLimits
 from ..infrastructure.auth.header_provider import HeaderTrustedContextProvider
+from ..infrastructure.auth.hisiem_service_provider import (
+    HisiemServiceTrustedContextProvider,
+)
 from ..infrastructure.durable.dispatcher import AsyncOutboxDispatcher
 from ..infrastructure.durable.investigation_runner import (
     AsyncInvestigationGraphRunner,
@@ -51,6 +58,11 @@ class Container:
         self.copilot_engine = build_engine(self.settings.database)
         self.copilot_sessions = build_session_factory(self.copilot_engine)
         self.hisiem_adapter = HisiemHttpAdapter(settings=self.settings.hisiem)
+        # Fail closed at startup: if the HISIEM service boundary is selected but
+        # its credential is not configured, refuse to start rather than silently
+        # accepting (or rejecting) every request.
+        if self.settings.auth.trusted_context_provider == "hisiem_bearer":
+            self._resolve_hisiem_service_token()
         if self.settings.app.enable_dispatcher:
             self.dispatcher = self.outbox_dispatcher()
             await self.dispatcher.start()
@@ -174,16 +186,38 @@ class Container:
             worker_name="copilot-dispatcher",
         )
 
+    def _resolve_hisiem_service_token(self) -> str:
+        """Resolve the HISIEM→Copilot service credential from the environment.
+
+        The secret is never a config default: only the NAME of the environment
+        variable is configured. A missing/blank value is a configuration defect
+        and fails closed (raises) — it never degrades to ``header``/``none`` or an
+        anonymous/system identity.
+        """
+        env_name = self.settings.auth.hisiem_service_token_env
+        token = os.environ.get(env_name) or ""
+        if not token.strip():
+            raise ServiceAuthenticationError(
+                f"service credential environment variable {env_name} is not set; "
+                "refusing to serve the HISIEM service boundary"
+            )
+        return token
+
     def trusted_context_provider(self, request: Request) -> TrustedContextProvider | None:
         """Build a TrustedContextProvider for the request from configuration.
 
         Returns None when no provider is configured (``none`` default) so the API
-        fails closed. Only the ``header`` dev/test adapter is selectable today; a
-        production deployment must wire a real authenticator here.
+        fails closed. ``hisiem_bearer`` is the integrated/production boundary: it
+        authenticates HISIEM first, then trusts the tenant/actor it asserts.
+        ``header`` is a development/test adapter only.
         """
         mode = self.settings.auth.trusted_context_provider
         if mode == "header":
             return HeaderTrustedContextProvider(request)
+        if mode == "hisiem_bearer":
+            return HisiemServiceTrustedContextProvider(
+                request, expected_token=self._resolve_hisiem_service_token()
+            )
         if mode == "none":
             return None
         raise RuntimeError(f"unknown trusted-context provider: {mode}")

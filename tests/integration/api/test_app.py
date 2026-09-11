@@ -15,6 +15,7 @@ import pytest_asyncio
 from asgi_lifespan import LifespanManager
 
 from hisiem_soc_copilot.api.app import create_app
+from hisiem_soc_copilot.application.ports.trust import ServiceAuthenticationError
 from hisiem_soc_copilot.config import Settings
 
 
@@ -115,3 +116,62 @@ async def test_no_provider_fails_closed() -> None:
             )
             assert res.status_code == 403
             assert res.json()["code"] == "UNTRUSTED_REQUEST"
+
+
+async def test_hisiem_bearer_without_configured_secret_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the HISIEM service boundary with no configured credential must
+    fail at startup — never silently degrade to header/none/anonymous."""
+    monkeypatch.delenv("HISIEM_COPILOT_SERVICE_TOKEN", raising=False)
+    settings = _settings()
+    settings.auth.trusted_context_provider = "hisiem_bearer"
+    settings.auth.hisiem_service_token_env = "HISIEM_COPILOT_SERVICE_TOKEN"
+    app = create_app(settings)
+    with pytest.raises(ServiceAuthenticationError):
+        async with LifespanManager(app):
+            pass
+
+
+async def test_hisiem_bearer_rejects_forged_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the service credential configured, headers alone are still rejected."""
+    monkeypatch.setenv("HISIEM_COPILOT_SERVICE_TOKEN", "svc-secret-value")
+    settings = _settings()
+    settings.auth.trusted_context_provider = "hisiem_bearer"
+    settings.auth.hisiem_service_token_env = "HISIEM_COPILOT_SERVICE_TOKEN"
+    app = create_app(settings)
+    async with LifespanManager(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            forged = await c.post(
+                "/api/v1/investigations",
+                json={
+                    "source_alert_ref": {
+                        "provider": "hisiem",
+                        "resource_type": "alert",
+                        "address_id": "alert-x",
+                    }
+                },
+                headers={"X-Tenant-ID": "tenant-a", "X-Actor-Subject": "attacker"},
+            )
+            assert forged.status_code == 401
+            assert forged.json()["code"] == "SERVICE_AUTHENTICATION_FAILED"
+
+            wrong = await c.post(
+                "/api/v1/investigations",
+                json={
+                    "source_alert_ref": {
+                        "provider": "hisiem",
+                        "resource_type": "alert",
+                        "address_id": "alert-x",
+                    }
+                },
+                headers={
+                    "Authorization": "Bearer not-the-secret",
+                    "X-Tenant-ID": "tenant-a",
+                    "X-Actor-Subject": "attacker",
+                },
+            )
+            assert wrong.status_code == 401

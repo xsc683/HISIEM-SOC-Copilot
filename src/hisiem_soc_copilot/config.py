@@ -148,9 +148,11 @@ class ApplicationSettings(BaseSettings):
 class AuthSettings(BaseSettings):
     """Trusted-context provider selection.
 
-    Production must wire a real authenticator. ``header`` is a development/test
-    adapter only and must not be the production default; ``none`` (default) fails
-    closed — no request can be trusted.
+    ``hisiem_bearer`` is the integrated/production boundary: it authenticates the
+    HISIEM service caller with a shared server-only bearer credential before
+    trusting the tenant/actor HISIEM asserts. ``header`` is a development/test
+    adapter only and must not be selected for a production/integrated runtime;
+    ``none`` (default) fails closed — no request can be trusted.
     """
 
     model_config = SettingsConfigDict(
@@ -159,7 +161,11 @@ class AuthSettings(BaseSettings):
         extra="ignore",
     )
 
-    trusted_context_provider: Literal["none", "header"] = "none"
+    trusted_context_provider: Literal["none", "header", "hisiem_bearer"] = "none"
+    # Name of the environment variable holding the HISIEM→Copilot service
+    # credential. The secret itself is never a config default; it is resolved from
+    # the environment at runtime (the same pattern as ``llm.api_key_env``).
+    hisiem_service_token_env: str = Field(default="HISIEM_COPILOT_SERVICE_TOKEN")
 
 
 class EvaluationSettings(BaseSettings):

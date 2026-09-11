@@ -78,6 +78,10 @@ def to_http_error(exc: BaseException) -> tuple[int, str, str]:
     if isinstance(exc, (IdempotencyConflictError, CommandReceiptConflictError)):
         return 409, exc.code, exc.args[0] if exc.args else "idempotency conflict"
     if isinstance(exc, DomainError):
+        if exc.code == "SERVICE_AUTHENTICATION_FAILED":
+            # Service-to-service authentication failure (missing/invalid service
+            # credential, or missing server-asserted identity) → 401.
+            return 401, exc.code, str(exc)
         if exc.code == "UNTRUSTED_REQUEST":
             # Authentication/authorization boundary failures are 403, not client 400.
             return 403, exc.code, str(exc)

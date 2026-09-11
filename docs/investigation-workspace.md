@@ -37,7 +37,22 @@ SOC Copilot Workspace API
 - 浏览器 **不得**直接用伪造身份头调用 Copilot 特权 API。
 - 浏览器 **不得**获得 HISIEM→Copilot 服务凭据。
 - P1 **不引入第二个独立登录**。
-- 开发/测试 Header Provider 不是生产浏览器认证。
+
+**信任边界（P1.1，可证明）**：
+
+```text
+浏览器 → HISIEM 认证用户会话
+HISIEM 派生 tenant / actor / 授权
+HISIEM BFF → Copilot：Authorization: Bearer <S2S 凭据> + X-Tenant-ID + X-Actor-Subject
+Copilot：先校验 S2S 凭据 → 通过后才信任 HISIEM 提供的 tenant / actor → TrustedContext
+```
+
+- **只有** `Authorization: Bearer <服务凭据>` 校验通过后，Copilot 才信任 `X-Tenant-ID` / `X-Actor-Subject`。仅凭这两个头**无法**认证。
+- 服务凭据为共享高熵 bearer，常量时间比较，配置缺失即**fail-closed**（启动失败 / 拒绝请求），绝不回退到 `header` / `none` / 匿名 / `system`。
+- 服务凭据只存在于 HISIEM 服务端与 Copilot 服务端环境变量；浏览器/前端 **永不**持有。
+- Copilot `hisiem_bearer` 需要 tenant 与 actor 均存在，且两者均由 HISIEM 服务端派生（浏览器不能覆盖）。
+
+**`HeaderTrustedContextProvider` 仅为开发/测试适配器**，无任何认证，**不得**用于生产/集成运行时（服务认证不等于用户认证：S2S 凭据只证明“请求来自可信 HISIEM”，最终用户身份仍由 HISIEM 认证建立）。
 
 ---
 
@@ -95,7 +110,10 @@ occurred_at ASC + 稳定次级键
 
 ## 6. 安全保证（必须可证明）
 
+- Copilot 在信任 `X-Tenant-ID` / `X-Actor-Subject` **之前**先认证 HISIEM 服务调用方（缺失/错误服务凭据 → `401`）。
+- 仅凭身份头（无有效服务凭据）**不能**获得任何 Investigation 特权（直接攻击 Copilot 被拒绝）。
 - Tenant A 不能读取 / 取消 Tenant B 的 Investigation（真实 PG 测试证明跨租户 `404`）。
+- 服务认证**不**绕过租户隔离：合法服务凭据 + 错误租户仍 `404`。
 - 浏览器不能通过 body / header 覆盖 tenant 或 actor。
 - HISIEM→Copilot 服务凭据永不进入浏览器。
 - Workspace API 不暴露任何 API Key / token / password / DSN。
