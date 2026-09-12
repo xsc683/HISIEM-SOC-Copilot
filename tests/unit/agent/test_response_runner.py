@@ -35,6 +35,7 @@ from hisiem_soc_copilot.infrastructure.durable.investigation_runner import (
 )
 from hisiem_soc_copilot.infrastructure.durable.response_runner import (
     ResponseObserveRunner,
+    ResponseSubmitExhaustionHandler,
     ResponseSubmitRunner,
 )
 from tests.fixtures.fakes import FakeSoar, FakeUnitOfWorkFactory
@@ -203,12 +204,21 @@ async def test_crash_after_provider_create_converges_on_the_same_key() -> None:
     )
     await _run_submit(factory, soar, proposal.id)
 
-    # Simulate the crash: the provider execution exists, the local transaction did not.
+    # Simulate the crash: the provider execution exists, but our local transaction
+    # never committed. That transaction wrote the ref, the proposal transition AND
+    # the submission settlement, so rolling back must undo ALL THREE — otherwise the
+    # simulation contradicts itself (a SUBMITTED submission with no ref).
     factory._response_executions._store.clear()
     factory._response_proposals._store[proposal.id] = replace(
         factory._response_proposals._store[proposal.id],
         status=ResponseProposalStatus.APPROVED,
         execution_ref=None,
+    )
+    factory._response_submissions._store[proposal.id] = replace(
+        factory._response_submissions._store[proposal.id],
+        status="PENDING",
+        attempt_count=0,
+        submitted_at=None,
     )
 
     await _run_submit(factory, soar, proposal.id)
@@ -506,21 +516,32 @@ async def test_definitive_observe_error_settles_the_execution_as_failed() -> Non
     }
 
 
-async def test_transient_observe_error_is_reraised_for_backoff_retry() -> None:
+async def test_transient_observe_error_durably_reschedules_without_raising() -> None:
+    """An unreadable provider is NOT a failed responsibility.
+
+    Raising here would drive reconciliation through the generic retry budget, so a
+    long provider outage would eventually dead-letter the obligation to observe a
+    real execution. Instead the failed read is persisted as a fact and the next
+    observation is scheduled durably — this delivery completes normally.
+    """
     factory = FakeUnitOfWorkFactory()
     proposal_id, soar = await _submitted(factory, status_sequence=[])
+    before = len(_observe_rows(factory))
     soar.raise_on_status = ExternalServiceError(
         "unavailable", service="hisiem", code="HTTP_503"
     )
 
-    with pytest.raises(ExternalServiceError):
-        await _observe(factory, soar).run(
-            aggregate_id=str(proposal_id), tenant_id=TENANT
-        )
+    await _observe(factory, soar).run(
+        aggregate_id=str(proposal_id), tenant_id=TENANT
+    )
 
     execution = await _ref(factory, proposal_id)
     assert execution is not None
-    assert execution.status == "RUNNING"
+    assert execution.status == "RUNNING"  # never marks the provider execution failed
+    assert len(_observe_rows(factory)) == before + 1  # durably re-scheduled
+    types = [e.event_type for e in factory.events.events]
+    assert "response_execution_observation_failed" in types
+    assert "response_execution_failed" not in types
 
 
 # ---------------------------------------------------------------------------
@@ -541,14 +562,14 @@ async def test_a_transient_4xx_observe_never_settles_a_live_execution(
     """
     factory = FakeUnitOfWorkFactory()
     proposal_id, soar = await _submitted(factory, status_sequence=[])
+    before = len(_observe_rows(factory))
     soar.raise_on_status = ExternalServiceError(
         "throttled", service="hisiem", code=f"HTTP_{status}"
     )
 
-    with pytest.raises(ExternalServiceError):
-        await _observe(factory, soar).run(
-            aggregate_id=str(proposal_id), tenant_id=TENANT
-        )
+    await _observe(factory, soar).run(
+        aggregate_id=str(proposal_id), tenant_id=TENANT
+    )
 
     execution = await _ref(factory, proposal_id)
     assert execution is not None
@@ -556,6 +577,7 @@ async def test_a_transient_4xx_observe_never_settles_a_live_execution(
     assert "response_execution_failed" not in {
         e.event_type for e in factory.events.events
     }
+    assert len(_observe_rows(factory)) == before + 1
 
 
 @pytest.mark.parametrize("status", [408, 425, 429])
@@ -905,3 +927,244 @@ def test_no_fixture_ever_constructs_an_empty_execution_id() -> None:
         if path != self_path and needle in path.read_text(encoding="utf-8")
     ]
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# Crash / redelivery safety around a DEFINITIVE refusal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+async def test_a_redelivered_submit_after_a_definitive_refusal_never_asks_again(
+    status: int,
+) -> None:
+    """The refusal is durable BEFORE the delivery is dead-lettered.
+
+    Between committing FAILED_DEFINITIVE and dead-lettering the outbox row the
+    worker can die. The lease then expires, the SAME submit delivery is reclaimed,
+    and re-delivering it must NOT call the provider a second time: we already know,
+    durably, that HISIEM refused this submission.
+    """
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "rejected", service="hisiem", code=f"HTTP_{status}"
+        )
+    )
+
+    with pytest.raises(NonRetryableRunError):
+        await _run_submit(factory, soar, proposal.id)
+
+    assert len(soar.submitted) == 1
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "FAILED_DEFINITIVE"
+    assert await _ref(factory, proposal.id) is None
+
+    # The crash window: durably refused, never dead-lettered → reclaimed + redelivered.
+    await _run_submit(factory, soar, proposal.id)
+    await _run_submit(factory, soar, proposal.id)
+
+    assert len(soar.submitted) == 1  # the provider was never asked again
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "FAILED_DEFINITIVE"  # never resurrected
+    assert submission.attempt_count == 1
+    assert await _ref(factory, proposal.id) is None
+    reloaded = await _proposal(factory, proposal.id)
+    assert reloaded is not None
+    assert reloaded.status is ResponseProposalStatus.APPROVED
+
+
+async def test_a_redelivered_submit_after_attention_required_never_asks_again() -> None:
+    """Once a human owns the submission, a reclaim must not silently resume it."""
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "unavailable", service="hisiem", code="HTTP_503"
+        )
+    )
+    with pytest.raises(ExternalServiceError):
+        await _run_submit(factory, soar, proposal.id)
+
+    current = await _submission(factory, proposal.id)
+    assert current is not None
+    factory._response_submissions._store[proposal.id] = replace(
+        current, status="ATTENTION_REQUIRED"
+    )
+    before = len(soar.submitted)
+
+    await _run_submit(factory, soar, proposal.id)
+
+    assert len(soar.submitted) == before
+    assert (await _submission(factory, proposal.id)).status == "ATTENTION_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# Exhausted submit budget → ATTENTION_REQUIRED (before the outbox is terminal)
+# ---------------------------------------------------------------------------
+
+
+def _submit_dispatcher(factory: FakeUnitOfWorkFactory, soar: FakeSoar, mapping: dict):
+    proposal_id = next(iter(factory._response_submissions._store))
+    return AsyncOutboxDispatcher(
+        outbox_store=factory.outbox,
+        resolver=_Resolver(mapping),
+        runner=_submit(factory, soar),
+        worker_name="copilot-response-submit-dispatcher",
+        destination=RESPONSE_SUBMIT_DESTINATION,
+        exhaustion=ResponseSubmitExhaustionHandler(unit_of_work_factory=factory),
+    ), proposal_id
+
+
+async def test_an_exhausted_submit_budget_becomes_attention_required() -> None:
+    """The business state must be persisted BEFORE the outbox goes terminal.
+
+    Otherwise the workspace would read "delivery is dead" while the projection still
+    says "retrying" — and keep polling a retry that is never coming.
+    """
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "unavailable", service="hisiem", code="HTTP_503"
+        )
+    )
+    mapping = {event_id: (TENANT, str(proposal.id)) for event_id in factory.outbox.rows}
+    dispatcher, proposal_id = _submit_dispatcher(factory, soar, mapping)
+
+    for _ in range(_MAX_ATTEMPTS + 2):
+        factory.outbox.advance(600)
+        await dispatcher.drain_once()
+
+    submission = await _submission(factory, proposal_id)
+    assert submission is not None
+    assert submission.status == "ATTENTION_REQUIRED"
+    assert submission.attention_required_at is not None
+    assert submission.attempt_count >= _MAX_ATTEMPTS
+    assert submission.last_error_code == "HTTP_503"
+
+    # Both halves of the fact are true at the same time — never one without the other.
+    rows = [
+        row
+        for row in factory.outbox.rows.values()
+        if row["destination"] == RESPONSE_SUBMIT_DESTINATION
+    ]
+    assert [row["status"] for row in rows] == ["DEAD_LETTER"]
+
+    # Still no provider execution, and nothing claims one failed.
+    assert await _ref(factory, proposal_id) is None
+    reloaded = await _proposal(factory, proposal_id)
+    assert reloaded is not None
+    assert reloaded.status is ResponseProposalStatus.APPROVED
+    types = [e.event_type for e in factory.events.events]
+    assert "response_submission_attention_required" in types
+    assert "response_submission_failed" not in types
+    assert "response_execution_failed" not in types
+
+
+async def test_a_failing_exhaustion_hook_keeps_the_delivery_retryable() -> None:
+    """Never dead-letter while the projection still says retrying.
+
+    If the business fact cannot be written, keeping the row retryable is the
+    conservative choice: it stays visible and the hook runs again next attempt.
+    """
+
+    class _Broken(ResponseSubmitExhaustionHandler):
+        async def on_retry_exhausted(
+            self, *, aggregate_id: str, tenant_id: str, error_code: str
+        ) -> None:
+            raise RuntimeError("projection unavailable")
+
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "unavailable", service="hisiem", code="HTTP_503"
+        )
+    )
+    mapping = {event_id: (TENANT, str(proposal.id)) for event_id in factory.outbox.rows}
+    dispatcher = AsyncOutboxDispatcher(
+        outbox_store=factory.outbox,
+        resolver=_Resolver(mapping),
+        runner=_submit(factory, soar),
+        worker_name="copilot-response-submit-dispatcher",
+        destination=RESPONSE_SUBMIT_DESTINATION,
+        exhaustion=_Broken(unit_of_work_factory=factory),
+    )
+
+    for _ in range(_MAX_ATTEMPTS + 2):
+        factory.outbox.advance(600)
+        await dispatcher.drain_once()
+
+    rows = [
+        row
+        for row in factory.outbox.rows.values()
+        if row["destination"] == RESPONSE_SUBMIT_DESTINATION
+    ]
+    assert [row["status"] for row in rows] == ["FAILED"]  # retryable, not terminal
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "RETRYING"
+
+
+# ---------------------------------------------------------------------------
+# A prolonged OBSERVE outage must never dead-letter reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def test_a_prolonged_observe_outage_never_dead_letters_and_still_converges() -> None:
+    """A real provider execution exists; a long outage must not lose the obligation.
+
+    HISIEM owns the execution's truth. While we cannot READ it we know nothing, so
+    every failed read durably schedules the next attempt instead of consuming the
+    generic retry budget — reconciliation survives far beyond _MAX_ATTEMPTS and
+    survives a process restart.
+    """
+    factory = FakeUnitOfWorkFactory()
+    proposal_id, soar = await _submitted(factory, status_sequence=[])
+    mapping = {event_id: (TENANT, str(proposal_id)) for event_id in factory.outbox.rows}
+
+    def build() -> AsyncOutboxDispatcher:
+        return AsyncOutboxDispatcher(
+            outbox_store=factory.outbox,
+            resolver=_Resolver(mapping),
+            runner=_observe(factory, soar),
+            worker_name="copilot-response-observe-dispatcher",
+            destination=RESPONSE_OBSERVE_DESTINATION,
+        )
+
+    soar.raise_on_status = ExternalServiceError(
+        "unavailable", service="hisiem", code="HTTP_503"
+    )
+    dispatcher = build()
+    for _ in range(_MAX_ATTEMPTS * 2):
+        factory.outbox.advance(600)
+        mapping.update(
+            {event_id: (TENANT, str(proposal_id)) for event_id in factory.outbox.rows}
+        )
+        await dispatcher.drain_once()
+
+    assert factory.outbox.dead_letter_ids == []
+    execution = await _ref(factory, proposal_id)
+    assert execution is not None
+    assert execution.status == "RUNNING"  # never marked FAILED by an unreadable provider
+
+    # PROCESS RESTART: brand-new dispatcher over the same durable state.
+    dispatcher = build()
+    soar.raise_on_status = None
+    soar.status_sequence = ["SUCCEEDED"]
+    for _ in range(5):
+        factory.outbox.advance(600)
+        mapping.update(
+            {event_id: (TENANT, str(proposal_id)) for event_id in factory.outbox.rows}
+        )
+        await dispatcher.drain_once()
+
+    execution = await _ref(factory, proposal_id)
+    assert execution is not None
+    assert execution.status == "SUCCEEDED"
+    assert factory.outbox.dead_letter_ids == []
+    assert len(soar.submitted) == 1  # one provider execution, never a second

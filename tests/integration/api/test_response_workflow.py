@@ -163,21 +163,48 @@ class _Harness:
             hisiem=self.hisiem, model=GroundedSshModel(script=_script())
         )
 
-    async def make_submit_delivery_claimable(self) -> None:
+    async def make_delivery_claimable(
+        self, destination: str = "response.execution.submit"
+    ) -> None:
         """Simulate the retry backoff elapsing — deterministically, no sleep.
 
-        A transient submit failure leaves the outbox row with a FUTURE
-        ``available_at`` (exponential backoff), which is correct but unclaimable.
-        Time is advanced by rewriting that timestamp into the past rather than by
-        sleeping on the wall clock.
+        A transient failure leaves the outbox row with a FUTURE ``available_at``
+        (exponential backoff), which is correct but unclaimable. Time is advanced by
+        rewriting that timestamp into the past rather than by sleeping on the wall
+        clock.
         """
         async with self._session_factory() as session:
             await session.execute(
                 text(
                     "UPDATE copilot.outbox_message "
                     "SET available_at = now() - interval '1 hour' "
-                    "WHERE destination = 'response.execution.submit' "
+                    "WHERE destination = :destination "
                     "AND status IN ('PENDING','FAILED')"
+                ),
+                {"destination": destination},
+            )
+            await session.commit()
+
+    async def make_submit_delivery_claimable(self) -> None:
+        await self.make_delivery_claimable("response.execution.submit")
+
+    async def make_observe_delivery_claimable(self) -> None:
+        await self.make_delivery_claimable("response.execution.observe")
+
+    async def requeue_submit_delivery(self) -> None:
+        """Undo a dead-letter: simulate a worker that died before settling the row.
+
+        The business fact (e.g. FAILED_DEFINITIVE) is already committed; only the
+        outbox settlement was lost, so the lease expires and the SAME delivery is
+        reclaimed and re-delivered.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE copilot.outbox_message "
+                    "SET status = 'PENDING', locked_at = NULL, locked_by = NULL, "
+                    "lease_token = NULL, available_at = now() - interval '1 hour' "
+                    "WHERE destination = 'response.execution.submit'"
                 )
             )
             await session.commit()
@@ -1327,3 +1354,214 @@ async def test_concurrent_first_creates_converge_on_one_proposal(
         "SELECT status FROM copilot.investigation WHERE id = :iid",
         iid=investigation_id,
     ) == "COMPLETED"
+
+
+# ---------------------------------------------------------------------------
+# §1 crash/redelivery safety, and §2 an exhausted submit budget
+# ---------------------------------------------------------------------------
+
+
+async def test_a_redelivered_submit_after_a_definitive_refusal_converges(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "rejected", service="hisiem", code="HTTP_422"
+        )
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "FAILED_DEFINITIVE"
+    assert len(soar.submitted) == 1
+
+    # Simulate the crash window: the refusal is committed but the outbox row was
+    # never dead-lettered, so it is reclaimed and the SAME delivery is re-delivered.
+    await harness.requeue_submit_delivery()
+    assert await harness.drain_submit() == 1
+
+    # The provider is not asked again — we already know, durably, that it refused.
+    assert len(soar.submitted) == 1
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "FAILED_DEFINITIVE"
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.response_submission"
+    ) == 1
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "APPROVED"
+    # The stale delivery settles normally rather than being dead-lettered.
+    assert await harness.scalar(
+        "SELECT status FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == "PUBLISHED"
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["submission"]["status"] == "FAILED_DEFINITIVE"
+    assert p["execution"] is None
+
+
+async def test_an_exhausted_submit_budget_becomes_attention_required(
+    harness: _Harness,
+) -> None:
+    """Exhaustion is a BUSINESS fact persisted before the outbox goes terminal."""
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "unavailable", service="hisiem", code="HTTP_503"
+        )
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+
+    for _ in range(_MAX_ATTEMPTS + 2):
+        await harness.make_submit_delivery_claimable()
+        await harness.drain_submit()
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "ATTENTION_REQUIRED"
+    assert await harness.scalar(
+        "SELECT attention_required_at IS NOT NULL FROM copilot.response_submission"
+    ) is True
+    # Every claim was a real provider attempt, so the transport's own counter is
+    # the exact number of submissions tried — and the local submission agrees.
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == len(soar.submitted)
+    assert len(soar.submitted) >= 1
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.response_submission"
+    ) == len(soar.submitted)
+    assert await harness.scalar(
+        "SELECT last_error_code FROM copilot.response_submission"
+    ) == "HTTP_503"
+    assert await harness.scalar(
+        "SELECT status FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == "DEAD_LETTER"
+
+    # No provider execution exists, none is claimed to have failed, and the
+    # proposal is untouched: nobody knows whether the provider accepted this.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "APPROVED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.domain_event "
+        "WHERE event_type IN ('response_execution_failed','response_submission_failed')"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.domain_event "
+        "WHERE event_type = 'response_submission_attention_required'"
+    ) == 1
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    # The workspace must stop claiming a retry that is no longer happening.
+    assert p["submission"]["status"] == "ATTENTION_REQUIRED"
+    assert p["execution"] is None
+    kinds = [t["kind"] for t in ws["timeline"]]
+    assert "RESPONSE_SUBMISSION_ATTENTION_REQUIRED" in kinds
+    assert "RESPONSE_SUBMISSION_RETRYING" not in kinds
+    assert not [
+        t for t in ws["timeline"] if t["kind"].startswith("RESPONSE_EXECUTION_")
+    ]
+
+    # Refreshing reconstructs the same truth.
+    refreshed = await _workspace(harness, investigation_id)
+    assert refreshed["response"]["proposals"][0] == p
+
+
+async def test_a_prolonged_observe_outage_never_loses_reconciliation(
+    harness: _Harness,
+) -> None:
+    """A real execution exists; a long provider outage must not end reconciliation."""
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    # A genuinely long-running execution: it must still be RUNNING while the
+    # provider is unreadable, so the outage cannot be confused with a fast success.
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(
+            execution_id="exec-outage-1", status="RUNNING"
+        )
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "RUNNING"
+
+    # The provider becomes unreadable for far longer than the generic budget.
+    soar.raise_on_status = ExternalServiceError(
+        "unavailable", service="hisiem", code="HTTP_503"
+    )
+    for _ in range(_MAX_ATTEMPTS * 2):
+        await harness.make_observe_delivery_claimable()
+        await harness.drain_observe()
+
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.observe' AND status = 'DEAD_LETTER'"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "RUNNING"  # an unreadable provider never settles the execution
+
+    # PROCESS RESTART: brand-new workers over the same durable state.
+    harness.restart_workers()
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    soar.raise_on_status = None
+    soar.status_sequence = ["SUCCEEDED"]
+    for _ in range(5):
+        await harness.make_observe_delivery_claimable()
+        await harness.drain_observe()
+        if await harness.scalar(
+            "SELECT status FROM copilot.response_execution_ref"
+        ) == "SUCCEEDED":
+            break
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "SUCCEEDED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.observe' AND status = 'DEAD_LETTER'"
+    ) == 0
+    ws = await _workspace(harness, investigation_id)
+    assert ws["response"]["proposals"][0]["execution"]["status"] == "SUCCEEDED"

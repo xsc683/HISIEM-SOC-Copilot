@@ -52,6 +52,11 @@ _EVENT_DESTINATIONS: dict[str, str] = {
     "response_execution_queued": "response.execution.submit",
     "response_execution_submitted": "response.execution.observe",
     "response_execution_observed": "response.execution.observe",
+    # A failed READ of the provider is not a failed RESPONSIBILITY: it re-schedules
+    # the next observation durably instead of consuming the generic retry budget.
+    # (Submission facts — queued/retrying/failed/attention_required — have NO
+    # destination: they are facts, not deliveries.)
+    "response_execution_observation_failed": "response.execution.observe",
 }
 
 

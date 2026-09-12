@@ -213,6 +213,61 @@ def response_submission_failed(
     )
 
 
+def response_submission_attention_required(
+    aggregate_id: UUID,
+    *,
+    submission_key: str,
+    attempt_count: int,
+    error_code: str,
+    safe_error_message: str | None = None,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """The AUTOMATIC retry budget ran out while failures were still UNCERTAIN.
+
+    Deliberately distinct from ``response_submission_failed``: the provider never
+    gave a verdict, so nothing here claims a rejection. The fact is "we stopped
+    trying, and a human has to decide" — the durable truth the workspace needs in
+    order to stop polling instead of claiming a retry is still in flight.
+    """
+    return ResponseEvent(
+        event_type="response_submission_attention_required",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={
+            "submission_key": submission_key,
+            "attempt_count": attempt_count,
+            "error_code": error_code,
+            "safe_error_message": safe_error_message,
+        },
+    )
+
+
+def response_execution_observation_failed(
+    aggregate_id: UUID,
+    *,
+    external_execution_id: str,
+    error_code: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """We could not READ the provider's truth about a real execution just now.
+
+    A transport error / timeout / 408 / 425 / 429 / 5xx on ``get_execution_status``
+    says nothing about the execution — HISIEM remains the source of truth and may
+    still be running it. This event is the durable re-observation schedule (it maps
+    to the observe destination), so a prolonged provider outage can never consume
+    the generic retry budget and dead-letter the reconciliation responsibility.
+    """
+    return ResponseEvent(
+        event_type="response_execution_observation_failed",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={
+            "external_execution_id": external_execution_id,
+            "error_code": error_code,
+        },
+    )
+
+
 def response_execution_started(
     aggregate_id: UUID, *, tenant_id: str | None = None
 ) -> ResponseEvent:

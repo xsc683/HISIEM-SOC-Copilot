@@ -57,12 +57,21 @@ class ResponseSubmissionStatus(enum.StrEnum):
     ``FAILED_DEFINITIVE`` means the provider did not accept the submission. It is
     NOT ``ResponseExecutionStatus.FAILED``: no provider execution was ever created,
     so there is nothing to observe and nothing to reconcile.
+
+    ``ATTENTION_REQUIRED`` means the AUTOMATIC retry budget ran out while the
+    failures were still TRANSIENT/UNCERTAIN. It deliberately does NOT claim that the
+    provider refused the submission, and it does NOT claim that no execution exists
+    — we genuinely do not know, because every attempt failed before the provider
+    gave us an answer. Someone has to look. This is a terminal LOCAL state: the
+    delivery is no longer retried automatically, so the workspace can stop telling
+    the analyst that a retry is still in flight.
     """
 
     PENDING = "PENDING"
     RETRYING = "RETRYING"
     SUBMITTED = "SUBMITTED"
     FAILED_DEFINITIVE = "FAILED_DEFINITIVE"
+    ATTENTION_REQUIRED = "ATTENTION_REQUIRED"
 
     @property
     def is_terminal(self) -> bool:
@@ -70,6 +79,7 @@ class ResponseSubmissionStatus(enum.StrEnum):
         return self in {
             ResponseSubmissionStatus.SUBMITTED,
             ResponseSubmissionStatus.FAILED_DEFINITIVE,
+            ResponseSubmissionStatus.ATTENTION_REQUIRED,
         }
 
     @property

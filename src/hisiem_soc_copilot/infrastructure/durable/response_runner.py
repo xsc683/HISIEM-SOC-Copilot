@@ -26,6 +26,7 @@ The response side effect has TWO distinct durable responsibilities (spec §3):
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from uuid import UUID
 
@@ -37,10 +38,12 @@ from ...domain.response.enums import ResponseProposalStatus, ResponseSubmissionS
 from ...domain.response.events import (
     ResponseEvent,
     response_execution_failed,
+    response_execution_observation_failed,
     response_execution_observed,
     response_execution_started,
     response_execution_submitted,
     response_execution_succeeded,
+    response_submission_attention_required,
     response_submission_failed,
     response_submission_retrying,
 )
@@ -53,6 +56,9 @@ from ...domain.shared.identifiers import utc_now
 from .investigation_runner import NonRetryableRunError
 
 _PROVIDER = "hisiem"
+_SUBMISSION_FAILED_DEFINITIVE = ResponseSubmissionStatus.FAILED_DEFINITIVE.value
+_SUBMISSION_ATTENTION_REQUIRED = ResponseSubmissionStatus.ATTENTION_REQUIRED.value
+_SUBMISSION_SUBMITTED = ResponseSubmissionStatus.SUBMITTED.value
 _TERMINAL = {"SUCCEEDED", "FAILED"}
 # A definitive (non-retryable) provider rejection: a bad request/action/target.
 _DEFINITIVE_CODES = {"SOAR_NOT_FOUND", "SOAR_CONFIGURATION"}
@@ -90,9 +96,27 @@ class ResponseSubmitRunner:
             execution = await uow.response_executions.get_by_proposal(
                 tenant_id=tenant_id, proposal_id=proposal_id
             )
+            submission = await uow.response_submissions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=proposal_id
+            )
         finally:
             await uow.close()
 
+        if submission is not None and submission.status == _SUBMISSION_FAILED_DEFINITIVE:
+            # The provider DEFINITIVELY refused this submission and that fact is
+            # already durable. This delivery is a stale/reclaimed one (the worker
+            # crashed after committing the refusal but before dead-lettering):
+            # calling the provider again would re-attempt a submission we already
+            # know was rejected. Settle it as a no-op — the dispatcher publishes it.
+            return
+        if submission is not None and submission.status == _SUBMISSION_ATTENTION_REQUIRED:
+            # The automatic retry budget is already spent and a human owns this.
+            # A reclaimed delivery must never silently resume submitting.
+            return
+        if submission is not None and submission.status == _SUBMISSION_SUBMITTED:
+            # Converged: the provider accepted it, whether or not the ref row is
+            # visible to this read.
+            return
         if execution is not None:
             # A provider execution identity is already durably attached: a duplicate
             # submit delivery CONVERGES (no-op) and never executes a second time.
@@ -397,7 +421,21 @@ class ResponseObserveRunner:
                         error_message=_safe_message(exc),
                     )
                     return
-                raise  # transient → dispatcher retries with backoff
+                # TRANSIENT/UNCERTAIN READ: a timeout, transport error, 408/425/429
+                # or 5xx tells us NOTHING about the execution — HISIEM still owns
+                # that truth and may well be running it. This is the same situation
+                # as a non-terminal status, so it uses the same durable mechanism:
+                # persist the failed read and schedule the next observation with a
+                # future available_at, then complete THIS delivery normally. Driving
+                # it through the generic retry/backoff exception path instead would
+                # let a long provider outage exhaust _MAX_ATTEMPTS and permanently
+                # dead-letter the reconciliation responsibility.
+                await self._reschedule_observation(
+                    tenant_id=tenant_id,
+                    execution=execution,
+                    error_code=exc.upstream_code or "SOAR_UNAVAILABLE",
+                )
+                return
 
             if result.status in _TERMINAL:
                 await self._settle_terminal(
@@ -414,6 +452,41 @@ class ResponseObserveRunner:
         )
 
     # ------------------------------------------------------------------
+    async def _reschedule_observation(
+        self,
+        *,
+        tenant_id: str,
+        execution: ResponseExecutionRef,
+        error_code: str,
+    ) -> None:
+        """Durably schedule the next observation after a failed READ.
+
+        The execution projection is deliberately NOT touched: we learned nothing
+        about the provider's execution, so its recorded status, timestamps and
+        errors stay exactly as the last successful observation left them. Only the
+        reconciliation FACT is persisted, and that fact carries the schedule.
+        """
+        uow = self._uow_factory()
+        try:
+            current = await uow.response_executions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=execution.proposal_id
+            )
+            if current is None or current.status in _TERMINAL:
+                return  # already settled by another delivery
+            await uow.events.append(
+                response_execution_observation_failed(
+                    execution.proposal_id,
+                    external_execution_id=execution.execution_id,
+                    error_code=error_code,
+                    tenant_id=tenant_id,
+                ),
+                aggregate_revision=0,
+                available_at=utc_now() + self._observe_delay,
+            )
+            await uow.commit()
+        finally:
+            await uow.close()
+
     async def _settle_nonterminal(
         self,
         *,
@@ -565,6 +638,62 @@ def _terminal_event(
         error_code=result.safe_error_code or "SOAR_EXECUTION_FAILED",
         tenant_id=tenant_id,
     )
+
+
+class ResponseSubmitExhaustionHandler:
+    """Persists the business meaning of an exhausted SUBMIT retry budget.
+
+    Injected into the response submit dispatcher as its ``on_retry_exhausted``
+    hook, so the generic dispatcher never has to know what exhaustion means for a
+    response. It runs BEFORE the outbox row is dead-lettered: the workspace must
+    never be able to read "the delivery is dead" while the submission still says
+    "retrying".
+    """
+
+    def __init__(self, *, unit_of_work_factory: Callable[[], UnitOfWork]) -> None:
+        self._uow_factory = unit_of_work_factory
+
+    async def on_retry_exhausted(
+        self, *, aggregate_id: str, tenant_id: str, error_code: str
+    ) -> None:
+        proposal_id = UUID(aggregate_id)
+        uow = self._uow_factory()
+        try:
+            current = await uow.response_submissions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=proposal_id
+            )
+            if current is None:
+                return
+            if current.status in (
+                _SUBMISSION_SUBMITTED,
+                _SUBMISSION_FAILED_DEFINITIVE,
+                _SUBMISSION_ATTENTION_REQUIRED,
+            ):
+                # Already terminal: a later exhaustion must never overwrite a
+                # recorded verdict, and never resurrect a settled submission.
+                return
+            now = utc_now()
+            record = replace(
+                current,
+                status=_SUBMISSION_ATTENTION_REQUIRED,
+                updated_at=now,
+                attention_required_at=now,
+            )
+            await uow.response_submissions.update(record)
+            await uow.events.append(
+                response_submission_attention_required(
+                    proposal_id,
+                    submission_key=current.submission_key,
+                    attempt_count=current.attempt_count,
+                    error_code=current.last_error_code or error_code,
+                    safe_error_message=current.safe_error_message,
+                    tenant_id=tenant_id,
+                ),
+                aggregate_revision=0,
+            )
+            await uow.commit()
+        finally:
+            await uow.close()
 
 
 async def _mark_submission_submitted(

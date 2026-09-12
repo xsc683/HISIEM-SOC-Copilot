@@ -41,6 +41,7 @@ from ..infrastructure.durable.investigation_runner import (
 )
 from ..infrastructure.durable.response_runner import (
     ResponseObserveRunner,
+    ResponseSubmitExhaustionHandler,
     ResponseSubmitRunner,
 )
 from ..infrastructure.hisiem.adapter import HisiemHttpAdapter
@@ -273,6 +274,12 @@ class Container:
             ),
             worker_name="copilot-response-submit-dispatcher",
             destination=RESPONSE_SUBMIT_DESTINATION,
+            # Destination-specific: the generic dispatcher must not have to know
+            # what an exhausted submit budget MEANS, but the business fact has to
+            # be persisted before the delivery is dead-lettered.
+            exhaustion=ResponseSubmitExhaustionHandler(
+                unit_of_work_factory=self.unit_of_work_factory()
+            ),
         )
 
     def response_observe_outbox_dispatcher(

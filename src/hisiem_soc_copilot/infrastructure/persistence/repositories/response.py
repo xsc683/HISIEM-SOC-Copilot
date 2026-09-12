@@ -416,6 +416,7 @@ class SqlAlchemyResponseSubmissionRepository(ResponseSubmissionRepository):
                     updated_at=submission.updated_at,
                     submitted_at=submission.submitted_at,
                     failed_at=submission.failed_at,
+                    attention_required_at=submission.attention_required_at,
                 )
             ),
         )

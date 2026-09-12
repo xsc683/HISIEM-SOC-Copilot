@@ -228,6 +228,7 @@ FAKE_EVENT_DESTINATIONS: dict[str, str] = {
     "response_execution_queued": "response.execution.submit",
     "response_execution_submitted": "response.execution.observe",
     "response_execution_observed": "response.execution.observe",
+    "response_execution_observation_failed": "response.execution.observe",
 }
 
 

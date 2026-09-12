@@ -804,6 +804,7 @@ created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 submitted_at TIMESTAMPTZ NULL
 failed_at TIMESTAMPTZ NULL
+attention_required_at TIMESTAMPTZ NULL
 ```
 
 Status：
@@ -813,13 +814,14 @@ PENDING
 RETRYING
 SUBMITTED
 FAILED_DEFINITIVE
+ATTENTION_REQUIRED
 ```
 
 约束：
 
 ```text
 UNIQUE(submission_key)
-CHECK (status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE'))
+CHECK (status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE','ATTENTION_REQUIRED'))
 CHECK (attempt_count >= 0)
 ```
 
@@ -851,6 +853,14 @@ submit 投递被 Provider 确定性拒绝（HTTP 400 / 404 / 409 / 422）
     → 追加 response_submission_failed 事件，outbox 投递进入 DEAD_LETTER
     → 仍然不创建任何 response_execution_ref
 
+submit 投递自动重试预算耗尽，且每次失败都仍是 TRANSIENT / UNCERTAIN
+    （timeout、transport error、HTTP 408 / 425 / 429、5xx）
+    → ATTENTION_REQUIRED，写入 attention_required_at，保留 attempt_count、
+      last_error_code 与 safe_error_message
+    → 追加 response_submission_attention_required 事件（无 outbox 目的地）
+    → 该事实落库**之后**，outbox 投递才进入 DEAD_LETTER
+    → 仍然不创建任何 response_execution_ref
+
 submit 成功
     → 在创建真实 response_execution_ref 并把 Proposal 从 APPROVED 推进到
       SUBMITTED 的**同一事务**内写入 SUBMITTED + submitted_at
@@ -860,6 +870,16 @@ submit 成功
 execution，因此既没有 execution 可以失败，也**不得**写
 `response_execution_ref.status = FAILED`；Proposal 合法地保持 `APPROVED`。Workspace
 必须显示"提交失败"且不展示任何外部执行编号，并停止轮询。
+
+`ATTENTION_REQUIRED` 是自动重试预算耗尽后的终态**本地**状态，与
+`FAILED_DEFINITIVE` 刻意不同：`FAILED_DEFINITIVE` 断言 Provider **拒绝**了该次提交，
+而这里我们**不能**断言任何一方的结论 —— 既不能断言 Provider 拒绝，也不能断言没有
+execution 存在（每次尝试都在 Provider 给出答案之前失败）。该事实由 submit 投递的
+exhaustion hook 在 dead-letter **之前**写入（见 §27）：`response_submission` 先变为
+`ATTENTION_REQUIRED` 并记录 `attention_required_at`，随后 outbox 投递才被置为
+`DEAD_LETTER`，因此 Workspace 永远不会读到"投递已终止"而本地提交仍显示"正在重试"。
+该状态之后不再有任何自动重试，Workspace 必须显示"提交状态不确定 / 需要人工处理"，
+不展示任何外部执行编号，并停止轮询。
 
 ---
 
@@ -989,11 +1009,16 @@ investigation_created            → investigation.graph.run
 response_execution_queued        → response.execution.submit
 response_execution_submitted     → response.execution.observe
 response_execution_observed      → response.execution.observe
+response_execution_observation_failed → response.execution.observe
 ```
 
-`response_submission_retrying` 与 `response_submission_failed` **不在此表中**：它们是
-关于本地提交的事实（见 §23.1），不是需要投递的交付，因此不产生 outbox 行；它们只作为
-Domain Event 追加进事件账本。
+`response_submission_retrying`、`response_submission_failed` 与
+`response_submission_attention_required` **不在此表中**：它们是关于本地提交的事实
+（见 §23.1），不是需要投递的交付，因此不产生 outbox 行；它们只作为 Domain Event
+追加进事件账本。`response_submission_attention_required` 只是事实：它**没有** outbox
+目的地，因此它不会投递任何东西；"自动重试已停止"这一语义由 submit 投递自身的
+exhaustion hook 承担 —— 该 hook 先持久化上述事实，随后该 submit 投递（
+`response_execution_queued` 的投递）才进入 `DEAD_LETTER`。
 
 响应执行的 durable 语义：`response.execution.submit` 与 `response.execution.observe`
 是**两个独立职责** —— submit 仅在一次性提交时获取真实 Provider execution id；
@@ -1002,6 +1027,15 @@ observe 只推进一个已经提交的 execution。一个合法但非终态的 P
 `available_at` 设为**未来时刻**来重新调度（durable delayed observation），
 **绝不允许**靠耗尽 attempts 把该投递重试到 `DEAD_LETTER` —— 一个正在运行中的
 execution 不是失败。
+
+同理，一次**读取**真实 Provider execution 的失败（transient / uncertain 的
+`get_execution_status()` 失败：timeout、transport error、HTTP 408 / 425 / 429、5xx）
+不消耗该 observe 投递的重试预算：它追加 `response_execution_observation_failed`
+（映射到 `response.execution.observe`，`available_at` 设为未来时刻）并正常结束本次
+投递，因此 Provider 长时间不可用也**永不**会把对账职责耗尽 attempts 而进入
+`DEAD_LETTER`。此时 `response_execution_ref` 投影**刻意保持不变** —— 我们对该
+execution 一无所知，其 status / 时间戳 / 错误保持为最后一次成功观测所留下的值，
+绝不因读取失败而把 execution 标记为 `FAILED`。
 
 Status：
 
@@ -1199,7 +1233,8 @@ Durable submit worker（事务外调用 HISIEM）
 如果 SOAR 已接受请求但 Copilot 在持久化 execution ref 前崩溃，重试必须使用相同 `submission_key`，由 HISIEM 去重并恢复同一 execution，禁止生成第二次实际响应。
 
 上面的审批事务同时创建 `response_submission` 的 `PENDING` 行；submit worker 的成功与
-失败路径如何持久化该行（SUBMITTED / RETRYING / FAILED_DEFINITIVE），见 §23.1。
+失败路径如何持久化该行（SUBMITTED / RETRYING / FAILED_DEFINITIVE /
+ATTENTION_REQUIRED），见 §23.1。
 
 ---
 

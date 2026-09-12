@@ -99,6 +99,7 @@ class ResponseSubmission:
     updated_at: datetime = field(default_factory=utc_now)
     submitted_at: datetime | None = None
     failed_at: datetime | None = None
+    attention_required_at: datetime | None = None
 
 
 @dataclass(frozen=True)

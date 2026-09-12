@@ -453,6 +453,7 @@ class SubmissionSchema(BaseModel):
     updated_at: datetime | None = None
     submitted_at: datetime | None = None
     failed_at: datetime | None = None
+    attention_required_at: datetime | None = None
 
     @classmethod
     def from_read_model(cls, value: WorkspaceResponseSubmission) -> SubmissionSchema:
@@ -465,6 +466,7 @@ class SubmissionSchema(BaseModel):
             updated_at=value.updated_at,
             submitted_at=value.submitted_at,
             failed_at=value.failed_at,
+            attention_required_at=value.attention_required_at,
         )
 
 

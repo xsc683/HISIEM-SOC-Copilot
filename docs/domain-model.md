@@ -724,7 +724,9 @@ ResponseSubmission
       ▼                        │
    RETRYING ───────────────────┘
       │
-      └──▶ FAILED_DEFINITIVE
+      ├──▶ FAILED_DEFINITIVE
+      │
+      └──▶ ATTENTION_REQUIRED
 ```
 
 | 状态 | 含义 | 允许操作 |
@@ -733,17 +735,30 @@ ResponseSubmission
 | RETRYING | TRANSIENT / UNCERTAIN 失败（HTTP 408 / 425 / 429、5xx、transport error、空 execution_id），同一稳定 key 继续重试 | Read |
 | SUBMITTED | Provider 已接受，真实 `execution_id` 已持久化为 ResponseExecutionRef | Read、Observe |
 | FAILED_DEFINITIVE | Provider 确定性拒绝该次提交（HTTP 400 / 404 / 409 / 422），未创建任何 execution | Read |
+| ATTENTION_REQUIRED | 自动重试预算耗尽，而失败始终是 TRANSIENT / UNCERTAIN（timeout、transport error、HTTP 408 / 425 / 429、5xx）：Provider 从未给出结论 | Read |
 
 关键不变量：
 
 - 审批事务创建 `PENDING` 行，并**仍然不创建** ResponseExecutionRef（见 §35.1）；
-- `PENDING` / `RETRYING` / `FAILED_DEFINITIVE` 一律没有 Provider execution identity，
-  不得展示任何外部执行编号（也不得用 `proposal_id` 顶替）；
+- `PENDING` / `RETRYING` / `FAILED_DEFINITIVE` / `ATTENTION_REQUIRED` 一律没有
+  Provider execution identity，不得展示任何外部执行编号（也不得用 `proposal_id` 顶替）；
 - **`FAILED_DEFINITIVE` 是提交事实，不是执行事实**：Provider 从未创建 execution，
   因此它不是 `ResponseExecutionRef.status = FAILED`（不存在可失败的 execution），
   Proposal 合法地保持 `APPROVED`，绝不为该次失败虚构 execution id；
 - `FAILED_DEFINITIVE` 之后没有可 Observe 的对象：Workspace 必须呈现"提交失败"，
-  不展示外部执行编号，并停止轮询。
+  不展示外部执行编号，并停止轮询；
+- **`ATTENTION_REQUIRED` 是终态本地状态，且与 `FAILED_DEFINITIVE` 刻意不同**：
+  `FAILED_DEFINITIVE` 断言 Provider **拒绝**了该次提交，而 `ATTENTION_REQUIRED` 只断言
+  "自动重试已停止"，**既不**断言 Provider 拒绝了提交，**也不**断言不存在 execution ——
+  我们确实不知道，因为每次尝试都在 Provider 给出答案之前失败。该状态在 dead-letter
+  之前持久化（见 persistence-schema.md §23.1 / §27），因此不会出现"投递已终止而本地
+  提交仍在重试"的假象；
+- `ATTENTION_REQUIRED` 之后：不再有任何自动重试，Workspace 必须呈现
+  "提交状态不确定 / 需要人工处理"，不展示任何外部执行编号，并停止轮询；
+- 对真实 Provider execution 的一次失败**读取**（transient / uncertain 的
+  `get_execution_status()` 失败）从不改变该 execution 的状态，也不结束对账：它不消耗
+  observe 投递的重试预算，只是持久化下一次观测的 durable 计划，并保持
+  `response_execution_ref` 投影不变（见 persistence-schema.md §27）。
 
 ## 36. 合法状态转换
 

@@ -172,7 +172,9 @@ class ResponseSubmissionRow(CopilotBase):
 
     Exists because "did the provider accept our submission?" and "what did the
     provider do with the execution?" are different questions. A definitive
-    provider rejection leaves a row here and NO ``response_execution_ref`` row.
+    provider rejection leaves a row here and NO ``response_execution_ref`` row —
+    and so does an exhausted automatic retry budget, which is a DIFFERENT fact
+    (``ATTENTION_REQUIRED``: we never got a verdict).
     """
 
     __tablename__ = "response_submission"
@@ -181,7 +183,8 @@ class ResponseSubmissionRow(CopilotBase):
             "submission_key", name="uq_response_submission_submission_key"
         ),
         CheckConstraint(
-            "status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE')",
+            "status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE',"
+            "'ATTENTION_REQUIRED')",
             name="response_submission_status_valid",
         ),
         CheckConstraint("attempt_count >= 0", name="response_submission_attempts_valid"),
@@ -199,3 +202,5 @@ class ResponseSubmissionRow(CopilotBase):
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
     submitted_at: Mapped[datetime | None] = mapped_column(nullable=True)
     failed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    #: Set when the AUTOMATIC retry budget ran out on still-uncertain failures.
+    attention_required_at: Mapped[datetime | None] = mapped_column(nullable=True)

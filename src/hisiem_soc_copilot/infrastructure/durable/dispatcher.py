@@ -51,6 +51,24 @@ class Resolver(Protocol):
     async def resolve(self, *, event_id: UUID) -> tuple[str, str] | None: ...
 
 
+class ExhaustionHandler(Protocol):
+    """Destination-specific hook invoked BEFORE a delivery is dead-lettered.
+
+    A retry budget is a TRANSPORT concern; what it MEANS for the business is not.
+    The generic dispatcher therefore does not guess: when a destination's attempts
+    run out it asks the destination's own handler to persist whatever business fact
+    the exhaustion implies (for submit: "nobody knows whether the provider accepted
+    it, a human must look"), and only then dead-letters the row. This keeps the
+    durable projection and the outbox from ever disagreeing — an outbox row in
+    DEAD_LETTER while the projection still says "retrying" is a lie the workspace
+    would keep showing.
+    """
+
+    async def on_retry_exhausted(
+        self, *, aggregate_id: str, tenant_id: str, error_code: str
+    ) -> None: ...
+
+
 class OutboxRunner(Protocol):
     """A durable consumer for one outbox destination.
 
@@ -93,10 +111,12 @@ class AsyncOutboxDispatcher:
         destination: str = _DISPATCHER_DESTINATION,
         poll_interval_seconds: float = 1.0,
         batch_size: int = 8,
+        exhaustion: ExhaustionHandler | None = None,
     ) -> None:
         self._outbox = outbox_store
         self._resolver = resolver
         self._runner = runner
+        self._exhaustion = exhaustion
         self._worker = worker_name
         self._destination = destination
         self._poll = poll_interval_seconds
@@ -144,7 +164,7 @@ class AsyncOutboxDispatcher:
         try:
             target = await self._resolver.resolve(event_id=record.event_id)
         except Exception as exc:  # resolution is short/transient
-            await self._fail(record, "RESOLVE_ERROR")
+            await self._fail(record, "RESOLVE_ERROR", target=None)
             logger.warning("outbox resolve failed: %s", exc)
             return
         if target is None:
@@ -185,7 +205,7 @@ class AsyncOutboxDispatcher:
                 )
                 return
             except Exception as exc:  # recoverable: retry with backoff
-                await self._fail(record, "RUN_FAILED")
+                await self._fail(record, "RUN_FAILED", target=(tenant_id, aggregate_id))
                 logger.warning("aggregate %s run failed: %s", aggregate_id, exc)
                 return
         await self._outbox.mark_published(
@@ -232,9 +252,46 @@ class AsyncOutboxDispatcher:
             with suppress(asyncio.CancelledError):
                 await renewer
 
-    async def _fail(self, record: OutboxRecord, error_code: str) -> None:
+    async def _fail(
+        self,
+        record: OutboxRecord,
+        error_code: str,
+        *,
+        target: tuple[str, str] | None,
+    ) -> None:
         """Exhausted attempts → DEAD_LETTER (terminal); else FAILED with backoff."""
         if record.attempt_count >= _MAX_ATTEMPTS:
+            if self._exhaustion is not None and target is not None:
+                tenant_id, aggregate_id = target
+                try:
+                    # The business fact goes FIRST. If it cannot be written we must
+                    # NOT dead-letter: that would leave the durable projection
+                    # claiming the delivery is still being retried. Keeping the row
+                    # retryable is the conservative failure mode — it stays visible
+                    # and the hook runs again on the next attempt.
+                    await self._exhaustion.on_retry_exhausted(
+                        aggregate_id=aggregate_id,
+                        tenant_id=tenant_id,
+                        error_code=error_code,
+                    )
+                except Exception as exc:
+                    backoff = timedelta(
+                        seconds=min(2 ** record.attempt_count, 120)
+                    )
+                    await self._outbox.mark_failed(
+                        outbox_id=record.id,
+                        lease_token=record.lease_token,
+                        error_code=error_code,
+                        next_available_at=datetime.now(UTC) + backoff,
+                        attempt_count=record.attempt_count,
+                    )
+                    logger.warning(
+                        "exhaustion handler failed for aggregate %s (%s); keeping "
+                        "the delivery retryable instead of dead-lettering",
+                        aggregate_id,
+                        exc,
+                    )
+                    return
             await self._outbox.mark_dead_letter(
                 outbox_id=record.id,
                 lease_token=record.lease_token,

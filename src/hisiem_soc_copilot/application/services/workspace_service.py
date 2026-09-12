@@ -95,6 +95,7 @@ TL_RESPONSE_EXECUTION_FAILED = "RESPONSE_EXECUTION_FAILED"
 TL_RESPONSE_SUBMISSION_QUEUED = "RESPONSE_SUBMISSION_QUEUED"
 TL_RESPONSE_SUBMISSION_RETRYING = "RESPONSE_SUBMISSION_RETRYING"
 TL_RESPONSE_SUBMISSION_FAILED = "RESPONSE_SUBMISSION_FAILED"
+TL_RESPONSE_SUBMISSION_ATTENTION_REQUIRED = "RESPONSE_SUBMISSION_ATTENTION_REQUIRED"
 
 _TOOL_SUCCEEDED = "SUCCEEDED"
 _EXEC_SUCCEEDED = "SUCCEEDED"
@@ -106,8 +107,10 @@ _EXEC_QUEUED = "QUEUED"
 _EXEC_AWAITING_SUBMISSION = "AWAITING_SUBMISSION"
 _EXEC_SUBMISSION_RETRYING = "SUBMISSION_RETRYING"
 _EXEC_SUBMISSION_FAILED = "SUBMISSION_FAILED"
+_EXEC_SUBMISSION_ATTENTION_REQUIRED = "SUBMISSION_ATTENTION_REQUIRED"
 _SUBMISSION_RETRYING = "RETRYING"
 _SUBMISSION_FAILED_DEFINITIVE = "FAILED_DEFINITIVE"
+_SUBMISSION_ATTENTION_REQUIRED = "ATTENTION_REQUIRED"
 
 
 def _header(investigation: Investigation) -> WorkspaceInvestigation:
@@ -529,6 +532,7 @@ def _workspace_submission(
         updated_at=submission.updated_at,
         submitted_at=submission.submitted_at,
         failed_at=submission.failed_at,
+        attention_required_at=submission.attention_required_at,
     )
 
 
@@ -640,6 +644,24 @@ def _response_timeline_entries(
                     occurred_at=submission.failed_at or submission.updated_at,
                     title="Response submission rejected by provider",
                     status=_EXEC_SUBMISSION_FAILED,
+                    ref_type="response_proposal",
+                    ref_id=str(proposal.id),
+                    safe_metadata={
+                        "error_code": submission.last_error_code,
+                        "attempts": submission.attempt_count,
+                    },
+                )
+            )
+            return entries
+        if submission is not None and submission.status == _SUBMISSION_ATTENTION_REQUIRED:
+            # The automatic retry budget is spent and nobody knows whether the
+            # provider accepted the submission — say exactly that, and stop.
+            entries.append(
+                WorkspaceTimelineEntry(
+                    kind=TL_RESPONSE_SUBMISSION_ATTENTION_REQUIRED,
+                    occurred_at=submission.attention_required_at or submission.updated_at,
+                    title="Response submission needs attention",
+                    status=_EXEC_SUBMISSION_ATTENTION_REQUIRED,
                     ref_type="response_proposal",
                     ref_id=str(proposal.id),
                     safe_metadata={

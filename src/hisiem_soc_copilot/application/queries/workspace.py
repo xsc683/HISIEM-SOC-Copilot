@@ -249,6 +249,11 @@ class WorkspaceResponseSubmission:
     ``FAILED_DEFINITIVE`` means the provider refused the submission and no provider
     execution exists, so the workspace must NOT render an external execution id and
     must NOT keep telling the analyst that submission is still pending.
+
+    ``ATTENTION_REQUIRED`` means the automatic retry budget ran out on UNCERTAIN
+    failures: we cannot claim the provider refused it, and we cannot claim no
+    execution exists. The workspace must say so plainly rather than showing a
+    retry that is no longer happening.
     """
 
     status: str
@@ -260,6 +265,7 @@ class WorkspaceResponseSubmission:
     updated_at: datetime | None = None
     submitted_at: datetime | None = None
     failed_at: datetime | None = None
+    attention_required_at: datetime | None = None
 
 
 @dataclass(frozen=True)

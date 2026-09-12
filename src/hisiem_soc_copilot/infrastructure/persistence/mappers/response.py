@@ -186,6 +186,7 @@ def submission_to_domain(row: ResponseSubmissionRow) -> ResponseSubmission:
         updated_at=row.updated_at,
         submitted_at=row.submitted_at,
         failed_at=row.failed_at,
+        attention_required_at=row.attention_required_at,
     )
 
 
@@ -201,4 +202,5 @@ def submission_to_row(submission: ResponseSubmission) -> ResponseSubmissionRow:
         updated_at=submission.updated_at,
         submitted_at=submission.submitted_at,
         failed_at=submission.failed_at,
+        attention_required_at=submission.attention_required_at,
     )
