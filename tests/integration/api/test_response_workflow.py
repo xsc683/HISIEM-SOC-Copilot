@@ -30,7 +30,12 @@ from hisiem_soc_copilot.api.app import create_app
 from hisiem_soc_copilot.application.errors import ExternalServiceError
 from hisiem_soc_copilot.application.ports.soar import SoarExecutionResult
 from hisiem_soc_copilot.config import Settings
-from hisiem_soc_copilot.infrastructure.durable.dispatcher import _MAX_ATTEMPTS
+from hisiem_soc_copilot.infrastructure.durable.dispatcher import (
+    _MAX_ATTEMPTS,
+    RESPONSE_OBSERVE_DESTINATION,
+    RESPONSE_SUBMIT_DESTINATION,
+    AsyncOutboxDispatcher,
+)
 from tests.fixtures.fakes import FakeSoar
 from tests.fixtures.hisiem_fake import FakeHisiem
 from tests.fixtures.ssh_models import GroundedSshModel
@@ -137,6 +142,34 @@ def _script() -> dict[str, Any]:
     }
 
 
+class _UnreadableResolver:
+    """A resolver whose READ fails — never a resolver that finds nothing.
+
+    ``resolve() -> None`` means "the event is genuinely gone" and settles the
+    delivery. RAISING means "the read failed", which is evidence about nothing at
+    all and must never be terminal.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def resolve(self, *, event_id: Any) -> tuple[str, str] | None:
+        self.calls += 1
+        raise RuntimeError("domain_event read failed")
+
+
+class _SpyExhaustion:
+    """Records exhaustion notifications without writing any business fact."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def on_retry_exhausted(
+        self, *, aggregate_id: str, tenant_id: str, error_code: str
+    ) -> None:
+        self.calls.append((aggregate_id, tenant_id, error_code))
+
+
 class _Harness:
     def __init__(
         self,
@@ -214,6 +247,39 @@ class _Harness:
 
     async def drain_observe(self) -> int:
         return await self.container.response_observe_dispatcher.drain_once()
+
+    def submit_dispatcher_with_unreadable_events(
+        self, *, soar: FakeSoar
+    ) -> tuple[AsyncOutboxDispatcher, _SpyExhaustion]:
+        """A REAL submit dispatcher (real store, real runner) whose event read fails."""
+        exhaustion = _SpyExhaustion()
+        return (
+            AsyncOutboxDispatcher(
+                outbox_store=self.container.outbox_store(),
+                resolver=_UnreadableResolver(),
+                runner=self.container.response_submit_runner(
+                    soar=soar, observe_delay_seconds=0.0
+                ),
+                worker_name="test-submit",
+                destination=RESPONSE_SUBMIT_DESTINATION,
+                exhaustion=exhaustion,
+            ),
+            exhaustion,
+        )
+
+    def observe_dispatcher_with_unreadable_events(
+        self, *, soar: FakeSoar
+    ) -> AsyncOutboxDispatcher:
+        """A REAL observe dispatcher whose event read fails (no exhaustion hook)."""
+        return AsyncOutboxDispatcher(
+            outbox_store=self.container.outbox_store(),
+            resolver=_UnreadableResolver(),
+            runner=self.container.response_observe_runner(
+                soar=soar, observe_delay_seconds=0.0
+            ),
+            worker_name="test-observe",
+            destination=RESPONSE_OBSERVE_DESTINATION,
+        )
 
     async def scalar(self, sql: str, **params: Any) -> Any:
         async with self._session_factory() as session:
@@ -1448,7 +1514,9 @@ async def test_an_exhausted_submit_budget_becomes_attention_required(
         "SELECT attempt_count FROM copilot.outbox_message "
         "WHERE destination = 'response.execution.submit'"
     ) == len(soar.submitted)
-    assert len(soar.submitted) >= 1
+    # …and that number is exactly the budget: `_MAX_ATTEMPTS` really means ten
+    # deliveries, so the tenth attempt is the one that exhausts it.
+    assert len(soar.submitted) == _MAX_ATTEMPTS
     assert await harness.scalar(
         "SELECT attempt_count FROM copilot.response_submission"
     ) == len(soar.submitted)
@@ -1547,6 +1615,155 @@ async def test_a_prolonged_observe_outage_never_loses_reconciliation(
         )
     )
     soar.raise_on_status = None
+    soar.status_sequence = ["SUCCEEDED"]
+    for _ in range(5):
+        await harness.make_observe_delivery_claimable()
+        await harness.drain_observe()
+        if await harness.scalar(
+            "SELECT status FROM copilot.response_execution_ref"
+        ) == "SUCCEEDED":
+            break
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "SUCCEEDED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.observe' AND status = 'DEAD_LETTER'"
+    ) == 0
+    ws = await _workspace(harness, investigation_id)
+    assert ws["response"]["proposals"][0]["execution"]["status"] == "SUCCEEDED"
+
+
+# ---------------------------------------------------------------------------
+# §6 — a failed EVENT READ is not a business outcome
+# ---------------------------------------------------------------------------
+
+
+async def test_a_resolver_outage_never_terminalizes_a_submit(harness: _Harness) -> None:
+    """An unreadable event must not be mistaken for a verdict about the provider.
+
+    Driven past the whole retry budget: the exhaustion hook never fires, the outbox
+    row never dead-letters, the submission is never pushed into ATTENTION_REQUIRED
+    (which would assert "automatic retrying stopped" — false, it merely could not
+    read its own event), and the provider is never called. Once events are readable
+    the SAME delivery reaches the submit runner normally.
+    """
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar()
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "PENDING"
+
+    dispatcher, exhaustion = harness.submit_dispatcher_with_unreadable_events(soar=soar)
+    harness.container.response_submit_dispatcher = dispatcher
+    overshoot = 3
+    for _ in range(_MAX_ATTEMPTS + overshoot):
+        await harness.make_submit_delivery_claimable()
+        assert await harness.drain_submit() == 1
+
+    assert exhaustion.calls == []
+    assert soar.submitted == []  # the provider was never asked anything
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "PENDING"
+    assert await harness.scalar(
+        "SELECT attention_required_at FROM copilot.response_submission"
+    ) is None
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == "FAILED"
+    # Not one attempt was lost: the transport counted every claim it made.
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.submit'"
+    ) == _MAX_ATTEMPTS + overshoot
+
+    # Reads work again → the SAME delivery is delivered and the submit goes through.
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    await harness.make_submit_delivery_claimable()
+    assert await harness.drain_submit() == 1
+    assert len(soar.submitted) == 1
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "SUBMITTED"
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 1
+
+    ws = await _workspace(harness, investigation_id)
+    assert ws["response"]["proposals"][0]["submission"]["status"] == "SUBMITTED"
+
+
+async def test_a_resolver_outage_never_loses_observe_reconciliation(
+    harness: _Harness,
+) -> None:
+    """Same rule where a real provider execution is being observed.
+
+    A real, non-terminal execution exists, so HISIEM owns the truth. An unreadable
+    event means we cannot even find the delivery's aggregate — it is not a reason to
+    declare the execution failed, nor to dead-letter the reconciliation. Once reads
+    recover, observation resumes against the SAME execution and converges.
+    """
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(
+            execution_id="exec-resolver-outage", status="RUNNING"
+        )
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "RUNNING"
+
+    harness.container.response_observe_dispatcher = (
+        harness.observe_dispatcher_with_unreadable_events(soar=soar)
+    )
+    overshoot = 3
+    for _ in range(_MAX_ATTEMPTS + overshoot):
+        await harness.make_observe_delivery_claimable()
+        await harness.drain_observe()
+
+    assert soar.status_calls == []  # the provider was never polled
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.outbox_message "
+        "WHERE destination = 'response.execution.observe' AND status = 'DEAD_LETTER'"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_execution_ref"
+    ) == "RUNNING"
+
+    # Reads recover → reconciliation continues against the same execution.
+    harness.container.response_observe_dispatcher = (
+        harness.container.response_observe_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
     soar.status_sequence = ["SUCCEEDED"]
     for _ in range(5):
         await harness.make_observe_delivery_claimable()

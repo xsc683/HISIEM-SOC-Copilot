@@ -461,6 +461,13 @@ class SqlAlchemyOutboxStore(OutboxStore):
                         OutboxMessageRow.locked_by == row.locked_by,
                     )
                 token = uuid4().hex
+                # Compute the post-claim count BEFORE the UPDATE and reuse that one
+                # value for both the row and the returned record. Reading
+                # ``row.attempt_count`` again after the UPDATE would be unsafe: with
+                # ORM session synchronization enabled the UPDATE refreshes the
+                # in-memory instance, so a second ``+ 1`` would make the record lead
+                # the persisted value by one and burn the retry budget a round early.
+                next_attempt_count = row.attempt_count + 1
                 updated = cast(
                     "CursorResult[object]",
                     await session.execute(
@@ -471,7 +478,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
                             locked_at=now,
                             locked_by=worker,
                             lease_token=token,
-                            attempt_count=row.attempt_count + 1,
+                            attempt_count=next_attempt_count,
                         )
                     ),
                 )
@@ -483,7 +490,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
                         event_id=row.event_id,
                         destination=row.destination,
                         status="PROCESSING",
-                        attempt_count=row.attempt_count + 1,
+                        attempt_count=next_attempt_count,
                         available_at=row.available_at,
                         lease_token=token,
                         locked_at=now,

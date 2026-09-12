@@ -60,6 +60,10 @@ class FakeOutboxStore:
     published_ids: list[UUID] = field(default_factory=list)
     failed_ids: list[UUID] = field(default_factory=list)
     dead_letter_ids: list[UUID] = field(default_factory=list)
+    #: ``(outbox_id, error_code, next_available_at)`` for every FAILED settlement,
+    #: so a test can assert the retry schedule (future, monotone, capped) without
+    #: reaching into the row dict.
+    failed_schedules: list[tuple[UUID, str, Any]] = field(default_factory=list)
     now: Any = field(default_factory=lambda: __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc
     ))
@@ -199,6 +203,7 @@ class FakeOutboxStore:
                 row["available_at"] = next_available_at
                 row["lease_token"] = None
                 self.failed_ids.append(outbox_id)
+                self.failed_schedules.append((outbox_id, error_code, next_available_at))
                 return True
         return False
 

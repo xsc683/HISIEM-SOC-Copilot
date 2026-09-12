@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest_asyncio
@@ -21,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from hisiem_soc_copilot.config import Settings
+from hisiem_soc_copilot.infrastructure.durable.dispatcher import _MAX_ATTEMPTS
 from hisiem_soc_copilot.infrastructure.persistence.repositories.durable import (
     SqlAlchemyOutboxStore,
 )
@@ -422,6 +424,46 @@ async def test_worker_stops_renewing_then_reclaimable_after_lease_timeout(
     assert len(reclaimed) == 1
     assert reclaimed[0].lease_token != claimed[0].lease_token
     assert await _lease_owner(session_factory, outbox_id) == "worker-other"
+
+
+async def test_claim_returns_exactly_the_persisted_attempt_count(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The claimed record's ``attempt_count`` IS the persisted one — never one ahead.
+
+    The claim UPDATE increments the column, so reading ``row.attempt_count`` again
+    afterwards is unsafe: with ORM session synchronization the in-memory instance has
+    already been refreshed, and a second ``+ 1`` would make the record lead the row
+    by one. That would spend a ``_MAX_ATTEMPTS`` budget one attempt early, so it is
+    asserted against real rows here rather than only against the in-memory fake.
+    """
+    store = SqlAlchemyOutboxStore(session_factory)
+    event_id = uuid4()
+    outbox_id = await _enqueue(session_factory, event_id)
+
+    record: Any = None
+    for expected in range(1, _MAX_ATTEMPTS + 1):
+        claimed = await store.claim_batch(
+            worker="worker-count", limit=10, available_before=datetime.now(UTC)
+        )
+        assert len(claimed) == 1
+        record = claimed[0]
+        assert record.attempt_count == expected
+        status, persisted = await _status_of(session_factory, outbox_id)
+        assert status == "PROCESSING"
+        assert persisted == expected
+        # Settle it back to a claimable state (backoff already elapsed).
+        assert await store.mark_failed(
+            outbox_id=record.id,
+            lease_token=record.lease_token,
+            error_code="RETRY_FOR_TEST",
+            next_available_at=datetime.now(UTC) - timedelta(hours=1),
+            attempt_count=record.attempt_count,
+        )
+
+    # `_MAX_ATTEMPTS = 10` therefore means TEN deliveries: the tenth claim is the one
+    # that reports the budget as spent, not the ninth.
+    assert record.attempt_count == _MAX_ATTEMPTS
 
 
 async def _locked_at_of(

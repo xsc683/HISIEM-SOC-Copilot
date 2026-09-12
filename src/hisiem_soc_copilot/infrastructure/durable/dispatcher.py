@@ -7,6 +7,13 @@ investigation runner (which does all graph/LLM/tool work outside DB transactions
 The outbox row is marked PUBLISHED on success and FAILED (with backoff) on a
 recoverable error, each in its own transaction.
 
+Failures split into three classes, and only ONE of them may ever dead-letter:
+- resolution failed (we cannot even name the aggregate) → retry forever, the
+  dead-letter budget is never touched;
+- the runner raised a deterministic ``NonRetryableRunError`` → DEAD_LETTER at once;
+- the runner failed recoverably → retry with backoff, and at budget exhaustion the
+  DESTINATION's exhaustion hook writes the business fact before the DEAD_LETTER.
+
 An in-process per-investigation lock guarantees that duplicate/concurrent outbox
 delivery never launches two runs of the same investigation.
 """
@@ -43,10 +50,18 @@ RESPONSE_OBSERVE_DESTINATION = "response.execution.observe"
 _DISPATCHER_DESTINATION = INVESTIGATION_DESTINATION
 _MAX_ATTEMPTS = 10
 _LEASE_TIMEOUT_SECONDS = 60
+# Retry backoff is exponential in the attempt count and capped here, so a delivery
+# that has to stay retryable indefinitely still settles into a bounded attempt rate.
+_MAX_BACKOFF_SECONDS = 120
 
 
 class Resolver(Protocol):
-    """Maps a claimed outbox record to the event's (tenant_id, aggregate_id)."""
+    """Maps a claimed outbox record to the event's (tenant_id, aggregate_id).
+
+    ``None`` means "that event is genuinely gone" and settles the delivery. RAISING
+    means "the read failed" — a different fact entirely, and the one the dispatcher
+    must never turn into a dead letter (see ``AsyncOutboxDispatcher._retry_later``).
+    """
 
     async def resolve(self, *, event_id: UUID) -> tuple[str, str] | None: ...
 
@@ -163,9 +178,23 @@ class AsyncOutboxDispatcher:
             return
         try:
             target = await self._resolver.resolve(event_id=record.event_id)
-        except Exception as exc:  # resolution is short/transient
-            await self._fail(record, "RESOLVE_ERROR", target=None)
-            logger.warning("outbox resolve failed: %s", exc)
+        except Exception as exc:
+            # A failed RESOLUTION says nothing about the business outcome: we cannot
+            # even name the aggregate this delivery belongs to, so no destination
+            # hook can be consulted and no business fact can honestly be written.
+            # Spending the dead-letter budget here would drop the responsibility
+            # silently — a submit stuck at PENDING/RETRYING, an execution left
+            # RUNNING with its reconciliation gone for good, or a local event that
+            # was merely unreadable at that instant discarded permanently. The
+            # delivery stays retryable; backoff still bounds the attempt rate.
+            await self._retry_later(record, "RESOLVE_ERROR")
+            # Bounded, internal detail only — never the exception's own text.
+            logger.warning(
+                "outbox %s resolve failed on attempt %d (%s)",
+                record.id,
+                record.attempt_count,
+                type(exc).__name__,
+            )
             return
         if target is None:
             # The originating event vanished — nothing to dispatch.
@@ -257,55 +286,63 @@ class AsyncOutboxDispatcher:
         record: OutboxRecord,
         error_code: str,
         *,
-        target: tuple[str, str] | None,
+        target: tuple[str, str],
     ) -> None:
-        """Exhausted attempts → DEAD_LETTER (terminal); else FAILED with backoff."""
-        if record.attempt_count >= _MAX_ATTEMPTS:
-            if self._exhaustion is not None and target is not None:
-                tenant_id, aggregate_id = target
-                try:
-                    # The business fact goes FIRST. If it cannot be written we must
-                    # NOT dead-letter: that would leave the durable projection
-                    # claiming the delivery is still being retried. Keeping the row
-                    # retryable is the conservative failure mode — it stays visible
-                    # and the hook runs again on the next attempt.
-                    await self._exhaustion.on_retry_exhausted(
-                        aggregate_id=aggregate_id,
-                        tenant_id=tenant_id,
-                        error_code=error_code,
-                    )
-                except Exception as exc:
-                    backoff = timedelta(
-                        seconds=min(2 ** record.attempt_count, 120)
-                    )
-                    await self._outbox.mark_failed(
-                        outbox_id=record.id,
-                        lease_token=record.lease_token,
-                        error_code=error_code,
-                        next_available_at=datetime.now(UTC) + backoff,
-                        attempt_count=record.attempt_count,
-                    )
-                    logger.warning(
-                        "exhaustion handler failed for aggregate %s (%s); keeping "
-                        "the delivery retryable instead of dead-lettering",
-                        aggregate_id,
-                        exc,
-                    )
-                    return
-            await self._outbox.mark_dead_letter(
-                outbox_id=record.id,
-                lease_token=record.lease_token,
-                error_code=error_code,
-            )
+        """A DELIVERED run failed: retry with backoff, dead-letter once exhausted.
+
+        At exhaustion the DESTINATION decides what the dead letter means, because a
+        retry budget is a transport concern and the business meaning is not. The
+        hook writes that fact FIRST; if it cannot be written the delivery stays
+        retryable rather than dead-lettering — a dead letter sitting next to a
+        projection that still says "retrying" is a lie the workspace keeps showing.
+        Destinations with no exhaustion hook simply dead-letter.
+        """
+        if record.attempt_count < _MAX_ATTEMPTS:
+            await self._retry_later(record, error_code)
             return
-        backoff = timedelta(seconds=min(2 ** record.attempt_count, 120))
+        if self._exhaustion is not None:
+            tenant_id, aggregate_id = target
+            try:
+                await self._exhaustion.on_retry_exhausted(
+                    aggregate_id=aggregate_id,
+                    tenant_id=tenant_id,
+                    error_code=error_code,
+                )
+            except Exception as exc:
+                await self._retry_later(record, error_code)
+                logger.warning(
+                    "exhaustion handler failed for aggregate %s (%s); keeping "
+                    "the delivery retryable instead of dead-lettering",
+                    aggregate_id,
+                    type(exc).__name__,
+                )
+                return
+        await self._outbox.mark_dead_letter(
+            outbox_id=record.id,
+            lease_token=record.lease_token,
+            error_code=error_code,
+        )
+
+    async def _retry_later(self, record: OutboxRecord, error_code: str) -> None:
+        """Schedule another attempt WITHOUT ever consuming the dead-letter budget.
+
+        For failures that are evidence of nothing: a resolution read that failed, or
+        an exhaustion hook that could not persist its business fact. Backoff keeps
+        the attempt rate bounded, so retrying indefinitely is safe.
+        """
         await self._outbox.mark_failed(
             outbox_id=record.id,
             lease_token=record.lease_token,
             error_code=error_code,
-            next_available_at=datetime.now(UTC) + backoff,
+            next_available_at=datetime.now(UTC)
+            + timedelta(seconds=self._backoff_seconds(record.attempt_count)),
             attempt_count=record.attempt_count,
         )
+
+    @staticmethod
+    def _backoff_seconds(attempt_count: int) -> int:
+        """Bounded exponential backoff: 2, 4, 8, … capped at ``_MAX_BACKOFF_SECONDS``."""
+        return min(int(2**attempt_count), _MAX_BACKOFF_SECONDS)
 
     # ------------------------------------------------------------------
     # worker lifecycle
