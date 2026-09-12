@@ -23,6 +23,13 @@ from .evidence import (
     HypothesisRow,
 )
 from .investigation import InvestigationRow
+from .knowledge import (
+    AttackTechniqueRow,
+    EmbeddingProfileRow,
+    KnowledgeChunkRow,
+    KnowledgeDocumentRow,
+    KnowledgeDocumentVersionRow,
+)
 from .plan import PlanRevisionRow, PlanStepRow, PlanStepStateRow
 from .response import (
     ApprovalDecisionRow,
@@ -61,4 +68,9 @@ __all__ = [
     "DomainEventRow",
     "OutboxMessageRow",
     "ToolInvocationRow",
+    "KnowledgeDocumentRow",
+    "KnowledgeDocumentVersionRow",
+    "EmbeddingProfileRow",
+    "KnowledgeChunkRow",
+    "AttackTechniqueRow",
 ]

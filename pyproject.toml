@@ -21,6 +21,9 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0",
     "httpx>=0.27",
     "openai>=1.40,<2",
+    # The one P3-A addition (brief §76): the official pgvector SQLAlchemy
+    # integration for the untyped ``vector`` column. No ANN index, no vector DB.
+    "pgvector>=0.3,<1",
 ]
 
 [project.optional-dependencies]

@@ -10,12 +10,21 @@ from __future__ import annotations
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ...application.errors import CommandReceiptConflictError
+from ...application.errors import (
+    CommandReceiptConflictError,
+    KnowledgeIngestionConflictError,
+)
 from ...application.ports.durable import (
     CommandReceiptStore,
     EventLedger,
     OrchestrationBindingStore,
     ToolInvocationStore,
+)
+from ...application.ports.knowledge import (
+    AttackTechniqueRepository,
+    EmbeddingProfileRepository,
+    KnowledgeChunkRepository,
+    KnowledgeDocumentRepository,
 )
 from ...application.ports.repositories import (
     EvidenceRepository,
@@ -47,6 +56,12 @@ from .repositories.durable import (
     SqlAlchemyToolInvocationStore,
 )
 from .repositories.investigation import SqlAlchemyInvestigationRepository
+from .repositories.knowledge import (
+    SqlAlchemyAttackTechniqueRepository,
+    SqlAlchemyEmbeddingProfileRepository,
+    SqlAlchemyKnowledgeChunkRepository,
+    SqlAlchemyKnowledgeDocumentRepository,
+)
 from .repositories.response import (
     SqlAlchemyResponseApprovalRepository,
     SqlAlchemyResponseExecutionRepository,
@@ -75,6 +90,23 @@ _PROPOSAL_UNIQUE_CONSTRAINTS = (
 # collides HERE on commit — the handler must converge deterministically instead of
 # leaking a raw IntegrityError. Every other IntegrityError propagates unchanged.
 _RECEIPT_SCOPED_CONSTRAINT = "uq_command_receipt_tenant_command_key"
+
+# Knowledge writes are guarded by unique constraints rather than by read-then-
+# write checks, because read-then-write loses every race that matters. Two
+# concurrent ingests of the same content must converge on ONE version, and a
+# second ACTIVE embedding profile must be unrepresentable -- so the loser of
+# either race gets a translated conflict to react to instead of a raw
+# IntegrityError (brief sections 13/28).
+_KNOWLEDGE_UNIQUE_CONSTRAINTS = (
+    "uq_knowledge_document_global_key",
+    "uq_knowledge_document_tenant_key",
+    "uq_knowledge_document_version_number",
+    "uq_knowledge_document_version_content_hash",
+    "uq_knowledge_chunk_version_ordinal",
+    "uq_embedding_profile_identity",
+    "uq_embedding_profile_single_active",
+    "uq_attack_technique_release",
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -127,6 +159,21 @@ class SqlAlchemyUnitOfWork:
         self.tool_invocations: ToolInvocationStore = SqlAlchemyToolInvocationStore(
             self._session
         )
+        # Knowledge persistence shares the SAME session/transaction as the rest of
+        # the command: an ingested version, its active pointer and its rebuildable
+        # chunk projection commit together or not at all.
+        self.knowledge_documents: KnowledgeDocumentRepository = (
+            SqlAlchemyKnowledgeDocumentRepository(self._session)
+        )
+        self.knowledge_chunks: KnowledgeChunkRepository = (
+            SqlAlchemyKnowledgeChunkRepository(self._session)
+        )
+        self.embedding_profiles: EmbeddingProfileRepository = (
+            SqlAlchemyEmbeddingProfileRepository(self._session)
+        )
+        self.attack_techniques: AttackTechniqueRepository = (
+            SqlAlchemyAttackTechniqueRepository(self._session)
+        )
 
     async def __aenter__(self) -> SqlAlchemyUnitOfWork:
         return self
@@ -161,6 +208,11 @@ class SqlAlchemyUnitOfWork:
                 raise ResponseProposalConflictError(
                     investigation_id=_conflicting_investigation_id(exc)
                 ) from exc
+            if _is_knowledge_unique_conflict(exc):
+                raise KnowledgeIngestionConflictError(
+                    "a concurrent knowledge write won the race on "
+                    f"{_violated_constraint_name(exc) or 'a knowledge unique constraint'}"
+                ) from exc
             raise
 
     async def rollback(self) -> None:
@@ -174,6 +226,20 @@ def _is_active_alert_conflict(exc: IntegrityError) -> bool:
     SQLAlchemy IntegrityError is ``exc`` and the driver error is ``exc.orig``.
     """
     return _violates_constraint(exc, _ACTIVE_ALERT_CONSTRAINT)
+
+
+def _is_knowledge_unique_conflict(exc: IntegrityError) -> bool:
+    """True only when the integrity error is one of the knowledge unique indexes."""
+    return any(
+        _violates_constraint(exc, name) for name in _KNOWLEDGE_UNIQUE_CONSTRAINTS
+    )
+
+
+def _violated_constraint_name(exc: IntegrityError) -> str | None:
+    """Best-effort constraint name from the driver error, for a bounded message."""
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    return str(name) if name else None
 
 
 def _is_receipt_scoped_conflict(exc: IntegrityError) -> bool:

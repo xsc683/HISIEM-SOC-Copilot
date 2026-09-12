@@ -17,13 +17,17 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from ...domain.investigation.events import InvestigationEvent
+from ...domain.knowledge.events import KnowledgeEvent
 from ...domain.response.events import ResponseEvent
 
-#: Domain events that may be appended to the ledger. ``InvestigationEvent`` and
-#: ``ResponseEvent`` share an identical structural shape (event_id / event_type /
-#: aggregate_type / aggregate_id / tenant_id / correlation_id / causation_id /
-#: actor_subject_id / occurred_at / payload), so the ledger treats them uniformly.
-AppendableEvent = InvestigationEvent | ResponseEvent
+#: Domain events that may be appended to the ledger. ``InvestigationEvent``,
+#: ``ResponseEvent``, and ``KnowledgeEvent`` share an identical structural shape
+#: (event_id / event_type / aggregate_type / aggregate_id / tenant_id /
+#: correlation_id / causation_id / actor_subject_id / occurred_at / payload), so
+#: the ledger treats them uniformly. Knowledge events have no entry in
+#: ``_EVENT_DESTINATIONS``, so appending one records an audit fact and enqueues
+#: no delivery (brief section 29).
+AppendableEvent = InvestigationEvent | ResponseEvent | KnowledgeEvent
 
 
 @dataclass(frozen=True)

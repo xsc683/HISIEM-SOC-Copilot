@@ -68,6 +68,64 @@ class ExternalServiceError(ApplicationError):
         self.upstream_code = code
 
 
+class KnowledgeIngestionConflictError(ApplicationError):
+    """A knowledge unique constraint was violated by a concurrent writer.
+
+    Raised by the UnitOfWork commit when one of the knowledge unique indexes
+    fires (document identity, version number, content hash, chunk ordinal,
+    attack-technique release, single ACTIVE embedding profile). The ingestion
+    handler catches it, re-reads, and either converges on the winner's version
+    (same content) or re-raises it as a deterministic conflict -- a raw
+    IntegrityError must never reach a caller as a 500 (brief section 28).
+    """
+
+    code = "KNOWLEDGE_INGESTION_CONFLICT"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class KnowledgeEmbeddingProfileError(ApplicationError):
+    """The configured embedding space cannot be used for this write.
+
+    Covers "the profile for this provider is retired" and "a different profile is
+    already ACTIVE and switching was not explicitly requested". Both are operator
+    decisions, so both are refused loudly rather than resolved silently
+    (brief sections 16/18).
+    """
+
+    code = "KNOWLEDGE_EMBEDDING_PROFILE"
+
+
+class InvalidKnowledgeQueryError(ApplicationError):
+    """Raised when a knowledge query violates its bounded contract.
+
+    Query normalization is a REJECTION boundary, not a repair service: an
+    over-long topic or too many context terms fails loudly instead of being
+    silently truncated into a different query than the caller asked for
+    (brief sections 40/41).
+    """
+
+    code = "INVALID_KNOWLEDGE_QUERY"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class KnowledgeRetrievalUnavailableError(ApplicationError):
+    """Raised when retrieval cannot run at all, as opposed to returning no hits.
+
+    Distinct from "no results" on purpose: a missing ACTIVE embedding profile or
+    an unconfigured provider is an operational fault an operator must fix, and
+    reporting it as an empty result set would hide it (brief sections 16/31).
+    """
+
+    code = "KNOWLEDGE_RETRIEVAL_UNAVAILABLE"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 def to_http_error(exc: BaseException) -> tuple[int, str, str]:
     """Map domain/application errors to stable HTTP (status, code, message).
 
@@ -100,6 +158,10 @@ def to_http_error(exc: BaseException) -> tuple[int, str, str]:
         return 502, exc.code, str(exc)
     if isinstance(exc, UnauthorizedError):
         return 403, exc.code, str(exc)
+    if isinstance(exc, KnowledgeRetrievalUnavailableError):
+        # A deployment/configuration fault, not a caller mistake: 503 so an
+        # operator sees "knowledge retrieval is down", never a bare 400.
+        return 503, exc.code, str(exc)
     if isinstance(exc, ApplicationError):
         return 400, exc.code, str(exc)
     return 500, "INTERNAL_ERROR", "internal error"

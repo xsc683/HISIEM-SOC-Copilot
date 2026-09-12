@@ -16,6 +16,12 @@ from .durable import (
     OrchestrationBindingStore,
     ToolInvocationStore,
 )
+from .knowledge import (
+    AttackTechniqueRepository,
+    EmbeddingProfileRepository,
+    KnowledgeChunkRepository,
+    KnowledgeDocumentRepository,
+)
 from .repositories import (
     EvidenceRepository,
     FindingRepository,
@@ -57,6 +63,10 @@ class UnitOfWork(Protocol):
     command_receipts: CommandReceiptStore
     bindings: OrchestrationBindingStore
     tool_invocations: ToolInvocationStore
+    knowledge_documents: KnowledgeDocumentRepository
+    knowledge_chunks: KnowledgeChunkRepository
+    embedding_profiles: EmbeddingProfileRepository
+    attack_techniques: AttackTechniqueRepository
 
     async def commit(self) -> None: ...
 
