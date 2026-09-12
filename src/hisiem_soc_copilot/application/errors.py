@@ -91,6 +91,7 @@ def to_http_error(exc: BaseException) -> tuple[int, str, str]:
             "OPTIMISTIC_CONCURRENCY",
             "APPROVAL_DECISION_EXISTS",
             "APPROVAL_CONTRACT_MISMATCH",
+            "RESPONSE_PROPOSAL_CONFLICT",
         } else 400
         return status, exc.code, str(exc)
     if isinstance(exc, OptimisticConcurrencyError):

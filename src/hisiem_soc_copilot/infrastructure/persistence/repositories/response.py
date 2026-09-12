@@ -12,18 +12,22 @@ from typing import cast
 from uuid import UUID
 
 from sqlalchemy import CursorResult, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ....application.ports.repositories import (
     ResponseApprovalRepository,
     ResponseExecutionRepository,
     ResponseProposalRepository,
+    ResponseSubmissionRepository,
 )
 from ....domain.response.aggregate import ResponseProposal
+from ....domain.response.errors import ResponseProposalConflictError
 from ....domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
     ResponseExecutionRef,
+    ResponseSubmission,
 )
 from ....domain.shared.errors import OptimisticConcurrencyError
 from ..mappers.response import (
@@ -34,6 +38,8 @@ from ..mappers.response import (
     execution_to_domain,
     proposal_to_domain,
     proposal_to_row,
+    submission_to_domain,
+    submission_to_row,
     targets_to_rows,
 )
 from ..orm.investigation import InvestigationRow
@@ -44,7 +50,26 @@ from ..orm.response import (
     ResponseProposalEvidenceRow,
     ResponseProposalRow,
     ResponseProposalTargetRow,
+    ResponseSubmissionRow,
 )
+
+# V1 allows exactly ONE response proposal per investigation (and per result).
+# Both unique constraints mean the same thing to a caller: someone else created
+# this investigation's proposal first. Shared with the unit of work, which keeps a
+# commit-time translation as a second net.
+_PROPOSAL_UNIQUE_CONSTRAINTS = (
+    "uq_response_proposal_investigation",
+    "uq_response_proposal_result",
+)
+
+
+def _is_proposal_unique_conflict(exc: IntegrityError) -> bool:
+    orig = exc.orig
+    name = getattr(orig, "constraint_name", None)
+    if name is None:
+        diag = getattr(orig, "diag", None)
+        name = getattr(diag, "constraint_name", None)
+    return name in _PROPOSAL_UNIQUE_CONSTRAINTS
 
 
 class SqlAlchemyResponseProposalRepository(ResponseProposalRepository):
@@ -57,7 +82,19 @@ class SqlAlchemyResponseProposalRepository(ResponseProposalRepository):
         # the child INSERTs (and for an approval_request added later in the same
         # transaction). Without an ORM relationship, insert order is otherwise
         # not guaranteed.
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # The INSERT is what actually violates UNIQUE(investigation_id) /
+            # UNIQUE(result_id), so the concurrent-first-create race surfaces HERE
+            # rather than at commit(). Translate it at the point it fires so the
+            # handler can converge instead of leaking a raw IntegrityError as 500.
+            await self._session.rollback()
+            if _is_proposal_unique_conflict(exc):
+                raise ResponseProposalConflictError(
+                    investigation_id=proposal.investigation_id
+                ) from exc
+            raise
         for target in targets_to_rows(proposal):
             self._session.add(target)
         for evidence_id in proposal.evidence_ids:
@@ -356,8 +393,61 @@ class SqlAlchemyResponseExecutionRepository(ResponseExecutionRepository):
         return execution_to_domain(row) if row is not None else None
 
 
+class SqlAlchemyResponseSubmissionRepository(ResponseSubmissionRepository):
+    """Local submission lifecycle; tenant-scoped through the owning investigation."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add(self, submission: ResponseSubmission) -> None:
+        self._session.add(submission_to_row(submission))
+
+    async def update(self, submission: ResponseSubmission) -> None:
+        result = cast(
+            "CursorResult[object]",
+            await self._session.execute(
+                update(ResponseSubmissionRow)
+                .where(ResponseSubmissionRow.proposal_id == submission.proposal_id)
+                .values(
+                    status=submission.status,
+                    attempt_count=submission.attempt_count,
+                    last_error_code=submission.last_error_code,
+                    safe_error_message=submission.safe_error_message,
+                    updated_at=submission.updated_at,
+                    submitted_at=submission.submitted_at,
+                    failed_at=submission.failed_at,
+                )
+            ),
+        )
+        if result.rowcount == 0:
+            raise KeyError(f"response submission {submission.proposal_id} not found")
+
+    async def get_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseSubmission | None:
+        row = (
+            await self._session.execute(
+                select(ResponseSubmissionRow)
+                .join(
+                    ResponseProposalRow,
+                    ResponseProposalRow.id == ResponseSubmissionRow.proposal_id,
+                )
+                .join(
+                    InvestigationRow,
+                    InvestigationRow.id == ResponseProposalRow.investigation_id,
+                )
+                .where(
+                    InvestigationRow.tenant_id == tenant_id,
+                    ResponseSubmissionRow.proposal_id == proposal_id,
+                )
+            )
+        ).scalar_one_or_none()
+        return submission_to_domain(row) if row is not None else None
+
+
 __all__ = [
     "SqlAlchemyResponseProposalRepository",
+    "SqlAlchemyResponseSubmissionRepository",
     "SqlAlchemyResponseApprovalRepository",
     "SqlAlchemyResponseExecutionRepository",
 ]

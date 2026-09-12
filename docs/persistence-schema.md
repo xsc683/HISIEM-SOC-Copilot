@@ -154,6 +154,7 @@ response_proposal_evidence
 approval_request
 approval_decision
 response_execution_ref
+response_submission
 
 Application / Runtime
 ────────────────────────────
@@ -583,6 +584,9 @@ content_revision INTEGER NOT NULL DEFAULT 1
 content_hash CHAR(64) NOT NULL
 lock_version BIGINT NOT NULL DEFAULT 0
 
+created_by_subject TEXT NOT NULL
+created_by_display_name TEXT NULL
+
 created_at TIMESTAMPTZ NOT NULL
 updated_at TIMESTAMPTZ NOT NULL
 ```
@@ -618,6 +622,20 @@ REQUIRE_APPROVAL
 V1 Proposal Content 创建后不允许用户修改。
 
 `content_revision` 用于 Approval Contract；`lock_version` 用于并发控制，两者不得混淆。
+
+`created_by_subject` / `created_by_display_name` 是**不可变的 Proposer Provenance**：
+创建时由服务端从已认证的 trusted context 推导，写入后永不修改；它绝不是请求体字段，
+也**绝不**取 `investigation.initiated_by_subject` —— 后者回答的是"谁跑了这次
+Investigation"，是另一个问题（只要提出响应的人不是调查者本人，答案就不同）。
+`created_by_subject` 非空：空 proposer 是构造错误，`ResponseProposal.__post_init__`
+直接抛 `DomainError`。
+
+Proposer Provenance **刻意不参与 Approval Content Hash**：`_compute_content_hash()`
+只覆盖 `action_key` / `target_refs` / `parameters`，因此 provenance 不可能让审批契约
+匹配或失配。`created_by_display_name` 可为空。
+
+存量行（早于 provenance 采集）在迁移中回填为字面量 `'unknown'`（add nullable →
+backfill → set NOT NULL），不为它们虚构任何身份。
 
 ---
 
@@ -769,6 +787,82 @@ response:{tenant_id}:{proposal_id}
 
 ---
 
+## 23.1 `response_submission`
+
+本地提交生命周期（LOCAL Submission Lifecycle）：durable 地回答"这一份被批准的提交
+是否被 Provider 接受"。它**不是** Provider Execution Status，也不是第二个 execution
+投影 —— 与 §23 相同，该表永不保存 placeholder / 伪造的 execution identity。
+
+```text
+proposal_id UUID PK FK
+submission_key TEXT NOT NULL
+status VARCHAR(32) NOT NULL
+attempt_count INTEGER NOT NULL DEFAULT 0
+last_error_code TEXT NULL
+safe_error_message TEXT NULL
+created_at TIMESTAMPTZ NOT NULL
+updated_at TIMESTAMPTZ NOT NULL
+submitted_at TIMESTAMPTZ NULL
+failed_at TIMESTAMPTZ NULL
+```
+
+Status：
+
+```text
+PENDING
+RETRYING
+SUBMITTED
+FAILED_DEFINITIVE
+```
+
+约束：
+
+```text
+UNIQUE(submission_key)
+CHECK (status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE'))
+CHECK (attempt_count >= 0)
+```
+
+`submission_key` 与 §23 使用同一个稳定幂等身份：
+
+```text
+response:{tenant_id}:{proposal_id}
+```
+
+该表不携带 tenant 列，只能通过所属 Investigation 做 tenant-scoped 访问
+（`response_proposal.investigation_id → investigation.tenant_id`）。
+
+生命周期（与 §32 的事务边界一一对应）：
+
+```text
+审批事务（APPROVE）
+    → 创建 PENDING 行：与不可变 ApprovalDecision、WAITING_APPROVAL → APPROVED、
+      response_execution_queued 事件及其 outbox 投递在**同一事务**内
+    → 仍然不创建任何 response_execution_ref
+
+submit 投递遇到 TRANSIENT / UNCERTAIN 失败
+    （HTTP 408 / 425 / 429、5xx、transport error，或 Provider 返回空 execution_id）
+    → RETRYING，attempt_count 递增，记录有界的 last_error_code 与 safe_error_message
+    → 追加 response_submission_retrying 事件
+    → outbox 投递保持可重试，并使用**同一个**稳定 key
+
+submit 投递被 Provider 确定性拒绝（HTTP 400 / 404 / 409 / 422）
+    → FAILED_DEFINITIVE，写入 failed_at
+    → 追加 response_submission_failed 事件，outbox 投递进入 DEAD_LETTER
+    → 仍然不创建任何 response_execution_ref
+
+submit 成功
+    → 在创建真实 response_execution_ref 并把 Proposal 从 APPROVED 推进到
+      SUBMITTED 的**同一事务**内写入 SUBMITTED + submitted_at
+```
+
+`FAILED_DEFINITIVE` 是关于**提交**的事实，不是关于执行的事实：Provider 从未创建
+execution，因此既没有 execution 可以失败，也**不得**写
+`response_execution_ref.status = FAILED`；Proposal 合法地保持 `APPROVED`。Workspace
+必须显示"提交失败"且不展示任何外部执行编号，并停止轮询。
+
+---
+
 ## 24. `orchestration_binding`
 
 连接 Domain Identity 与 LangGraph Runtime Identity。
@@ -896,6 +990,10 @@ response_execution_queued        → response.execution.submit
 response_execution_submitted     → response.execution.observe
 response_execution_observed      → response.execution.observe
 ```
+
+`response_submission_retrying` 与 `response_submission_failed` **不在此表中**：它们是
+关于本地提交的事实（见 §23.1），不是需要投递的交付，因此不产生 outbox 行；它们只作为
+Domain Event 追加进事件账本。
 
 响应执行的 durable 语义：`response.execution.submit` 与 `response.execution.observe`
 是**两个独立职责** —— submit 仅在一次性提交时获取真实 Provider execution id；
@@ -1099,6 +1197,9 @@ Durable submit worker（事务外调用 HISIEM）
 ```
 
 如果 SOAR 已接受请求但 Copilot 在持久化 execution ref 前崩溃，重试必须使用相同 `submission_key`，由 HISIEM 去重并恢复同一 execution，禁止生成第二次实际响应。
+
+上面的审批事务同时创建 `response_submission` 的 `PENDING` 行；submit worker 的成功与
+失败路径如何持久化该行（SUBMITTED / RETRYING / FAILED_DEFINITIVE），见 §23.1。
 
 ---
 

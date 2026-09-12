@@ -29,6 +29,8 @@ def _proposal(**overrides) -> ResponseProposal:
         action_key=ResponseActionKey.BLOCK_SOURCE_IP.value,
         parameters={"ip": "203.0.113.7"},
         reason="Blocked repeat offender",
+        created_by_subject="analyst",
+        created_by_display_name="Analyst A",
         target_refs=[
             ExternalResourceRef(
                 provider="hisiem",

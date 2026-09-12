@@ -34,10 +34,14 @@ from hisiem_soc_copilot.domain.investigation.entities import (
 from hisiem_soc_copilot.domain.investigation.events import InvestigationEvent
 from hisiem_soc_copilot.domain.investigation.value_objects import ExternalResourceRef
 from hisiem_soc_copilot.domain.response.aggregate import ResponseProposal
+from hisiem_soc_copilot.domain.response.errors import (
+    ResponseProposalConflictError,
+)
 from hisiem_soc_copilot.domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
     ResponseExecutionRef,
+    ResponseSubmission,
 )
 
 
@@ -702,6 +706,7 @@ class FakeResponseProposalRepository:
 
     def __init__(self, investigations: FakeInvestigationRepository | None = None) -> None:
         self._store: dict[UUID, ResponseProposal] = {}
+        self.pending_conflicts: list[ResponseProposal] = []
         self._investigations = investigations
 
     def in_tenant(self, proposal: ResponseProposal, tenant_id: str) -> bool:
@@ -711,10 +716,28 @@ class FakeResponseProposalRepository:
         return inv is not None and inv.tenant_id == tenant_id
 
     async def add(self, proposal: ResponseProposal) -> None:
+        # The real table has UNIQUE(investigation_id) and UNIQUE(result_id). Because
+        # the ORM flushes inside commit(), a duplicate INSERT only fails THERE — so
+        # the fake must not silently overwrite the first proposal either. It keeps
+        # the winner and remembers the conflict for commit() to raise, exactly like
+        # the SQLAlchemy unit of work translates the IntegrityError.
+        for existing in self._store.values():
+            if (
+                existing.investigation_id == proposal.investigation_id
+                or existing.result_id == proposal.result_id
+            ):
+                self.pending_conflicts.append(proposal)
+                return
         self._store[proposal.id] = proposal
 
     async def update(self, proposal: ResponseProposal) -> None:
         self._store[proposal.id] = proposal
+
+    def take_conflict(self) -> ResponseProposal | None:
+        """Pop a pending unique-constraint conflict, if one was staged."""
+        if not self.pending_conflicts:
+            return None
+        return self.pending_conflicts.pop(0)
 
     async def get(
         self, *, tenant_id: str, proposal_id: UUID
@@ -895,6 +918,36 @@ class FakeSoar:
         return SoarExecutionResult(execution_id=execution_id, status=status)
 
 
+class FakeResponseSubmissionRepository:
+    """In-memory local submission lifecycle, tenant-scoped via the owning proposal."""
+
+    def __init__(
+        self, proposals: FakeResponseProposalRepository | None = None
+    ) -> None:
+        self._store: dict[UUID, ResponseSubmission] = {}
+        self._proposals = proposals
+
+    def _in_tenant(self, submission: ResponseSubmission, tenant_id: str) -> bool:
+        if self._proposals is None:
+            return True
+        proposal = self._proposals._store.get(submission.proposal_id)
+        return proposal is not None and self._proposals.in_tenant(proposal, tenant_id)
+
+    async def add(self, submission: ResponseSubmission) -> None:
+        self._store[submission.proposal_id] = submission
+
+    async def update(self, submission: ResponseSubmission) -> None:
+        self._store[submission.proposal_id] = submission
+
+    async def get_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseSubmission | None:
+        submission = self._store.get(proposal_id)
+        if submission is None or not self._in_tenant(submission, tenant_id):
+            return None
+        return submission
+
+
 class FakeUnitOfWork:
     """In-memory UoW over all child repos (no real transaction).
 
@@ -914,6 +967,7 @@ class FakeUnitOfWork:
             ResponseApprovalRepository,
             ResponseExecutionRepository,
             ResponseProposalRepository,
+            ResponseSubmissionRepository,
             ResultRepository,
         )
 
@@ -935,6 +989,9 @@ class FakeUnitOfWork:
         self.response_executions: ResponseExecutionRepository = (
             FakeResponseExecutionRepository(self.response_proposals)
         )
+        self.response_submissions: ResponseSubmissionRepository = (
+            FakeResponseSubmissionRepository(self.response_proposals)
+        )
         self.outbox = FakeOutboxStore()
         self.events = FakeEventLedger(outbox=self.outbox)
         self.command_receipts = FakeCommandReceiptStore()
@@ -952,6 +1009,14 @@ class FakeUnitOfWork:
         return self._closed
 
     async def commit(self) -> None:
+        # Mirror the SQLAlchemy unit of work: a staged UNIQUE violation on
+        # response_proposal surfaces AT COMMIT as a deterministic conflict (never a
+        # raw IntegrityError, never a silent second proposal).
+        conflict = self.response_proposals.take_conflict()
+        if conflict is not None:
+            raise ResponseProposalConflictError(
+                investigation_id=conflict.investigation_id
+            )
         self._commits += 1
 
     async def rollback(self) -> None:
@@ -991,6 +1056,9 @@ class FakeUnitOfWorkFactory:
         self._response_executions = FakeResponseExecutionRepository(
             self._response_proposals
         )
+        self._response_submissions = FakeResponseSubmissionRepository(
+            self._response_proposals
+        )
         self.outbox = FakeOutboxStore()
         self.events = FakeEventLedger(outbox=self.outbox)
         self.command_receipts = FakeCommandReceiptStore()
@@ -1010,6 +1078,7 @@ class FakeUnitOfWorkFactory:
         uow.response_proposals = self._response_proposals
         uow.response_approvals = self._response_approvals
         uow.response_executions = self._response_executions
+        uow.response_submissions = self._response_submissions
         uow.events = self.events
         uow.command_receipts = self.command_receipts
         uow.bindings = self.bindings

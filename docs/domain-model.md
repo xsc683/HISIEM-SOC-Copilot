@@ -417,8 +417,25 @@ content_hash?
 approval_request_id?
 execution_ref?
 
+created_by_subject
+created_by_display_name?
+
 created_at
 ```
+
+`created_by_subject` / `created_by_display_name` 是**不可变的 Proposer Provenance**：
+创建时由服务端从已认证的 trusted context 推导，持久化后永不修改。它绝不是请求体字段，
+也**绝不**取 `Investigation.initiated_by` —— 后者回答"谁跑了这次 Investigation"，
+是另一个问题（提出响应的人不是调查者本人时，两者的答案就不同）。空 proposer 是构造错误：
+`ResponseProposal.__post_init__` 直接抛 `DomainError`。
+
+Proposer Provenance **刻意不参与 `content_hash`**：`_compute_content_hash()` 只覆盖
+`action_key` / `target_refs` / `parameters`，因此 provenance 不可能影响审批契约的匹配
+或失配。`created_by_display_name` 可为空。
+
+`response_proposal_created` 事件以 proposer 作为 event actor（`actor_subject_id`），
+payload 携带 `created_by_subject` / `created_by_display_name`，因此审计轨迹仅凭事件账本
+即可回答"谁提出了这次响应"，无需回读可变行。
 
 ## 22. Response Action
 
@@ -693,6 +710,40 @@ ResponseProposal
 响应审批事务内只允许：持久化 ApprovalDecision、`WAITING_APPROVAL → APPROVED`、
 持久化 `response_execution_queued` 事件、原子写入 outbox 投递；**不得**在该事务内创建 ResponseExecutionRef。
 ResponseExecutionRef 只能在提交 worker 拿到 HISIEM 返回的**真实非空 execution_id** 之后创建。
+
+## 35.2 本地提交生命周期（Local Submission）
+
+`APPROVED → SUBMITTED` 之间既不是"正在执行"，也不是"没有状态"：真正的问题只有
+"这一份提交是否被 Provider 接受"。该事实由 `response_submission` 独立持久化
+（见 persistence-schema.md §23.1），**不是** Provider Execution Status。
+
+```text
+ResponseSubmission
+   PENDING ──────────────▶ SUBMITTED
+      │                        ▲
+      ▼                        │
+   RETRYING ───────────────────┘
+      │
+      └──▶ FAILED_DEFINITIVE
+```
+
+| 状态 | 含义 | 允许操作 |
+|---|---|---|
+| PENDING | 审批事务已固化提交意图，submit 投递尚未完成 | Read |
+| RETRYING | TRANSIENT / UNCERTAIN 失败（HTTP 408 / 425 / 429、5xx、transport error、空 execution_id），同一稳定 key 继续重试 | Read |
+| SUBMITTED | Provider 已接受，真实 `execution_id` 已持久化为 ResponseExecutionRef | Read、Observe |
+| FAILED_DEFINITIVE | Provider 确定性拒绝该次提交（HTTP 400 / 404 / 409 / 422），未创建任何 execution | Read |
+
+关键不变量：
+
+- 审批事务创建 `PENDING` 行，并**仍然不创建** ResponseExecutionRef（见 §35.1）；
+- `PENDING` / `RETRYING` / `FAILED_DEFINITIVE` 一律没有 Provider execution identity，
+  不得展示任何外部执行编号（也不得用 `proposal_id` 顶替）；
+- **`FAILED_DEFINITIVE` 是提交事实，不是执行事实**：Provider 从未创建 execution，
+  因此它不是 `ResponseExecutionRef.status = FAILED`（不存在可失败的 execution），
+  Proposal 合法地保持 `APPROVED`，绝不为该次失败虚构 execution id；
+- `FAILED_DEFINITIVE` 之后没有可 Observe 的对象：Workspace 必须呈现"提交失败"，
+  不展示外部执行编号，并停止轮询。
 
 ## 36. 合法状态转换
 

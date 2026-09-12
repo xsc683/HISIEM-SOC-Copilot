@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -41,6 +41,7 @@ _ENV_NAME = "HISIEM_COPILOT_SERVICE_TOKEN"
 _PLAYBOOK_ID = "11111111-2222-3333-4444-555555555555"
 
 _TRUNCATE = (
+    "response_submission",
     "response_execution_ref",
     "approval_decision",
     "approval_request",
@@ -161,6 +162,25 @@ class _Harness:
         self.container.dispatcher = self.container.outbox_dispatcher(
             hisiem=self.hisiem, model=GroundedSshModel(script=_script())
         )
+
+    async def make_submit_delivery_claimable(self) -> None:
+        """Simulate the retry backoff elapsing — deterministically, no sleep.
+
+        A transient submit failure leaves the outbox row with a FUTURE
+        ``available_at`` (exponential backoff), which is correct but unclaimable.
+        Time is advanced by rewriting that timestamp into the past rather than by
+        sleeping on the wall clock.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE copilot.outbox_message "
+                    "SET available_at = now() - interval '1 hour' "
+                    "WHERE destination = 'response.execution.submit' "
+                    "AND status IN ('PENDING','FAILED')"
+                )
+            )
+            await session.commit()
 
     async def drain_submit(self) -> int:
         return await self.container.response_submit_dispatcher.drain_once()
@@ -460,12 +480,17 @@ async def test_approval_queues_submission_and_creates_no_execution(
     assert p["status"] == "APPROVED"
     # No fake external execution id may be shown while nothing was submitted.
     assert p["execution"] is None
+    # The entry is a LOCAL SUBMISSION fact, not an execution fact: there is no
+    # provider execution, so it must never be reported as one.
     queued = [
-        t for t in ws["timeline"] if t["kind"] == "RESPONSE_EXECUTION_QUEUED"
+        t for t in ws["timeline"] if t["kind"] == "RESPONSE_SUBMISSION_QUEUED"
     ]
     assert len(queued) == 1
     assert queued[0]["status"] == "AWAITING_SUBMISSION"
     assert queued[0]["ref_id"] == proposal["proposal_id"]
+    assert not [
+        t for t in ws["timeline"] if t["kind"] == "RESPONSE_EXECUTION_QUEUED"
+    ]
 
     # The investigation lifecycle is untouched by approval (§5).
     assert await harness.scalar(
@@ -797,8 +822,31 @@ async def test_response_workflow_is_tenant_scoped(harness: _Harness) -> None:
         headers=_headers(tenant="tenant-b", actor="operator"),
     )
     assert foreign_approve.status_code == 404
+
     assert await harness.drain_submit() == 0
     assert harness.soar.submitted == []
+
+
+async def test_submission_projection_is_tenant_scoped(harness: _Harness) -> None:
+    """The local submission lifecycle is reachable only through its own tenant."""
+    _, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+
+    from hisiem_soc_copilot.infrastructure.persistence.repositories.response import (
+        SqlAlchemyResponseSubmissionRepository,
+    )
+
+    async with harness.container.session_factory()() as session:
+        repo = SqlAlchemyResponseSubmissionRepository(session)
+        own = await repo.get_by_proposal(
+            tenant_id="tenant-a", proposal_id=UUID(proposal["proposal_id"])
+        )
+        foreign_submission = await repo.get_by_proposal(
+            tenant_id="tenant-b", proposal_id=UUID(proposal["proposal_id"])
+        )
+    assert own is not None
+    assert own.status == "PENDING"
+    assert foreign_submission is None
 
 
 async def test_response_workflow_rejects_a_missing_service_credential(
@@ -868,9 +916,36 @@ async def test_definitive_submit_failure_dead_letters_without_a_fake_ref(
         "WHERE destination = 'response.execution.submit'"
     ) == "DEAD_LETTER"
 
+    # The DEFINITIVE refusal is a fact about the SUBMISSION, and it must be
+    # persisted as one: without it the workspace would keep claiming "awaiting
+    # submission" forever.
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "FAILED_DEFINITIVE"
+    assert await harness.scalar(
+        "SELECT last_error_code FROM copilot.response_submission "
+        "WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "HTTP_422"
+    assert await harness.scalar(
+        "SELECT safe_error_message IS NOT NULL FROM copilot.response_submission "
+        "WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) is True
+
     ws = await _workspace(harness, investigation_id)
     p = ws["response"]["proposals"][0]
     assert p["execution"] is None  # no fabricated execution identity
+    assert p["submission"]["status"] == "FAILED_DEFINITIVE"
+    # ...and the workspace must stop claiming that submission is still pending.
+    kinds = [t["kind"] for t in ws["timeline"]]
+    assert "RESPONSE_SUBMISSION_FAILED" in kinds
+    assert "RESPONSE_SUBMISSION_QUEUED" not in kinds
+    assert "RESPONSE_SUBMISSION_RETRYING" not in kinds
+    assert not [
+        t for t in ws["timeline"] if t["kind"].startswith("RESPONSE_EXECUTION_")
+    ]
 
 
 async def test_transient_submit_failure_stays_queued(harness: _Harness) -> None:
@@ -895,6 +970,17 @@ async def test_transient_submit_failure_stays_queued(harness: _Harness) -> None:
     ) == "FAILED"
     assert await harness.scalar(
         "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    # Still retryable, and recorded as such - never as a provider failure.
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "RETRYING"
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.response_submission"
+    ) >= 1
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.domain_event "
+        "WHERE event_type = 'response_submission_failed'"
     ) == 0
 
 
@@ -924,3 +1010,320 @@ async def test_observed_provider_failure_settles_the_execution(harness: _Harness
     assert execution["status"] == "FAILED"
     assert execution["finished_at"] is not None
     assert execution["external_execution_id"] == "hisiem-exec-1"
+
+
+# ---------------------------------------------------------------------------
+# §1 provenance — who proposed this response?
+# ---------------------------------------------------------------------------
+
+
+async def test_proposal_persists_the_authenticated_proposer(harness: _Harness) -> None:
+    investigation_id = await _completed_investigation(harness)
+    ws = await _workspace(harness, investigation_id)
+    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
+
+    res = await harness.client.post(
+        f"/api/v1/investigations/{investigation_id}/response-proposals",
+        json={
+            "action_key": "START_SOAR_PLAYBOOK",
+            "evidence_ids": evidence_ids,
+            "parameters": {"playbook_id": _PLAYBOOK_ID},
+            "reason": "contain",
+        },
+        headers=_headers(actor="analyst-proposer"),
+    )
+    assert res.status_code == 201, res.text
+    proposal_id = res.json()["proposal"]["proposal_id"]
+
+    # Round-trip through the workspace read model (a fresh read, i.e. a refresh).
+    first = (await _workspace(harness, investigation_id))["response"]["proposals"][0]
+    assert first["created_by_subject"] == "analyst-proposer"
+    second = (await _workspace(harness, investigation_id))["response"]["proposals"][0]
+    assert second["created_by_subject"] == "analyst-proposer"
+
+    # Persisted, immutable, and NOT borrowed from the investigation initiator.
+    assert await harness.scalar(
+        "SELECT created_by_subject FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal_id,
+    ) == "analyst-proposer"
+    assert await harness.scalar(
+        "SELECT initiated_by_subject FROM copilot.investigation WHERE id = :iid",
+        iid=investigation_id,
+    ) == "analyst"
+
+    # The audit event names the proposer as its actor, so the ledger alone answers
+    # "who proposed this response".
+    assert await harness.scalar(
+        "SELECT actor_subject_id FROM copilot.domain_event "
+        "WHERE event_type = 'response_proposal_created' AND aggregate_id = :pid",
+        pid=proposal_id,
+    ) == "analyst-proposer"
+
+    # The browser cannot supply a creator: an out-of-bounds field is rejected loudly.
+    forged = await harness.client.post(
+        f"/api/v1/investigations/{investigation_id}/response-proposals",
+        json={
+            "action_key": "START_SOAR_PLAYBOOK",
+            "evidence_ids": evidence_ids,
+            "parameters": {"playbook_id": _PLAYBOOK_ID},
+            "reason": "contain",
+            "created_by_subject": "someone-else",
+        },
+        headers=_headers(actor="analyst-proposer"),
+    )
+    assert forged.status_code == 422, forged.text
+
+
+# ---------------------------------------------------------------------------
+# §2 the local submission lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def test_approval_persists_a_pending_submission_intent(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "PENDING"
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.response_submission "
+        "WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    ) == 0
+    key = await harness.scalar(
+        "SELECT submission_key FROM copilot.response_submission "
+        "WHERE proposal_id = :pid",
+        pid=proposal["proposal_id"],
+    )
+    assert key == f"response:tenant-a:{proposal['proposal_id']}"
+
+    # Still local-only: the approval transaction created NO provider execution.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+
+    ws = await _workspace(harness, investigation_id)
+    assert ws["response"]["proposals"][0]["submission"]["status"] == "PENDING"
+    assert ws["response"]["proposals"][0]["execution"] is None
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+async def test_definitive_submission_rejection_is_not_an_execution_failure(
+    harness: _Harness, status: int
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=FakeSoar(
+                raise_on_submit=ExternalServiceError(
+                    "rejected", service="hisiem", code=f"HTTP_{status}"
+                )
+            ),
+            observe_delay_seconds=0.0,
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "FAILED_DEFINITIVE"
+    assert await harness.scalar(
+        "SELECT last_error_code FROM copilot.response_submission"
+    ) == f"HTTP_{status}"
+    # No provider execution was created, so NOTHING may claim one failed.
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_execution_ref"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.domain_event "
+        "WHERE event_type IN ('response_execution_failed', 'response_execution_started')"
+    ) == 0
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.domain_event "
+        "WHERE event_type = 'response_submission_failed'"
+    ) == 1
+
+    ws = await _workspace(harness, investigation_id)
+    refreshed = await _workspace(harness, investigation_id)
+    assert ws["response"]["proposals"][0] == refreshed["response"]["proposals"][0]
+    assert ws["timeline"] == refreshed["timeline"]
+
+
+async def test_transient_submission_failure_projects_as_retrying(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=FakeSoar(
+                raise_on_submit=ExternalServiceError(
+                    "throttled", service="hisiem", code="HTTP_429"
+                )
+            ),
+            observe_delay_seconds=0.0,
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["submission"]["status"] == "RETRYING"
+    assert p["submission"]["attempt_count"] >= 1
+    assert p["execution"] is None
+    kinds = [t["kind"] for t in ws["timeline"]]
+    assert "RESPONSE_SUBMISSION_RETRYING" in kinds
+    assert "RESPONSE_SUBMISSION_FAILED" not in kinds
+    # The proposal itself is untouched: nothing was accepted and nothing failed.
+    assert p["status"] == "APPROVED"
+
+
+async def test_a_successful_retry_settles_submission_and_creates_the_ref(
+    harness: _Harness,
+) -> None:
+    investigation_id, proposal, approval, _ = await _proposal_with_approval(harness)
+    # First delivery throttled, second accepted: the SAME submission key is reused.
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=FakeSoar(
+                raise_on_submit=ExternalServiceError(
+                    "throttled", service="hisiem", code="HTTP_429"
+                )
+            ),
+            observe_delay_seconds=0.0,
+        )
+    )
+    assert (await _approve(harness, approval, proposal)).status_code == 200
+    await harness.drain_submit()
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "RETRYING"
+
+    # Provider recovers; the retry must converge on the SAME logical submission.
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(execution_id="exec-retry-1", status="RUNNING")
+    )
+    harness.container.response_submit_dispatcher = (
+        harness.container.response_submit_outbox_dispatcher(
+            soar=soar, observe_delay_seconds=0.0
+        )
+    )
+    await harness.make_submit_delivery_claimable()
+    await harness.drain_submit()
+
+    assert [call["submission_key"] for call in soar.submitted] == [
+        f"response:tenant-a:{proposal['proposal_id']}"
+    ]
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_submission"
+    ) == "SUBMITTED"
+    assert await harness.scalar(
+        "SELECT attempt_count FROM copilot.response_submission"
+    ) >= 1
+    assert await harness.scalar(
+        "SELECT execution_id FROM copilot.response_execution_ref"
+    ) == "exec-retry-1"
+    assert await harness.scalar(
+        "SELECT status FROM copilot.response_proposal WHERE id = :pid",
+        pid=proposal["proposal_id"],
+    ) == "SUBMITTED"
+
+    ws = await _workspace(harness, investigation_id)
+    p = ws["response"]["proposals"][0]
+    assert p["submission"]["status"] == "SUBMITTED"
+    assert p["execution"]["external_execution_id"] == "exec-retry-1"
+    kinds = [t["kind"] for t in ws["timeline"]]
+    assert "RESPONSE_EXECUTION_QUEUED" in kinds
+    assert "RESPONSE_SUBMISSION_FAILED" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# §4 concurrent first-creates converge (never two proposals, never a 500)
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_first_creates_converge_on_one_proposal(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import contextlib
+
+    from hisiem_soc_copilot.infrastructure.persistence.repositories.response import (
+        SqlAlchemyResponseProposalRepository,
+    )
+
+    investigation_id = await _completed_investigation(harness)
+    ws = await _workspace(harness, investigation_id)
+    evidence_ids = [e["evidence_id"] for e in ws["evidence"]][:1]
+
+    # Force the exact interleaving under test: both requests must pass the
+    # "does a proposal already exist?" pre-check before either may INSERT. Without
+    # this the race is real but not deterministic; nothing about the production
+    # path is weakened - the loser still hits the real UNIQUE constraint.
+    original = SqlAlchemyResponseProposalRepository.get_by_investigation
+    barrier = asyncio.Event()
+    arrived = 0
+    guard = asyncio.Lock()
+
+    async def gated(
+        self: Any, *, tenant_id: str, investigation_id: Any
+    ) -> Any:
+        nonlocal arrived
+        async with guard:
+            arrived += 1
+            if arrived >= 2:
+                barrier.set()
+        # Safety valve only: never expected to fire, and never a wall-clock wait
+        # for correctness (both requests are in flight before the barrier opens).
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(barrier.wait(), timeout=10)
+        return await original(
+            self, tenant_id=tenant_id, investigation_id=investigation_id
+        )
+
+    monkeypatch.setattr(
+        SqlAlchemyResponseProposalRepository, "get_by_investigation", gated
+    )
+
+    async def create() -> httpx.Response:
+        return await harness.client.post(
+            f"/api/v1/investigations/{investigation_id}/response-proposals",
+            json={
+                "action_key": "START_SOAR_PLAYBOOK",
+                "evidence_ids": evidence_ids,
+                "parameters": {"playbook_id": _PLAYBOOK_ID},
+                "reason": "contain",
+            },
+            headers=_headers(),
+        )
+
+    responses = await asyncio.gather(create(), create())
+
+    # Never a raw integrity error (500): the loser converges or gets a 409.
+    assert [r.status_code for r in responses] != []
+    for res in responses:
+        assert res.status_code in (201, 409), res.text
+    accepted = [r for r in responses if r.status_code == 201]
+    assert accepted, [r.text for r in responses]
+
+    assert await harness.scalar(
+        "SELECT count(*) FROM copilot.response_proposal WHERE investigation_id = :iid",
+        iid=investigation_id,
+    ) == 1
+    winners = {r.json()["proposal"]["proposal_id"] for r in accepted}
+    assert len(winners) == 1
+
+    # The investigation is linked to that ONE proposal, and stays COMPLETED.
+    assert await harness.scalar(
+        "SELECT response_proposal_id FROM copilot.investigation WHERE id = :iid",
+        iid=investigation_id,
+    ) == UUID(winners.pop())
+    assert await harness.scalar(
+        "SELECT status FROM copilot.investigation WHERE id = :iid",
+        iid=investigation_id,
+    ) == "COMPLETED"

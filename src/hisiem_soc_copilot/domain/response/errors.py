@@ -45,6 +45,26 @@ class ApprovalDecisionAlreadyExistsError(ResponseProposalError):
         )
 
 
+class ResponseProposalConflictError(ResponseProposalError):
+    """A concurrent request created this investigation's proposal FIRST.
+
+    V1 allows exactly ONE proposal per investigation (``uq_response_proposal_investigation``).
+    Two simultaneous first-creates therefore race on that unique constraint; the
+    loser must converge on the winner's proposal rather than leak a raw
+    IntegrityError as HTTP 500. If the winner cannot be read back (it was removed
+    between the failed INSERT and the re-read) this surfaces as a deterministic
+    conflict instead of a fabricated success.
+    """
+
+    code = "RESPONSE_PROPOSAL_CONFLICT"
+
+    def __init__(self, *, investigation_id: Any) -> None:
+        super().__init__(
+            "a concurrent request created the response proposal for this investigation",
+            details={"investigation_id": str(investigation_id)},
+        )
+
+
 class ResponseEvidenceInvalidError(ResponseProposalError):
     """Raised when requested supporting evidence does not resolve in scope.
 

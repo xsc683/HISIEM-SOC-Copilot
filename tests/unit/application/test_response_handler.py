@@ -538,3 +538,84 @@ async def test_foreign_tenant_cannot_approve() -> None:
 
 def test_source_alert_target_helper_matches_alerts() -> None:
     assert target().address_id == ALERT
+
+
+# ---------------------------------------------------------------------------
+# proposer provenance (immutable, server-derived, never from the body)
+# ---------------------------------------------------------------------------
+
+
+async def test_proposal_records_the_server_derived_proposer() -> None:
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+
+    assert proposal.created_by_subject == "analyst"
+    # NOT borrowed from the investigation initiator — they answer different questions.
+    investigation = await factory().investigations.get(
+        tenant_id=TENANT, investigation_id=investigation_id
+    )
+    assert investigation is not None
+    assert investigation.initiated_by.subject_id == "analyst"
+
+    event = next(
+        e for e in factory.events.events if e.event_type == "response_proposal_created"
+    )
+    assert event.actor_subject_id == "analyst"
+    assert event.payload["created_by_subject"] == "analyst"
+
+    # Survives a reload (it is persisted provenance, not an in-memory field).
+    reloaded = await factory().response_proposals.get(
+        tenant_id=TENANT, proposal_id=proposal.id
+    )
+    assert reloaded is not None
+    assert reloaded.created_by_subject == "analyst"
+
+
+async def test_an_empty_proposer_is_rejected_by_the_aggregate() -> None:
+    """A proposal with no recorded proposer cannot be constructed at all."""
+    from hisiem_soc_copilot.application.commands.response import CreateResponseProposal
+    from hisiem_soc_copilot.domain.shared.errors import DomainError as _DomainError
+
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    with pytest.raises(_DomainError):
+        await handler(factory).create_response_proposal(
+            CreateResponseProposal(
+                tenant_id=TENANT,
+                investigation_id=investigation_id,
+                action_key="START_SOAR_PLAYBOOK",
+                evidence_ids=(str(evidence_id),),
+                parameters={"playbook_id": "11111111-2222-3333-4444-555555555555"},
+                reason="contain the intrusion",
+                initiated_by_subject="   ",
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
+# concurrent first-create convergence
+# ---------------------------------------------------------------------------
+
+
+async def test_a_racing_second_create_converges_on_the_first_proposal() -> None:
+    """The loser of the UNIQUE race returns the winner's proposal, never a 500.
+
+    The in-memory store stages the same unique violation the real table raises, so
+    the handler's convergence branch is exercised without a database.
+    """
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+
+    first = await create_proposal(factory, investigation_id, evidence_ids=(evidence_id,))
+    second = await create_proposal(factory, investigation_id, evidence_ids=(evidence_id,))
+
+    assert second.id == first.id
+    assert len(factory._response_proposals._store) == 1

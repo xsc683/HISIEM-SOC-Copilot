@@ -79,6 +79,29 @@ class ResponseExecutionRef:
 
 
 @dataclass(frozen=True)
+class ResponseSubmission:
+    """The durable local truth about ONE approved submission attempt.
+
+    Persisted independently of the provider execution projection because the two
+    answer different questions: this one answers "did we get the submission to the
+    provider?", the other answers "what did the provider do with it?". A definitive
+    provider rejection has a submission row and NO execution row — which is exactly
+    the fact the workspace has to be able to show.
+    """
+
+    proposal_id: UUID
+    submission_key: str
+    status: str  # ResponseSubmissionStatus
+    attempt_count: int = 0
+    last_error_code: str | None = None
+    safe_error_message: str | None = None
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    submitted_at: datetime | None = None
+    failed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class ResponsePolicyDecision:
     decision: str  # DENY / REQUIRE_APPROVAL
     reason: str | None = None

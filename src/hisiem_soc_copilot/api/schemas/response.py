@@ -72,6 +72,8 @@ class ResponseProposalResponse(BaseModel):
                 ),
                 policy_reason=proposal.policy_reason,
                 created_at=proposal.created_at,
+                created_by_subject=proposal.created_by_subject,
+                created_by_display_name=proposal.created_by_display_name,
             )
         )
 

@@ -35,6 +35,7 @@ from ...application.queries.workspace import (
     WorkspaceResponseProjection,
     WorkspaceResponseProposal,
     WorkspaceResponseRecommendation,
+    WorkspaceResponseSubmission,
     WorkspaceResponseTarget,
     WorkspaceResult,
     WorkspaceSourceAlertRef,
@@ -441,6 +442,32 @@ class ApprovalSchema(BaseModel):
         )
 
 
+class SubmissionSchema(BaseModel):
+    """Local submission lifecycle; carries NO provider execution identity."""
+
+    status: str
+    attempt_count: int = 0
+    last_error_code: str | None = None
+    safe_error_message: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    submitted_at: datetime | None = None
+    failed_at: datetime | None = None
+
+    @classmethod
+    def from_read_model(cls, value: WorkspaceResponseSubmission) -> SubmissionSchema:
+        return cls(
+            status=value.status,
+            attempt_count=value.attempt_count,
+            last_error_code=value.last_error_code,
+            safe_error_message=value.safe_error_message,
+            created_at=value.created_at,
+            updated_at=value.updated_at,
+            submitted_at=value.submitted_at,
+            failed_at=value.failed_at,
+        )
+
+
 class ExecutionSchema(BaseModel):
     provider: str
     status: str
@@ -482,7 +509,10 @@ class ResponseProposalSchema(BaseModel):
     policy_decision: str | None = None
     policy_reason: str | None = None
     created_at: datetime | None = None
+    created_by_subject: str | None = None
+    created_by_display_name: str | None = None
     approval: ApprovalSchema | None = None
+    submission: SubmissionSchema | None = None
     execution: ExecutionSchema | None = None
 
     @classmethod
@@ -504,9 +534,16 @@ class ResponseProposalSchema(BaseModel):
             policy_decision=value.policy_decision,
             policy_reason=value.policy_reason,
             created_at=value.created_at,
+            created_by_subject=value.created_by_subject,
+            created_by_display_name=value.created_by_display_name,
             approval=(
                 ApprovalSchema.from_read_model(value.approval)
                 if value.approval is not None
+                else None
+            ),
+            submission=(
+                SubmissionSchema.from_read_model(value.submission)
+                if value.submission is not None
                 else None
             ),
             execution=(

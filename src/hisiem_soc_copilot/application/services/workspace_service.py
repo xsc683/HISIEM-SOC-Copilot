@@ -31,6 +31,7 @@ from ...domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
     ResponseExecutionRef,
+    ResponseSubmission,
 )
 from ..errors import NotFoundError
 from ..ports.durable import ToolInvocationRecord
@@ -55,6 +56,7 @@ from ..queries.workspace import (
     WorkspaceResponseProjection,
     WorkspaceResponseProposal,
     WorkspaceResponseRecommendation,
+    WorkspaceResponseSubmission,
     WorkspaceResponseTarget,
     WorkspaceResult,
     WorkspaceSourceAlertRef,
@@ -89,6 +91,10 @@ TL_RESPONSE_EXECUTION_QUEUED = "RESPONSE_EXECUTION_QUEUED"
 TL_RESPONSE_EXECUTION_STARTED = "RESPONSE_EXECUTION_STARTED"
 TL_RESPONSE_EXECUTION_SUCCEEDED = "RESPONSE_EXECUTION_SUCCEEDED"
 TL_RESPONSE_EXECUTION_FAILED = "RESPONSE_EXECUTION_FAILED"
+#: Local submission lifecycle facts (never provider execution facts).
+TL_RESPONSE_SUBMISSION_QUEUED = "RESPONSE_SUBMISSION_QUEUED"
+TL_RESPONSE_SUBMISSION_RETRYING = "RESPONSE_SUBMISSION_RETRYING"
+TL_RESPONSE_SUBMISSION_FAILED = "RESPONSE_SUBMISSION_FAILED"
 
 _TOOL_SUCCEEDED = "SUCCEEDED"
 _EXEC_SUCCEEDED = "SUCCEEDED"
@@ -98,6 +104,10 @@ _EXEC_QUEUED = "QUEUED"
 #: execution exists yet. Deliberately not a provider execution status: nothing is
 #: claimed about a provider execution because none exists.
 _EXEC_AWAITING_SUBMISSION = "AWAITING_SUBMISSION"
+_EXEC_SUBMISSION_RETRYING = "SUBMISSION_RETRYING"
+_EXEC_SUBMISSION_FAILED = "SUBMISSION_FAILED"
+_SUBMISSION_RETRYING = "RETRYING"
+_SUBMISSION_FAILED_DEFINITIVE = "FAILED_DEFINITIVE"
 
 
 def _header(investigation: Investigation) -> WorkspaceInvestigation:
@@ -413,6 +423,7 @@ def _response_projection(
     proposal: object | None,
     approval: ApprovalRequest | None,
     decision: ApprovalDecision | None,
+    submission: ResponseSubmission | None,
     execution: ResponseExecutionRef | None,
 ) -> WorkspaceResponseProjection:
     """Build the Response projection: informational recommendations + typed proposals.
@@ -428,7 +439,9 @@ def _response_projection(
         )
     proposals: tuple[WorkspaceResponseProposal, ...] = ()
     if proposal is not None:
-        proposals = (_response_proposal(proposal, approval, decision, execution),)
+        proposals = (
+            _response_proposal(proposal, approval, decision, submission, execution),
+        )
     return WorkspaceResponseProjection(
         recommendations=recommendations, proposals=proposals
     )
@@ -438,6 +451,7 @@ def _response_proposal(
     proposal: object,
     approval: ApprovalRequest | None,
     decision: ApprovalDecision | None,
+    submission: ResponseSubmission | None,
     execution: ResponseExecutionRef | None,
 ) -> WorkspaceResponseProposal:
     from ...domain.response.aggregate import ResponseProposal
@@ -466,7 +480,10 @@ def _response_proposal(
         ),
         policy_reason=proposal.policy_reason,
         created_at=proposal.created_at,
+        created_by_subject=proposal.created_by_subject,
+        created_by_display_name=proposal.created_by_display_name,
         approval=_workspace_approval(approval, decision),
+        submission=_workspace_submission(submission),
         execution=_workspace_execution(execution),
     )
 
@@ -496,6 +513,25 @@ def _workspace_approval(
     )
 
 
+def _workspace_submission(
+    submission: ResponseSubmission | None,
+) -> WorkspaceResponseSubmission | None:
+    """Local submission truth; carries NO provider execution identity."""
+    if submission is None:
+        return None
+    return WorkspaceResponseSubmission(
+        status=submission.status,
+        submission_key=submission.submission_key,
+        attempt_count=submission.attempt_count,
+        last_error_code=submission.last_error_code,
+        safe_error_message=submission.safe_error_message,
+        created_at=submission.created_at,
+        updated_at=submission.updated_at,
+        submitted_at=submission.submitted_at,
+        failed_at=submission.failed_at,
+    )
+
+
 def _workspace_execution(execution: ResponseExecutionRef | None) -> WorkspaceExecution | None:
     if execution is None:
         return None
@@ -521,17 +557,22 @@ def _response_timeline_entries(
     proposal: object | None,
     approval: ApprovalRequest | None,
     decision: ApprovalDecision | None,
+    submission: ResponseSubmission | None,
     execution: ResponseExecutionRef | None,
 ) -> list[WorkspaceTimelineEntry]:
-    """Deterministic response timeline entries derived from persisted facts only.
+    """Deterministic response timeline entries derived from PERSISTED FACTS only.
 
-    The timeline never invents state (spec §6):
+    Nothing here is inferred from an outbox row, a browser cache, or a delivery
+    attempt that may not have committed (spec §2/§3):
 
-    * ``APPROVED`` with NO execution projection means the human authorized the exact
-      contract and the durable SUBMIT command is queued — the workspace may say
-      "approved; submission queued", but there is no external execution id to show;
-    * once the projection row exists, the provider execution identity is REAL and the
-      provider status (QUEUED/RUNNING/SUCCEEDED/FAILED) is displayed against it;
+    * the LOCAL submission lifecycle (``response_submission``) is what says whether
+      the approved submission is queued, retrying, or was definitively refused —
+      the timeline never invents a provider execution identity for any of them;
+    * a definitive provider refusal is a fact about the SUBMISSION, so it is
+      reported as such and the timeline stops there;
+    * once the provider projection row exists, the provider execution identity is
+      REAL and the provider status (QUEUED/RUNNING/SUCCEEDED/FAILED) is displayed
+      against it;
     * the proposal id is never passed off as an execution identity.
     """
     from ...domain.response.aggregate import ResponseProposal
@@ -548,6 +589,8 @@ def _response_timeline_entries(
             safe_metadata={
                 "action_key": proposal.action_key,
                 "revision": proposal.content_revision,
+                "proposed_by": proposal.created_by_subject,
+                "proposed_by_display_name": proposal.created_by_display_name,
             },
         )
     ]
@@ -587,18 +630,63 @@ def _response_timeline_entries(
         )
 
     if execution is None:
-        # No provider execution exists. The durable local submission intent is a
-        # persisted fact (the immutable approval decision), so the timeline can say
-        # so — without fabricating an external execution identity.
-        if decision is not None and decision.decision == "APPROVE":
+        # No provider execution exists, and the ONLY authority on whether the local
+        # submission is still pending, retrying, or was refused is the persisted
+        # submission projection.
+        if submission is not None and submission.status == _SUBMISSION_FAILED_DEFINITIVE:
             entries.append(
                 WorkspaceTimelineEntry(
-                    kind=TL_RESPONSE_EXECUTION_QUEUED,
-                    occurred_at=decision.decided_at,
-                    title="Response approved; submission queued",
-                    status=_EXEC_AWAITING_SUBMISSION,
+                    kind=TL_RESPONSE_SUBMISSION_FAILED,
+                    occurred_at=submission.failed_at or submission.updated_at,
+                    title="Response submission rejected by provider",
+                    status=_EXEC_SUBMISSION_FAILED,
                     ref_type="response_proposal",
                     ref_id=str(proposal.id),
+                    safe_metadata={
+                        "error_code": submission.last_error_code,
+                        "attempts": submission.attempt_count,
+                    },
+                )
+            )
+            return entries
+        if decision is not None and decision.decision == "APPROVE":
+            retrying = (
+                submission is not None
+                and submission.status == _SUBMISSION_RETRYING
+            )
+            occurred = (
+                submission.updated_at
+                if retrying and submission is not None
+                else decision.decided_at
+            )
+            entries.append(
+                WorkspaceTimelineEntry(
+                    kind=(
+                        TL_RESPONSE_SUBMISSION_RETRYING
+                        if retrying
+                        else TL_RESPONSE_SUBMISSION_QUEUED
+                    ),
+                    occurred_at=occurred,
+                    title=(
+                        "Response submission retrying"
+                        if retrying
+                        else "Response approved; submission queued"
+                    ),
+                    status=(
+                        _EXEC_SUBMISSION_RETRYING
+                        if retrying
+                        else _EXEC_AWAITING_SUBMISSION
+                    ),
+                    ref_type="response_proposal",
+                    ref_id=str(proposal.id),
+                    safe_metadata=(
+                        {
+                            "error_code": submission.last_error_code,
+                            "attempts": submission.attempt_count,
+                        }
+                        if retrying and submission is not None
+                        else {}
+                    ),
                 )
             )
         return entries
@@ -781,6 +869,7 @@ class InvestigationWorkspaceService:
             approval = None
             decision = None
             execution = None
+            submission = None
             if proposal is not None:
                 approval = await uow.response_approvals.get_request_by_proposal(
                     tenant_id=tenant_id, proposal_id=proposal.id
@@ -790,6 +879,9 @@ class InvestigationWorkspaceService:
                         tenant_id=tenant_id, approval_request_id=approval.id
                     )
                 execution = await uow.response_executions.get_by_proposal(
+                    tenant_id=tenant_id, proposal_id=proposal.id
+                )
+                submission = await uow.response_submissions.get_by_proposal(
                     tenant_id=tenant_id, proposal_id=proposal.id
                 )
         finally:
@@ -809,12 +901,14 @@ class InvestigationWorkspaceService:
                 proposal=proposal,
                 approval=approval,
                 decision=decision,
+                submission=submission,
                 execution=execution,
             ),
             response_entries=_response_timeline_entries(
                 proposal=proposal,
                 approval=approval,
                 decision=decision,
+                submission=submission,
                 execution=execution,
             ),
         )

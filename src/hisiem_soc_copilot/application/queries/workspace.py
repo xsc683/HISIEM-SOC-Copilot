@@ -243,6 +243,26 @@ class WorkspaceExecution:
 
 
 @dataclass(frozen=True)
+class WorkspaceResponseSubmission:
+    """The LOCAL submission lifecycle (independent of the provider execution).
+
+    ``FAILED_DEFINITIVE`` means the provider refused the submission and no provider
+    execution exists, so the workspace must NOT render an external execution id and
+    must NOT keep telling the analyst that submission is still pending.
+    """
+
+    status: str
+    submission_key: str
+    attempt_count: int = 0
+    last_error_code: str | None = None
+    safe_error_message: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    submitted_at: datetime | None = None
+    failed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
 class WorkspaceResponseProposal:
     proposal_id: UUID
     revision: int
@@ -256,7 +276,11 @@ class WorkspaceResponseProposal:
     policy_decision: str | None = None
     policy_reason: str | None = None
     created_at: datetime | None = None
+    #: Immutable proposer provenance (server-derived at creation time).
+    created_by_subject: str | None = None
+    created_by_display_name: str | None = None
     approval: WorkspaceApproval | None = None
+    submission: WorkspaceResponseSubmission | None = None
     execution: WorkspaceExecution | None = None
 
 

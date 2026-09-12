@@ -61,6 +61,11 @@ class ResponseProposalRow(CopilotBase):
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     lock_version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
+    #: Immutable proposer provenance (server-derived; never a body field). NOT part
+    #: of the approval content hash — see ResponseProposal.
+    created_by_subject: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(nullable=False)
     updated_at: Mapped[datetime] = mapped_column(nullable=False)
 
@@ -160,3 +165,37 @@ class ResponseExecutionRefRow(CopilotBase):
     safe_result: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     safe_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     safe_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ResponseSubmissionRow(CopilotBase):
+    """Durable LOCAL truth about the one approved submission to the provider.
+
+    Exists because "did the provider accept our submission?" and "what did the
+    provider do with the execution?" are different questions. A definitive
+    provider rejection leaves a row here and NO ``response_execution_ref`` row.
+    """
+
+    __tablename__ = "response_submission"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_key", name="uq_response_submission_submission_key"
+        ),
+        CheckConstraint(
+            "status IN ('PENDING','RETRYING','SUBMITTED','FAILED_DEFINITIVE')",
+            name="response_submission_status_valid",
+        ),
+        CheckConstraint("attempt_count >= 0", name="response_submission_attempts_valid"),
+    )
+
+    proposal_id: Mapped[UUID] = mapped_column(
+        ForeignKey("response_proposal.id", ondelete="RESTRICT"), primary_key=True
+    )
+    submission_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    safe_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+    submitted_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(nullable=True)

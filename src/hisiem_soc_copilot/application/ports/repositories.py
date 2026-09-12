@@ -27,6 +27,7 @@ from ...domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
     ResponseExecutionRef,
+    ResponseSubmission,
 )
 
 
@@ -206,6 +207,22 @@ class ResponseApprovalRepository(Protocol):
     async def get_decision(
         self, *, tenant_id: str, approval_request_id: UUID
     ) -> ApprovalDecision | None: ...
+
+
+class ResponseSubmissionRepository(Protocol):
+    """Local submission lifecycle, independent of the provider execution ref.
+
+    A definitive provider rejection has a row here and NO ``response_execution_ref``
+    row — which is exactly the fact the workspace must be able to show.
+    """
+
+    async def add(self, submission: ResponseSubmission) -> None: ...
+
+    async def update(self, submission: ResponseSubmission) -> None: ...
+
+    async def get_by_proposal(
+        self, *, tenant_id: str, proposal_id: UUID
+    ) -> ResponseSubmission | None: ...
 
 
 class ResponseExecutionRepository(Protocol):

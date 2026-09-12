@@ -27,9 +27,11 @@ from ...application.ports.repositories import (
     ResponseApprovalRepository,
     ResponseExecutionRepository,
     ResponseProposalRepository,
+    ResponseSubmissionRepository,
     ResultRepository,
 )
 from ...domain.investigation.errors import ActiveInvestigationExistsError
+from ...domain.response.errors import ResponseProposalConflictError
 from .repositories.child import (
     SqlAlchemyEvidenceRepository,
     SqlAlchemyFindingRepository,
@@ -49,6 +51,7 @@ from .repositories.response import (
     SqlAlchemyResponseApprovalRepository,
     SqlAlchemyResponseExecutionRepository,
     SqlAlchemyResponseProposalRepository,
+    SqlAlchemyResponseSubmissionRepository,
 )
 
 # The partial unique index that guarantees at most one Active Investigation per
@@ -56,6 +59,16 @@ from .repositories.response import (
 # the concurrent-start convergence case; every other IntegrityError must propagate
 # unchanged so a genuine data problem is never swallowed.
 _ACTIVE_ALERT_CONSTRAINT = "uq_investigation_active_alert"
+
+# V1 allows at most ONE response proposal per investigation (and per result). Two
+# concurrent first-creates both pass the "does one already exist?" pre-check and
+# then race on these unique constraints; the loser must converge on the winner's
+# proposal (never leak a raw IntegrityError as HTTP 500, never create a second
+# proposal).
+_PROPOSAL_UNIQUE_CONSTRAINTS = (
+    "uq_response_proposal_investigation",
+    "uq_response_proposal_result",
+)
 
 # The scoped command_receipt idempotency identity (tenant, command_type,
 # idempotency_key). A concurrent same-key request that both pass the replay lookup
@@ -100,6 +113,9 @@ class SqlAlchemyUnitOfWork:
         self.response_executions: ResponseExecutionRepository = (
             SqlAlchemyResponseExecutionRepository(self._session)
         )
+        self.response_submissions: ResponseSubmissionRepository = (
+            SqlAlchemyResponseSubmissionRepository(self._session)
+        )
         # Durable stores bound to the SAME session/transaction as the domain rows.
         self.events: EventLedger = SqlAlchemyEventLedger(self._session)
         self.command_receipts: CommandReceiptStore = SqlAlchemyCommandReceiptStore(
@@ -141,6 +157,10 @@ class SqlAlchemyUnitOfWork:
                     "a concurrent request already recorded a command_receipt for "
                     "this tenant + command + Idempotency-Key"
                 ) from exc
+            if _is_proposal_unique_conflict(exc):
+                raise ResponseProposalConflictError(
+                    investigation_id=_conflicting_investigation_id(exc)
+                ) from exc
             raise
 
     async def rollback(self) -> None:
@@ -159,6 +179,23 @@ def _is_active_alert_conflict(exc: IntegrityError) -> bool:
 def _is_receipt_scoped_conflict(exc: IntegrityError) -> bool:
     """True only when the integrity error is the command_receipt scoped unique."""
     return _violates_constraint(exc, _RECEIPT_SCOPED_CONSTRAINT)
+
+
+def _is_proposal_unique_conflict(exc: IntegrityError) -> bool:
+    """True only when the integrity error is a one-proposal-per-* unique index."""
+    return any(
+        _violates_constraint(exc, name) for name in _PROPOSAL_UNIQUE_CONSTRAINTS
+    )
+
+
+def _conflicting_investigation_id(exc: IntegrityError) -> str:
+    """Best-effort investigation id from the failed insert for a bounded message."""
+    params = exc.params
+    if isinstance(params, dict):
+        value = params.get("investigation_id")
+        if value is not None:
+            return str(value)
+    return "unknown"
 
 
 def _violates_constraint(exc: IntegrityError, constraint: str) -> bool:

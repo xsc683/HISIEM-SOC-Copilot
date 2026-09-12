@@ -30,12 +30,14 @@ from ...domain.response.aggregate import ResponseProposal
 from ...domain.response.enums import (
     ApprovalDecisionKind,
     PolicyDecision,
+    ResponseSubmissionStatus,
 )
 from ...domain.response.errors import (
     ApprovalContractError,
     ApprovalDecisionAlreadyExistsError,
     ResponseEvidenceInvalidError,
     ResponseInvestigationNotCompletedError,
+    ResponseProposalConflictError,
 )
 from ...domain.response.events import (
     response_approval_decided,
@@ -48,6 +50,7 @@ from ...domain.response.policy import evaluate_response_policy
 from ...domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
+    ResponseSubmission,
     submission_key,
 )
 from ...domain.shared.errors import DomainError
@@ -160,6 +163,10 @@ class ResponseCommandHandler:
                 action_key=command.action_key,
                 parameters=dict(command.parameters),
                 reason=command.reason,
+                # Immutable provenance from the AUTHENTICATED context — never a body
+                # field, and never borrowed from Investigation.initiated_by.
+                created_by_subject=command.initiated_by_subject,
+                created_by_display_name=command.initiated_by_display_name,
                 target_refs=[target_ref],
                 evidence_ids=list(evidence_ids),
                 policy_decision=policy.decision,
@@ -171,6 +178,8 @@ class ResponseCommandHandler:
                 response_proposal_created(
                     proposal.id,
                     status=proposal.status,
+                    actor_subject_id=command.initiated_by_subject,
+                    actor_display_name=command.initiated_by_display_name,
                     tenant_id=command.tenant_id,
                 ),
                 response_policy_decided(
@@ -210,8 +219,36 @@ class ResponseCommandHandler:
             await uow.investigations.update(investigation)
             for event in events:
                 await uow.events.append(event, aggregate_revision=proposal.lock_version)
-            await uow.commit()
+            try:
+                await uow.commit()
+            except ResponseProposalConflictError:
+                # A CONCURRENT first-create won the race on
+                # UNIQUE(investigation_id) / UNIQUE(result_id). Converge on the
+                # winner's proposal — exactly what a sequential second call would
+                # have returned — instead of leaking a raw IntegrityError as 500 or
+                # creating a second proposal. If the row is not readable (the winner
+                # was removed between the failed INSERT and this re-read) the
+                # deterministic 409 stands rather than a fabricated success.
+                concurrent = await self._load_proposal(
+                    tenant_id=command.tenant_id,
+                    investigation_id=command.investigation_id,
+                )
+                if concurrent is None:
+                    raise
+                return concurrent
             return proposal
+        finally:
+            await uow.close()
+
+    async def _load_proposal(
+        self, *, tenant_id: str, investigation_id: UUID
+    ) -> ResponseProposal | None:
+        """Re-read in a FRESH transaction (the racing one was rolled back)."""
+        uow = self._uow_factory()
+        try:
+            return await uow.response_proposals.get_by_investigation(
+                tenant_id=tenant_id, investigation_id=investigation_id
+            )
         finally:
             await uow.close()
 
@@ -310,6 +347,18 @@ class ResponseCommandHandler:
             # two simultaneously-queued proposals (spec §2).
             proposal.approve(approval_request_id=request.id)
             await uow.response_proposals.update(proposal)
+
+            # The LOCAL submission lifecycle becomes an explicit persisted fact at
+            # the same instant the submission is queued. Without it, a definitive
+            # provider rejection would leave no local trace at all and the workspace
+            # would keep claiming "approved / awaiting submission" forever (spec §2).
+            await uow.response_submissions.add(
+                ResponseSubmission(
+                    proposal_id=proposal.id,
+                    submission_key=submission_key(command.tenant_id, proposal.id),
+                    status=ResponseSubmissionStatus.PENDING.value,
+                )
+            )
 
             await uow.events.append(
                 response_approval_decided(

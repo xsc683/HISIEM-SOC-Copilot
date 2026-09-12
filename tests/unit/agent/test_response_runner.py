@@ -99,6 +99,12 @@ async def _proposal(factory: FakeUnitOfWorkFactory, proposal_id: UUID):
     )
 
 
+async def _submission(factory: FakeUnitOfWorkFactory, proposal_id: UUID):
+    return await factory().response_submissions.get_by_proposal(
+        tenant_id=TENANT, proposal_id=proposal_id
+    )
+
+
 def _observe_rows(factory: FakeUnitOfWorkFactory) -> list[dict[str, object]]:
     return [
         row
@@ -590,6 +596,146 @@ async def test_a_genuine_client_rejection_stays_definitive(status: int) -> None:
     with pytest.raises(NonRetryableRunError):
         await _run_submit(factory, soar, proposal.id)
 
+    assert await _ref(factory, proposal.id) is None
+
+
+# ---------------------------------------------------------------------------
+# The LOCAL submission lifecycle (independent of the provider execution ref)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+async def test_a_definitive_rejection_is_recorded_as_a_submission_failure(
+    status: int,
+) -> None:
+    """HISIEM refused the SUBMISSION: no execution exists, so none may be recorded.
+
+    The proposal stays APPROVED (nothing was accepted), the local submission
+    becomes FAILED_DEFINITIVE so the workspace stops claiming "awaiting
+    submission", and the delivery is dead-lettered rather than retried forever.
+    """
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "rejected", service="hisiem", code=f"HTTP_{status}"
+        )
+    )
+
+    with pytest.raises(NonRetryableRunError):
+        await _run_submit(factory, soar, proposal.id)
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "FAILED_DEFINITIVE"
+    assert submission.last_error_code == f"HTTP_{status}"
+    assert submission.safe_error_message
+    assert submission.failed_at is not None
+    assert submission.attempt_count >= 1
+
+    assert await _ref(factory, proposal.id) is None
+    reloaded = await _proposal(factory, proposal.id)
+    assert reloaded is not None
+    assert reloaded.status is ResponseProposalStatus.APPROVED
+
+    types = {e.event_type for e in factory.events.events}
+    assert "response_submission_failed" in types
+    # NOT an execution failure: there is no execution to have failed.
+    assert "response_execution_failed" not in types
+    assert "response_execution_started" not in types
+
+
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
+async def test_an_uncertain_submission_failure_is_recorded_as_retrying(
+    status: int,
+) -> None:
+    """Throttling/timeouts/5xx leave us NOT KNOWING what the provider did.
+
+    Nothing may be claimed about a provider execution, and the delivery must stay
+    retryable under the same key.
+    """
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(
+        raise_on_submit=ExternalServiceError(
+            "uncertain", service="hisiem", code=f"HTTP_{status}"
+        )
+    )
+
+    with pytest.raises(ExternalServiceError):
+        await _run_submit(factory, soar, proposal.id)
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "RETRYING"
+    assert submission.last_error_code == f"HTTP_{status}"
+    assert submission.failed_at is None
+    assert await _ref(factory, proposal.id) is None
+
+    types = {e.event_type for e in factory.events.events}
+    assert "response_submission_retrying" in types
+    assert "response_submission_failed" not in types
+
+
+async def test_an_empty_execution_id_is_uncertain_not_failed() -> None:
+    """A provider contract violation is retryable: an execution may exist."""
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    soar = FakeSoar(submit_result=SoarExecutionResult(execution_id="", status="RUNNING"))
+
+    with pytest.raises(RuntimeError):
+        await _run_submit(factory, soar, proposal.id)
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "RETRYING"
+    assert submission.last_error_code == "SOAR_NO_EXECUTION_ID"
+    assert await _ref(factory, proposal.id) is None
+
+
+async def test_a_successful_submit_settles_the_local_submission() -> None:
+    factory = FakeUnitOfWorkFactory()
+    proposal = await _approved(factory)
+    sebelum = await _submission(factory, proposal.id)
+    assert sebelum is not None
+    assert sebelum.status == "PENDING"
+    assert sebelum.submission_key == f"response:{TENANT}:{proposal.id}"
+    assert sebelum.attempt_count == 0
+
+    soar = FakeSoar(
+        submit_result=SoarExecutionResult(execution_id=EXEC_ID, status="RUNNING")
+    )
+    await _run_submit(factory, soar, proposal.id)
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "SUBMITTED"
+    assert submission.submitted_at is not None
+    assert submission.submission_key == f"response:{TENANT}:{proposal.id}"
+    execution = await _ref(factory, proposal.id)
+    assert execution is not None
+    assert execution.execution_id == EXEC_ID
+
+
+async def test_approval_creates_a_pending_submission_intent() -> None:
+    """Approval persists the local intent — and still creates NO execution ref."""
+    factory = FakeUnitOfWorkFactory()
+    investigation_id, evidence_id = seed_investigation(factory)
+    assert evidence_id is not None
+    proposal = await create_proposal(
+        factory, investigation_id, evidence_ids=(evidence_id,)
+    )
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is None  # nothing is planned before a human approves
+
+    await approve(factory, proposal)
+
+    submission = await _submission(factory, proposal.id)
+    assert submission is not None
+    assert submission.status == "PENDING"
+    assert submission.attempt_count == 0
+    assert submission.submission_key == f"response:{TENANT}:{proposal.id}"
     assert await _ref(factory, proposal.id) is None
 
 

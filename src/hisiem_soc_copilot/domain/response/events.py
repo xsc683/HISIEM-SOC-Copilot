@@ -27,13 +27,29 @@ class ResponseEvent:
 
 
 def response_proposal_created(
-    aggregate_id: UUID, *, status: ResponseProposalStatus, tenant_id: str | None = None
+    aggregate_id: UUID,
+    *,
+    status: ResponseProposalStatus,
+    actor_subject_id: str,
+    actor_display_name: str | None = None,
+    tenant_id: str | None = None,
 ) -> ResponseEvent:
+    """Proposal creation, carrying the PROPOSER as the event actor.
+
+    ``actor_subject_id`` is the server-derived proposer (spec §1 provenance): the
+    audit trail must be able to answer "who proposed this response" from the event
+    ledger alone, without re-reading a mutable row.
+    """
     return ResponseEvent(
         event_type="response_proposal_created",
         aggregate_id=aggregate_id,
         tenant_id=tenant_id,
-        payload={"status": status.value},
+        actor_subject_id=actor_subject_id,
+        payload={
+            "status": status.value,
+            "created_by_subject": actor_subject_id,
+            "created_by_display_name": actor_display_name,
+        },
     )
 
 
@@ -140,6 +156,60 @@ def response_execution_observed(
         aggregate_id=aggregate_id,
         tenant_id=tenant_id,
         payload={"external_execution_id": external_execution_id, "status": status},
+    )
+
+
+def response_submission_retrying(
+    aggregate_id: UUID,
+    *,
+    submission_key: str,
+    attempt_count: int,
+    error_code: str,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """A TRANSIENT submission failure: still local-only, still retryable.
+
+    No provider execution exists and none is claimed. The submit delivery stays in
+    the outbox and is retried under the SAME ``submission_key``.
+    """
+    return ResponseEvent(
+        event_type="response_submission_retrying",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        payload={
+            "submission_key": submission_key,
+            "attempt_count": attempt_count,
+            "error_code": error_code,
+        },
+    )
+
+
+def response_submission_failed(
+    aggregate_id: UUID,
+    *,
+    submission_key: str,
+    attempt_count: int,
+    error_code: str,
+    safe_error_message: str | None = None,
+    tenant_id: str | None = None,
+) -> ResponseEvent:
+    """The provider DEFINITIVELY refused this submission (4xx contract rejection).
+
+    This is a fact about the SUBMISSION, not about an execution: no provider
+    execution was created, so this must never be recorded as an execution failure
+    and must never produce a ResponseExecutionRef.
+    """
+    return ResponseEvent(
+        event_type="response_submission_failed",
+        aggregate_id=aggregate_id,
+        tenant_id=tenant_id,
+        actor_subject_id=None,
+        payload={
+            "submission_key": submission_key,
+            "attempt_count": attempt_count,
+            "error_code": error_code,
+            "safe_error_message": safe_error_message,
+        },
     )
 
 

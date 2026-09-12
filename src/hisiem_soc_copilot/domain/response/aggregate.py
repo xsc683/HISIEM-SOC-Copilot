@@ -19,6 +19,11 @@ from ..shared.errors import DomainError, StateTransitionError
 from ..shared.identifiers import utc_now
 from .enums import PolicyDecision, ResponseProposalStatus
 
+#: Sentinel that makes "no proposer recorded" a loud construction error instead of
+#: a silently blank provenance column. Every legitimate caller must supply the
+#: server-derived subject; only a missing argument reaches this value.
+MISSING_PROPOSER = ""
+
 _TRANSITIONS: dict[ResponseProposalStatus, dict[str, ResponseProposalStatus]] = {
     ResponseProposalStatus.CREATED: {
         "deny": ResponseProposalStatus.DENIED,
@@ -45,6 +50,13 @@ class ResponseProposal:
     action_key: str
     parameters: dict[str, Any]
     reason: str
+    #: Immutable proposer provenance, ALWAYS server-derived from the authenticated
+    #: trusted context — never a body field, and never borrowed from
+    #: ``Investigation.initiated_by`` (that answers a different question: who ran
+    #: the investigation, not who proposed this response). Deliberately OUTSIDE the
+    #: content hash: provenance is not part of the approvable contract, so it can
+    #: never be used to make an approval hash match or mismatch.
+    created_by_subject: str = MISSING_PROPOSER
     target_refs: list[ExternalResourceRef] = field(default_factory=list)
     evidence_ids: list[UUID] = field(default_factory=list)
     status: ResponseProposalStatus = ResponseProposalStatus.CREATED
@@ -55,10 +67,15 @@ class ResponseProposal:
     lock_version: int = 0
     approval_request_id: UUID | None = None
     execution_ref: Any = None
+    created_by_display_name: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
+        if not self.created_by_subject.strip():
+            raise DomainError(
+                "a response proposal must record the authenticated proposer"
+            )
         self.content_hash = self._compute_content_hash()
 
     # ------------------------------------------------------------------

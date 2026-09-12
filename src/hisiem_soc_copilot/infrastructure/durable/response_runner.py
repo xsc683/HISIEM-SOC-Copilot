@@ -33,7 +33,7 @@ from ...application.errors import ExternalServiceError
 from ...application.ports.soar import SoarExecutionResult, SoarPort
 from ...application.ports.unit_of_work import UnitOfWork
 from ...domain.response.aggregate import ResponseProposal
-from ...domain.response.enums import ResponseProposalStatus
+from ...domain.response.enums import ResponseProposalStatus, ResponseSubmissionStatus
 from ...domain.response.events import (
     ResponseEvent,
     response_execution_failed,
@@ -41,8 +41,14 @@ from ...domain.response.events import (
     response_execution_started,
     response_execution_submitted,
     response_execution_succeeded,
+    response_submission_failed,
+    response_submission_retrying,
 )
-from ...domain.response.value_objects import ResponseExecutionRef, submission_key
+from ...domain.response.value_objects import (
+    ResponseExecutionRef,
+    ResponseSubmission,
+    submission_key,
+)
 from ...domain.shared.identifiers import utc_now
 from .investigation_runner import NonRetryableRunError
 
@@ -117,19 +123,78 @@ class ResponseSubmitRunner:
             )
         except ExternalServiceError as exc:
             if _is_definitive(exc):
-                # HISIEM definitively rejected the submission and created NO execution.
-                # The proposal therefore legitimately remains APPROVED (no provider
-                # execution identity exists to attach) and the delivery is dead-lettered
-                # with a bounded code — never retried, never given a fake execution id.
-                raise NonRetryableRunError(
-                    code=exc.upstream_code or "SOAR_REJECTED"
-                ) from None
-            raise  # transient → dispatcher retries with the SAME idempotency key
+                # HISIEM DEFINITIVELY refused this submission and created NO execution.
+                # That is a fact about the SUBMISSION, not about an execution: no
+                # provider execution exists, so none may be recorded as failed and no
+                # projection row may be fabricated. The proposal legitimately stays
+                # APPROVED (nothing was accepted), the local submission becomes
+                # FAILED_DEFINITIVE so the workspace stops claiming "awaiting
+                # submission", and the delivery is dead-lettered with a bounded code.
+                code = exc.upstream_code or "SOAR_REJECTED"
+                message = _safe_message(exc)
+                await self._record_submission(
+                    tenant_id=tenant_id,
+                    proposal_id=proposal.id,
+                    key=key,
+                    status=ResponseSubmissionStatus.FAILED_DEFINITIVE,
+                    bump_attempts=True,
+                    error_code=code,
+                    safe_error_message=message,
+                    event_factory=lambda attempts: response_submission_failed(
+                        proposal.id,
+                        submission_key=key,
+                        attempt_count=attempts,
+                        error_code=code,
+                        safe_error_message=message,
+                        tenant_id=tenant_id,
+                    ),
+                )
+                raise NonRetryableRunError(code=code) from None
+            # TRANSIENT/UNCERTAIN: the provider may or may not have processed the
+            # request. Nothing about a provider execution is claimed; the local
+            # submission is recorded as RETRYING and the delivery stays in the outbox
+            # to be retried under the SAME idempotency key.
+            code = exc.upstream_code or "SOAR_UNAVAILABLE"
+            message = _safe_message(exc)
+            await self._record_submission(
+                tenant_id=tenant_id,
+                proposal_id=proposal.id,
+                key=key,
+                status=ResponseSubmissionStatus.RETRYING,
+                bump_attempts=True,
+                error_code=code,
+                safe_error_message=message,
+                event_factory=lambda attempts: response_submission_retrying(
+                    proposal.id,
+                    submission_key=key,
+                    attempt_count=attempts,
+                    error_code=code,
+                    tenant_id=tenant_id,
+                ),
+            )
+            raise
 
         if not result.execution_id:
-            # HISIEM's contract is to return a real execution id. An empty one would
-            # mean we cannot durably identify the execution, so we must not persist a
-            # fabricated/placeholder identity — retry (same key ⇒ same execution).
+            # HISIEM's contract is to return a real execution id. An empty one means
+            # we cannot durably identify the execution, so we must not persist a
+            # fabricated/placeholder identity - retry (same key => same execution).
+            # UNCERTAIN rather than failed: an execution may exist provider-side.
+            await self._record_submission(
+                tenant_id=tenant_id,
+                proposal_id=proposal.id,
+                key=key,
+                status=ResponseSubmissionStatus.RETRYING,
+                bump_attempts=True,
+                error_code="SOAR_NO_EXECUTION_ID",
+                safe_error_message="provider returned no execution id",
+                event_factory=lambda attempts: response_submission_retrying(
+                    proposal.id,
+                    submission_key=key,
+                    attempt_count=attempts,
+                    error_code="SOAR_NO_EXECUTION_ID",
+                    tenant_id=tenant_id,
+                ),
+            )
             raise RuntimeError("SOAR submit returned no execution id")
 
         await self._attach_and_mark_submitted(
@@ -138,6 +203,60 @@ class ResponseSubmitRunner:
             key=key,
             result=result,
         )
+
+    # ------------------------------------------------------------------
+    async def _record_submission(
+        self,
+        *,
+        tenant_id: str,
+        proposal_id: UUID,
+        key: str,
+        status: ResponseSubmissionStatus,
+        bump_attempts: bool = False,
+        error_code: str | None = None,
+        safe_error_message: str | None = None,
+        event_factory: Callable[[int], ResponseEvent] | None = None,
+    ) -> None:
+        """Persist the local submission state in its OWN committed transaction.
+
+        It must be committed separately from the caller's outcome: this runs on the
+        failure path, where the caller then raises and the outbox delivery is retried
+        or dead-lettered. The local truth about the attempt has to survive that.
+        """
+        uow = self._uow_factory()
+        try:
+            current = await uow.response_submissions.get_by_proposal(
+                tenant_id=tenant_id, proposal_id=proposal_id
+            )
+            now = utc_now()
+            attempts = current.attempt_count if current is not None else 0
+            if bump_attempts:
+                attempts += 1
+            record = ResponseSubmission(
+                proposal_id=proposal_id,
+                submission_key=current.submission_key if current is not None else key,
+                status=status.value,
+                attempt_count=attempts,
+                last_error_code=error_code,
+                safe_error_message=safe_error_message,
+                created_at=current.created_at if current is not None else now,
+                updated_at=now,
+                submitted_at=current.submitted_at if current is not None else None,
+                failed_at=(
+                    now
+                    if status is ResponseSubmissionStatus.FAILED_DEFINITIVE
+                    else (current.failed_at if current is not None else None)
+                ),
+            )
+            if current is None:
+                await uow.response_submissions.add(record)
+            else:
+                await uow.response_submissions.update(record)
+            if event_factory is not None:
+                await uow.events.append(event_factory(attempts), aggregate_revision=0)
+            await uow.commit()
+        finally:
+            await uow.close()
 
     # ------------------------------------------------------------------
     async def _attach_and_mark_submitted(
@@ -192,6 +311,12 @@ class ResponseSubmitRunner:
             await uow.response_executions.add(execution)
             reloaded.mark_submitted(execution)
             await uow.response_proposals.update(reloaded)
+            # The local submission lifecycle settles in the SAME transaction that
+            # creates the provider projection: a proposal can never be SUBMITTED
+            # without both facts agreeing.
+            await _mark_submission_submitted(
+                uow, tenant_id=tenant_id, proposal_id=proposal.id, key=key, now=now
+            )
 
             await uow.events.append(
                 response_execution_started(proposal.id, tenant_id=tenant_id),
@@ -440,6 +565,31 @@ def _terminal_event(
         error_code=result.safe_error_code or "SOAR_EXECUTION_FAILED",
         tenant_id=tenant_id,
     )
+
+
+async def _mark_submission_submitted(
+    uow: UnitOfWork, *, tenant_id: str, proposal_id: UUID, key: str, now: datetime
+) -> None:
+    """Settle the local submission as SUBMITTED inside the caller's transaction."""
+    current = await uow.response_submissions.get_by_proposal(
+        tenant_id=tenant_id, proposal_id=proposal_id
+    )
+    record = ResponseSubmission(
+        proposal_id=proposal_id,
+        submission_key=current.submission_key if current is not None else key,
+        status=ResponseSubmissionStatus.SUBMITTED.value,
+        attempt_count=current.attempt_count if current is not None else 0,
+        last_error_code=None,
+        safe_error_message=None,
+        created_at=current.created_at if current is not None else now,
+        updated_at=now,
+        submitted_at=now,
+        failed_at=None,
+    )
+    if current is None:
+        await uow.response_submissions.add(record)
+    else:
+        await uow.response_submissions.update(record)
 
 
 def _is_definitive(exc: ExternalServiceError) -> bool:

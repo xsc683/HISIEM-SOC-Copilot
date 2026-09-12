@@ -45,6 +45,39 @@ class ResponseActionKey(enum.StrEnum):
     START_SOAR_PLAYBOOK = "START_SOAR_PLAYBOOK"
 
 
+class ResponseSubmissionStatus(enum.StrEnum):
+    """Local lifecycle of the ONE approved submission to the provider.
+
+    This is deliberately NOT a provider execution status. It records whether the
+    local submission command has been accepted by HISIEM yet, so the workspace can
+    tell "approved, not submitted yet", "retrying" and "the provider definitively
+    refused this submission" apart WITHOUT inventing a provider execution identity
+    (which would be a lie, and would collide on ``(provider, execution_id)``).
+
+    ``FAILED_DEFINITIVE`` means the provider did not accept the submission. It is
+    NOT ``ResponseExecutionStatus.FAILED``: no provider execution was ever created,
+    so there is nothing to observe and nothing to reconcile.
+    """
+
+    PENDING = "PENDING"
+    RETRYING = "RETRYING"
+    SUBMITTED = "SUBMITTED"
+    FAILED_DEFINITIVE = "FAILED_DEFINITIVE"
+
+    @property
+    def is_terminal(self) -> bool:
+        """No further local submission work will happen in this state."""
+        return self in {
+            ResponseSubmissionStatus.SUBMITTED,
+            ResponseSubmissionStatus.FAILED_DEFINITIVE,
+        }
+
+    @property
+    def is_awaiting_provider(self) -> bool:
+        """Still local-only: no provider execution identity exists yet."""
+        return not self.is_terminal
+
+
 class ResponseExecutionStatus(enum.StrEnum):
     """Lifecycle of one approved response execution (a ResponseExecutionRef).
 

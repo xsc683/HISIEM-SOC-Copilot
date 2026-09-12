@@ -26,6 +26,7 @@ from .repositories import (
     ResponseApprovalRepository,
     ResponseExecutionRepository,
     ResponseProposalRepository,
+    ResponseSubmissionRepository,
     ResultRepository,
 )
 
@@ -51,6 +52,7 @@ class UnitOfWork(Protocol):
     response_proposals: ResponseProposalRepository
     response_approvals: ResponseApprovalRepository
     response_executions: ResponseExecutionRepository
+    response_submissions: ResponseSubmissionRepository
     events: EventLedger
     command_receipts: CommandReceiptStore
     bindings: OrchestrationBindingStore

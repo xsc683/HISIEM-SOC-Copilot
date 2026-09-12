@@ -17,6 +17,7 @@ from ....domain.response.value_objects import (
     ApprovalDecision,
     ApprovalRequest,
     ResponseExecutionRef,
+    ResponseSubmission,
 )
 from ..orm.response import (
     ApprovalDecisionRow,
@@ -24,6 +25,7 @@ from ..orm.response import (
     ResponseExecutionRefRow,
     ResponseProposalRow,
     ResponseProposalTargetRow,
+    ResponseSubmissionRow,
 )
 
 
@@ -60,6 +62,8 @@ def proposal_to_domain(
         content_hash=row.content_hash,
         lock_version=row.lock_version,
         approval_request_id=None,
+        created_by_subject=row.created_by_subject,
+        created_by_display_name=row.created_by_display_name,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -84,6 +88,8 @@ def proposal_to_row(proposal: ResponseProposal) -> ResponseProposalRow:
         content_revision=proposal.content_revision,
         content_hash=proposal.content_hash,
         lock_version=proposal.lock_version,
+        created_by_subject=proposal.created_by_subject,
+        created_by_display_name=proposal.created_by_display_name,
         created_at=proposal.created_at,
         updated_at=proposal.updated_at,
     )
@@ -165,4 +171,34 @@ def execution_to_domain(row: ResponseExecutionRefRow) -> ResponseExecutionRef:
         safe_result=dict(row.safe_result) if row.safe_result else None,
         safe_error_code=row.safe_error_code,
         safe_error_message=row.safe_error_message,
+    )
+
+
+def submission_to_domain(row: ResponseSubmissionRow) -> ResponseSubmission:
+    return ResponseSubmission(
+        proposal_id=row.proposal_id,
+        submission_key=row.submission_key,
+        status=row.status,
+        attempt_count=row.attempt_count,
+        last_error_code=row.last_error_code,
+        safe_error_message=row.safe_error_message,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        submitted_at=row.submitted_at,
+        failed_at=row.failed_at,
+    )
+
+
+def submission_to_row(submission: ResponseSubmission) -> ResponseSubmissionRow:
+    return ResponseSubmissionRow(
+        proposal_id=submission.proposal_id,
+        submission_key=submission.submission_key,
+        status=submission.status,
+        attempt_count=submission.attempt_count,
+        last_error_code=submission.last_error_code,
+        safe_error_message=submission.safe_error_message,
+        created_at=submission.created_at,
+        updated_at=submission.updated_at,
+        submitted_at=submission.submitted_at,
+        failed_at=submission.failed_at,
     )
