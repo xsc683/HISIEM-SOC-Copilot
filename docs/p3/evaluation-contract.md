@@ -129,8 +129,9 @@ Two properties matter for review:
 Written to `.eval-runs/knowledge/` by default (override with `--out`). Filename:
 
 ```
-kb-golden-v1-k5.json
-kb-golden-v1-k5-plumbing-only.json     # over the deterministic test fixture
+kb-golden-v1-k5.json                    # SEALED, deployment provider
+kb-golden-v1-k5-plumbing-only.json      # SEALED, deterministic test fixture
+kb-golden-v1-k5-open-corpus.json        # NOT SEALED -- see section 8.3
 ```
 
 Schema: `knowledge-retrieval-eval/v1`.
@@ -139,13 +140,22 @@ Schema: `knowledge-retrieval-eval/v1`.
 {
   "schema_version": "knowledge-retrieval-eval/v1",
   "suite_id": "KB-GOLDEN-V1",
-  "corpus_version": "1",
   "retrieval_profile": { "profile_id": "hybrid-v1", "rrf_k": 60, ... },
   "embedding_profile": {
     "available": true,
     "provider": "...", "model_id": "...", "dimension": 1536,
     "evidence": "PLUMBING_ONLY" | "DEPLOYMENT_CONFIGURED" | "NONE",
     "detail": "..."
+  },
+  "corpus_version": "1",
+  "corpus": {
+    "corpus_mode": "SEALED" | "OPEN_CORPUS",
+    "sealed": true,
+    "corpus_fingerprint": "<64 hex>",
+    "expected_corpus_fingerprint": "<64 hex>" | null,
+    "eligible_document_count": 17,
+    "eligible_version_count": 17,
+    "eligible_chunk_count": 67
   },
   "case_count": 22,
   "modes": {
@@ -196,27 +206,100 @@ network calls, no randomness, and no clock reads inside the scoring path. The
 concrete-knob values that produced a run are recorded on every result via
 `RetrievalProfile`.
 
-### One honest qualification
+### 8.1 The stable ranking key
 
-Ties are broken by `document_id`, then `document_version_id`, then `ordinal` —
-the order the brief specifies. That is a **total order within a database**, so
-repeated runs against one deployment are identical, and that has been verified:
-three consecutive `--skip-ingest` runs produced byte-identical metrics.
+Ties are broken by **semantic business identity**, never by a database surrogate:
 
-It is not a total order *across* two databases built from the same corpus. A
-document's id is a `uuid4` assigned at ingest, so two deployments that ingested
-the same bytes in a different order can order two equally-scored chunks
-differently. Measured effect: two clean ingests of `KB-GOLDEN-V1` into two
-freshly-migrated databases differed in 16 of 66 case/mode rankings, all
-permutations **among documents that were already retrieved** — `Recall@5`,
-citation resolution, leakage and forbidden counts were identical to the digit;
-only the rank-sensitive `MRR` and `nDCG@5` moved (HYBRID `0.722` vs `0.782`).
+```python
+stable_ranking_key(view) -> (
+    source_kind, visibility, tenant_id or "", external_key,
+    document_version_number, chunk_generation, ordinal,
+)
+```
 
-So: rank-sensitive metrics are reproducible for a deployment, and indicative
-rather than exact across deployments. `Recall@5` did not move in any observed
-run. This is a property of tie-breaking on random identifiers, not of any
-randomness in the retrieval or scoring path — and it is why a quoted baseline
-must name the corpus state it was measured against.
+A random document, version, or chunk UUID is **forbidden** as a ranking
+tie-break. Every component of the key is reproducible from the corpus itself, so
+two databases that independently ingested the same bytes resolve a tie the same
+way — which is what makes the baseline reproducible rather than merely repeatable
+on one machine. `visibility`/`tenant_id` are in the key so it stays **total** when
+a `GLOBAL` and a `TENANT` document share an `external_key`, and `ordinal` is
+unique within `(document_version_id, generation)`.
+
+The SQL candidate queries order by exactly these columns too, via
+`_stable_order_columns()` and `COLLATE "C"`, so the database's ordering and the
+Python RRF fusion cannot disagree — the vector channel included.
+
+The earlier caveat is therefore retired. It said that rank-sensitive metrics were
+reproducible for a deployment but only *indicative* across deployments, because a
+tie was broken on a `uuid4`. That is no longer true, and the two-fresh-database
+test in `tests/integration/persistence/test_knowledge_persistence.py` asserts the
+opposite: identical LEXICAL rankings, identical deterministic-fixture
+VECTOR/HYBRID rankings, and identical `Recall`/`MRR`/`nDCG` across two
+independently-ingested databases.
+
+### 8.2 The sealed corpus precondition
+
+Before any metric is computed, the run derives the **tenant-visible ACTIVE
+eligible corpus** from the database and compares it against the sealed fixture's
+expected fact set. A mismatch fails with `CORPUS_PRECONDITION_FAILED`, listing
+every difference — unexpected eligible document, missing expected document,
+changed content hash, changed version, changed chunk projection — rather than
+producing a plausible-looking score.
+
+This matters because a score is the most dangerous possible output here. A
+ranking measured over the wrong corpus is not merely useless; it is a number
+someone would quote. The list of differences is bounded and the truncation is
+stated rather than silent, so a bounded message is never mistaken for a complete
+one.
+
+The default is **sealed**. Ambient documents in a competing scope are not
+tolerated, they are a precondition failure.
+
+### 8.3 `--allow-ambient-corpus` is a different measurement
+
+An explicit escape hatch exists for the operator who wants "what does this
+database return right now". It is not a lesser SEALED run:
+
+- The precondition is skipped entirely.
+- The artifact records `corpus_mode: "OPEN_CORPUS"` and `sealed: false`, and
+  `expected_corpus_fingerprint` is `null` because the run asserted nothing.
+- The artifact filename carries `-open-corpus`.
+- **No hybrid gate verdict is produced**, so an open-corpus run can never print
+  `KB-GOLDEN-V1 baseline PASS`.
+
+It can say what the database currently returns. It can never say "this is the
+KB-GOLDEN-V1 baseline", because nothing about the run establishes that the corpus
+was the fixture.
+
+### 8.4 The corpus fingerprint
+
+```python
+CORPUS_FINGERPRINT_SCHEMA = "knowledge-corpus-fingerprint/v1"
+
+corpus_fingerprint(facts) -> SHA256(canonical JSON of the SORTED fact set)
+```
+
+Each fact is one eligible corpus chunk reduced to reproducible semantic facts:
+
+```
+visibility, tenant_id, source_kind, external_key,
+document_version_number, document_content_hash,
+chunk_generation, ordinal, chunk_content_hash
+```
+
+`tenant_id` is `""` for a `GLOBAL` document rather than `None`, so the canonical
+form is total and the sort is a real total order. The fact set is **deduped and
+sorted** before hashing, so the fingerprint is order-independent by construction —
+and a `GLOBAL` document visible to three tenant scopes contributes one fact, not
+three.
+
+Deliberately absent, because they would make two identical corpora look
+different: **row UUIDs, timestamps, the database host, the embedding vectors** —
+and credentials, which must never be written down at all.
+
+Two independent databases that ingested the same fixture produce the same
+fingerprint. That is the claim the fingerprint exists to make checkable, and it is
+asserted directly.
 
 ## 9. Running it
 
@@ -225,6 +308,7 @@ python -m hisiem_soc_copilot.knowledge.cli evaluate            # all three modes
 python -m hisiem_soc_copilot.knowledge.cli evaluate --mode HYBRID --mode LEXICAL_ONLY
 python -m hisiem_soc_copilot.knowledge.cli evaluate --skip-ingest
 python -m hisiem_soc_copilot.knowledge.cli evaluate --embedding-provider deterministic-test-only
+python -m hisiem_soc_copilot.knowledge.cli evaluate --allow-ambient-corpus   # OPEN_CORPUS
 ```
 
 `--skip-ingest` re-derives the corpus key map from the database via
@@ -243,25 +327,31 @@ point.
 | Runs performed | One, against `127.0.0.1:5434` |
 | Embedding evidence | `PLUMBING_ONLY` — the deterministic test fixture, passed explicitly |
 | Artifact | `.eval-runs/knowledge/kb-golden-v1-k5-plumbing-only.json` |
-| Corpus | 18 documents (9 `GLOBAL`, 3 each for `tenant-a`/`tenant-b`/`tenant-c`), 18 versions, 70 labelled chunks |
+| Corpus | 18 documents (9 `GLOBAL`, 3 each for `tenant-a`/`tenant-b`/`tenant-c`), 18 versions, 70 labelled chunks — of which **17 / 17 / 67 are eligible**, because `guidance-legacy-ssh-hardening` is retired |
+| Eligible corpus fingerprint | `6eee7f56c8a01f50…` (`SEALED`) |
 | Cases | 22 sealed; 21 scored, 1 excluded (the `unanswerable` case) |
 
 ```
+corpus: SEALED fingerprint=6eee7f56c8a01f50 documents=17 versions=17 chunks=67
   LEXICAL_ONLY  recall@5=0.952 mrr=0.952 ndcg=0.924 citation_resolution=1.000 leaks=0 forbidden=0 scored=21
   VECTOR_ONLY   recall@5=0.381 mrr=0.248 ndcg=0.265 citation_resolution=1.000 leaks=0 forbidden=5 scored=21
-  HYBRID        recall@5=0.976 mrr=0.782 ndcg=0.828 citation_resolution=1.000 leaks=0 forbidden=1 scored=21
+  HYBRID        recall@5=0.976 mrr=0.750 ndcg=0.797 citation_resolution=1.000 leaks=0 forbidden=1 scored=21
 hybrid gate: PASS
 ```
 
-The database at that moment held exactly the 18 corpus documents — no ATT&CK
-release had been imported into it and no other document had been ingested. That
-matters more than it looks: the suite scores against the **live** database, so any
-ambient document in the same scope competes for the top-5 slots and moves the
-rank-sensitive metrics. Importing three unrelated ATT&CK technique documents into
-the same database was measured to move `LEXICAL_ONLY` `MRR` from `0.952` to
-`0.929` and `HYBRID` `nDCG@5` from `0.828` to `0.766`, with `Recall@5` at `0.952`
-for both channels unchanged. A baseline is therefore only meaningful together
-with the state of the database it was taken from.
+`HYBRID` `MRR`/`nDCG@5` are slightly below the pre-closure figures (`0.782` /
+`0.828`) because ties are now broken on semantic identity instead of a `uuid4` —
+the change that turns "repeatable on this machine" into "reproducible across
+databases". `LEXICAL_ONLY` and `VECTOR_ONLY` are unchanged.
+
+Under the closure the run's corpus is no longer a matter of operator discipline:
+the sealed precondition (section 8.2) derives the eligible corpus from the
+database before scoring and **fails with `CORPUS_PRECONDITION_FAILED`** if an
+ambient document has appeared in a competing scope. A baseline is still only
+meaningful together with the state of the database it was taken from; the
+difference is that a run over the wrong state now refuses to produce a number
+instead of producing one that is quietly wrong — and the fingerprint above is how
+that state is named.
 
 **REAL EMBEDDING EVALUATION NOT RUN.** No embedding provider is configured in
 this repository, so the semantic half of the hybrid gate — section 5's requirement
@@ -280,3 +370,8 @@ harness itself needs no change to do so.
 The plumbing numbers may be quoted as an end-to-end pipeline check. They may not
 be quoted as a semantic baseline, and nothing in these documents quotes them as
 one.
+
+**Status at closure: `REAL EMBEDDING EVALUATION NOT RUN`.** The semantic-provider
+configuration step is deliberately not a mandatory task of this closure, so the
+deterministic fixture above remains the only run. It must not be substituted for a
+semantic run, and the artifacts it produces stay labelled `PLUMBING_ONLY`.

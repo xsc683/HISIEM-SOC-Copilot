@@ -24,16 +24,24 @@ business fact — replaying it would duplicate the audit ledger.
 from __future__ import annotations
 
 from ....application.ports.knowledge import (
+    AttackReleaseRecord,
     AttackTechniqueRecord,
+    ChunkEmbeddingRecord,
     EmbeddingProfileRecord,
-    KnowledgeChunkRecord,
+    KnowledgeContentChunkRecord,
 )
-from ....domain.knowledge.entities import KnowledgeDocument, KnowledgeDocumentVersion
+from ....domain.knowledge.entities import (
+    KnowledgeContentChunk,
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
+)
 from ....domain.knowledge.enums import DocumentStatus, SourceKind, Visibility
 from ..orm.knowledge import (
+    AttackReleaseRow,
     AttackTechniqueRow,
     EmbeddingProfileRow,
-    KnowledgeChunkRow,
+    KnowledgeChunkEmbeddingRow,
+    KnowledgeContentChunkRow,
     KnowledgeDocumentRow,
     KnowledgeDocumentVersionRow,
 )
@@ -109,27 +117,127 @@ def row_to_version(row: KnowledgeDocumentVersionRow) -> KnowledgeDocumentVersion
     )
 
 
-def chunk_to_row(chunk: KnowledgeChunkRecord) -> KnowledgeChunkRow:
-    """Translate a rebuildable chunk projection into a NEW ORM row.
+def content_chunk_to_row(
+    chunk: KnowledgeContentChunkRecord,
+) -> KnowledgeContentChunkRow:
+    """Translate an immutable content chunk into a NEW ORM row.
 
     ``lexical_document`` is a GENERATED column, so it is deliberately absent here:
     the database derives it, and no code path can make it drift from the content.
+
+    The row is built through the DOMAIN entity first, so the
+    ``content_hash == SHA-256(content)`` invariant is enforced on the write path
+    too and not only on the read path (brief section 8). A caller that hands over
+    a mismatched pair fails here, before the row is ever added to a session,
+    instead of persisting a citation target that cannot resolve.
     """
-    return KnowledgeChunkRow(
+    entity = KnowledgeContentChunk(
         id=chunk.id,
         document_id=chunk.document_id,
         document_version_id=chunk.document_version_id,
+        generation=chunk.generation,
         ordinal=chunk.ordinal,
         heading_path=chunk.heading_path,
         content=chunk.content,
         content_hash=chunk.content_hash,
         token_count=chunk.token_count,
         language=chunk.language,
-        embedding_profile_id=chunk.embedding_profile_id,
-        # The domain carries an immutable tuple; pgvector's column is a list.
-        embedding=list(chunk.embedding),
         chunker_version=chunk.chunker_version,
         created_at=chunk.created_at,
+    )
+    return KnowledgeContentChunkRow(
+        id=entity.id,
+        document_id=entity.document_id,
+        document_version_id=entity.document_version_id,
+        generation=entity.generation,
+        ordinal=entity.ordinal,
+        heading_path=entity.heading_path,
+        content=entity.content,
+        content_hash=entity.content_hash,
+        token_count=entity.token_count,
+        language=entity.language,
+        chunker_version=entity.chunker_version,
+        created_at=entity.created_at,
+    )
+
+
+def row_to_content_chunk(
+    row: KnowledgeContentChunkRow,
+) -> KnowledgeContentChunkRecord:
+    """Rebuild an immutable content chunk, likewise through the domain entity.
+
+    Loading is where a tampered row would otherwise enter the system unnoticed:
+    the entity recomputes the hash from the stored content, so a chunk whose text
+    or hash was edited out-of-band raises ``InvalidKnowledgeChunkError`` rather
+    than being served as if it were intact (brief sections 3.4/8).
+    """
+    entity = KnowledgeContentChunk(
+        id=row.id,
+        document_id=row.document_id,
+        document_version_id=row.document_version_id,
+        generation=row.generation,
+        ordinal=row.ordinal,
+        heading_path=row.heading_path,
+        content=row.content,
+        content_hash=row.content_hash,
+        token_count=row.token_count,
+        language=row.language,
+        chunker_version=row.chunker_version,
+        created_at=row.created_at,
+    )
+    return KnowledgeContentChunkRecord(
+        id=entity.id,
+        document_id=entity.document_id,
+        document_version_id=entity.document_version_id,
+        generation=entity.generation,
+        ordinal=entity.ordinal,
+        heading_path=entity.heading_path,
+        content=entity.content,
+        content_hash=entity.content_hash,
+        token_count=entity.token_count,
+        language=entity.language,
+        chunker_version=entity.chunker_version,
+        created_at=entity.created_at,
+    )
+
+
+def embedding_to_row(embedding: ChunkEmbeddingRecord) -> KnowledgeChunkEmbeddingRow:
+    """Translate a rebuildable embedding projection into a NEW ORM row."""
+    return KnowledgeChunkEmbeddingRow(
+        id=embedding.id,
+        content_chunk_id=embedding.content_chunk_id,
+        embedding_profile_id=embedding.embedding_profile_id,
+        # The domain carries an immutable tuple; pgvector's column is a list.
+        embedding=list(embedding.embedding),
+        indexed_at=embedding.indexed_at,
+    )
+
+
+def release_to_row(release: AttackReleaseRecord) -> AttackReleaseRow:
+    """Translate an ATT&CK release record into a NEW ORM row."""
+    return AttackReleaseRow(
+        id=release.id,
+        framework=release.framework,
+        source_release=release.source_release,
+        content_fingerprint=release.content_fingerprint,
+        status=release.status,
+        technique_count=release.technique_count,
+        created_at=release.created_at,
+        activated_at=release.activated_at,
+    )
+
+
+def row_to_release(row: AttackReleaseRow) -> AttackReleaseRecord:
+    """Rebuild an ATT&CK release record from its row."""
+    return AttackReleaseRecord(
+        id=row.id,
+        framework=row.framework,
+        source_release=row.source_release,
+        content_fingerprint=row.content_fingerprint,
+        status=row.status,
+        technique_count=row.technique_count,
+        created_at=row.created_at,
+        activated_at=row.activated_at,
     )
 
 

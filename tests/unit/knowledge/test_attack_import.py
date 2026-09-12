@@ -23,7 +23,10 @@ from uuid import UUID
 import pytest
 
 from hisiem_soc_copilot.application.commands.knowledge import ImportAttackRelease
-from hisiem_soc_copilot.application.errors import ApplicationError
+from hisiem_soc_copilot.application.errors import (
+    ApplicationError,
+    AttackReleaseContentConflictError,
+)
 from hisiem_soc_copilot.application.handlers.attack_import import (
     DEFAULT_MAX_BUNDLE_BYTES,
     AttackImportHandler,
@@ -37,12 +40,16 @@ from hisiem_soc_copilot.application.ports.embedding import (
     EmbeddingVector,
 )
 from hisiem_soc_copilot.application.ports.knowledge import (
+    ATTACK_RELEASE_STATUS_ACTIVE,
+    ATTACK_RELEASE_STATUS_INACTIVE,
     AttackImportOutcome,
+    AttackReleaseRecord,
     AttackTechniqueRecord,
+    ChunkEmbeddingRecord,
     ChunkProjectionState,
     EmbeddingProfileRecord,
-    KnowledgeChunkRecord,
     KnowledgeChunkView,
+    KnowledgeContentChunkRecord,
     LexicalCandidate,
     VectorCandidate,
 )
@@ -51,13 +58,19 @@ from hisiem_soc_copilot.application.services.attack_projection import (
     technique_document_title,
     technique_external_key,
 )
+from hisiem_soc_copilot.application.services.attack_release_fingerprint import (
+    fingerprint_from_records,
+)
 from hisiem_soc_copilot.domain.knowledge.entities import (
     KnowledgeDocument,
     KnowledgeDocumentVersion,
 )
 from hisiem_soc_copilot.domain.knowledge.enums import SourceKind, Visibility
 from hisiem_soc_copilot.domain.knowledge.errors import InvalidMitreBundleError
-from hisiem_soc_copilot.domain.knowledge.value_objects import normalize_and_hash
+from hisiem_soc_copilot.domain.knowledge.value_objects import (
+    CHUNK_GENERATION_INITIAL,
+    normalize_and_hash,
+)
 from hisiem_soc_copilot.infrastructure.knowledge.attack_source import MitreStixAttackSource
 from hisiem_soc_copilot.infrastructure.knowledge.chunker_port import StructureAwareChunker
 
@@ -193,6 +206,28 @@ def _identity_object() -> dict[str, Any]:
     }
 
 
+def _reordered_bundle() -> bytes:
+    """The same release, with every object reversed and every JSON key sorted.
+
+    Real MITRE exports are not byte-stable: object order and key order move
+    between builds. A release that fingerprinted its INPUT BYTES could therefore
+    never be re-imported, so this fixture is the adversarial version of "the same
+    content in a different file" (brief section 2.2).
+    """
+    objects: list[dict[str, Any]] = [
+        _brute_force_object(),
+        _revoked_object(),
+        _command_shell_object(),
+        _deprecated_object(),
+        _mobile_object(),
+        _identity_object(),
+    ]
+    serialized = ",".join(json.dumps(obj, sort_keys=True) for obj in reversed(objects))
+    return (
+        '{"type":"bundle","spec_version":"2.1","objects":[' + serialized + "]}"
+    ).encode("utf-8")
+
+
 def _full_bundle() -> bytes:
     """Two in-scope techniques plus one object of each out-of-scope kind."""
     return _bundle(
@@ -251,7 +286,7 @@ class FakeClock:
 class FakeEmbeddingProvider:
     """A deterministic EmbeddingProvider double for the real ingestion handler."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
         self._descriptor = EmbeddingProfileDescriptor(
             provider=PROVIDER,
             model_id=MODEL_ID,
@@ -261,6 +296,9 @@ class FakeEmbeddingProvider:
             profile_version=1,
         )
         self.calls: list[tuple[str, ...]] = []
+        #: Simulates a crash part-way through the document projection (brief
+        #: section 2.4) by failing the Nth ``embed_documents`` call.
+        self._fail_on_call = fail_on_call
 
     @property
     def descriptor(self) -> EmbeddingProfileDescriptor:
@@ -268,6 +306,8 @@ class FakeEmbeddingProvider:
 
     async def embed_documents(self, texts: Sequence[str]) -> EmbeddingBatch:
         self.calls.append(tuple(texts))
+        if self._fail_on_call is not None and len(self.calls) == self._fail_on_call:
+            raise RuntimeError("embedding provider died mid-projection")
         return EmbeddingBatch(
             descriptor=self._descriptor,
             vectors=tuple(
@@ -398,29 +438,73 @@ class FakeKnowledgeDocumentRepository:
 
 
 class FakeKnowledgeChunkRepository:
-    """In-memory chunk store; the projection state is DERIVED from its rows."""
+    """In-memory chunk store, split exactly as the two tables are.
+
+    Content chunks (the immutable citation targets) and embeddings (the
+    rebuildable projection) live in SEPARATE maps, and ``projection_state`` is
+    DERIVED from them rather than scripted -- so a document that was chunked but
+    not embedded reads as un-projected here, just as it does in SQL.
+    """
 
     def __init__(self) -> None:
-        self.chunks: dict[UUID, KnowledgeChunkRecord] = {}
-        self.added_batches: list[tuple[KnowledgeChunkRecord, ...]] = []
-        self.deleted_versions: list[UUID] = []
+        self.chunks: dict[UUID, KnowledgeContentChunkRecord] = {}
+        self.embeddings: dict[tuple[UUID, UUID], ChunkEmbeddingRecord] = {}
+        self.added_batches: list[tuple[KnowledgeContentChunkRecord, ...]] = []
+        self.added_embedding_batches: list[tuple[ChunkEmbeddingRecord, ...]] = []
+        self.deleted_embeddings: list[tuple[UUID, int]] = []
+        self.deleted_profiles: list[tuple[UUID, UUID]] = []
 
-    def rows_for_version(self, document_version_id: UUID) -> tuple[KnowledgeChunkRecord, ...]:
+    # -- test-side helpers -------------------------------------------------
+
+    def generation_of(self, document_version_id: UUID) -> int:
+        generations = [
+            chunk.generation
+            for chunk in self.chunks.values()
+            if chunk.document_version_id == document_version_id
+        ]
+        return max(generations) if generations else CHUNK_GENERATION_INITIAL
+
+    def rows_for_version(
+        self, document_version_id: UUID, generation: int | None = None
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        if generation is None:
+            generation = self.generation_of(document_version_id)
         return tuple(
             sorted(
                 (
                     chunk
                     for chunk in self.chunks.values()
                     if chunk.document_version_id == document_version_id
+                    and chunk.generation == generation
                 ),
                 key=lambda chunk: chunk.ordinal,
             )
         )
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    def profiles_for(self, chunk: KnowledgeContentChunkRecord) -> tuple[UUID, ...]:
+        return tuple(
+            sorted(
+                embedding_profile_id
+                for (chunk_id, embedding_profile_id) in self.embeddings
+                if chunk_id == chunk.id
+            )
+        )
+
+    # -- KnowledgeChunkRepository -----------------------------------------
+
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         self.added_batches.append(tuple(chunks))
         for chunk in chunks:
             self.chunks[chunk.id] = chunk
+
+    async def add_embeddings(self, *, embeddings: Sequence[ChunkEmbeddingRecord]) -> None:
+        self.added_embedding_batches.append(tuple(embeddings))
+        for embedding in embeddings:
+            self.embeddings[
+                (embedding.content_chunk_id, embedding.embedding_profile_id)
+            ] = embedding
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return len(self.rows_for_version(document_version_id))
@@ -428,23 +512,57 @@ class FakeKnowledgeChunkRepository:
     async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
         rows = self.rows_for_version(document_version_id)
         if not rows:
-            return ChunkProjectionState(
-                embedding_profile_id=None, chunker_version=None, chunk_count=0
-            )
+            return ChunkProjectionState(None, None, 0)
+        per_profile: dict[UUID, int] = {}
+        for row in rows:
+            for profile_id in self.profiles_for(row):
+                per_profile[profile_id] = per_profile.get(profile_id, 0) + 1
+        covering = [
+            profile_id for profile_id, count in per_profile.items() if count == len(rows)
+        ]
         return ChunkProjectionState(
-            embedding_profile_id=rows[0].embedding_profile_id,
+            embedding_profile_id=covering[0] if len(covering) == 1 else None,
             chunker_version=rows[0].chunker_version,
             chunk_count=len(rows),
+            generation=rows[0].generation,
+            embedding_count=sum(per_profile.values()),
         )
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
-        self.deleted_versions.append(document_version_id)
-        for chunk_id in [
+    async def list_content_chunks(
+        self, *, document_version_id: UUID, generation: int
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        return self.rows_for_version(document_version_id, generation)
+
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
+        """Drop ONE generation's EMBEDDING rows; content chunks are untouched."""
+        self.deleted_embeddings.append((document_version_id, generation))
+        chunk_ids = {
+            chunk.id for chunk in self.rows_for_version(document_version_id, generation)
+        }
+        removed = [key for key in self.embeddings if key[0] in chunk_ids]
+        for key in removed:
+            del self.embeddings[key]
+        return len(removed)
+
+    async def delete_embeddings_for_profile(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID
+    ) -> int:
+        self.deleted_profiles.append((document_version_id, embedding_profile_id))
+        chunk_ids = {
             chunk.id
             for chunk in self.chunks.values()
             if chunk.document_version_id == document_version_id
-        ]:
-            del self.chunks[chunk_id]
+        }
+        removed = [
+            key
+            for key in self.embeddings
+            if key[0] in chunk_ids and key[1] == embedding_profile_id
+        ]
+        for key in removed:
+            del self.embeddings[key]
+        return len(removed)
 
     async def lexical_candidates(
         self, *, tenant_id: str, search_terms: Sequence[str], limit: int
@@ -520,13 +638,113 @@ class FakeEmbeddingProfileRepository:
         ]
 
 
+class FakeAttackReleaseRepository:
+    """In-memory ``attack_release`` store that ENFORCES the authority invariant.
+
+    The real table carries a per-framework partial unique index, and that index is
+    what makes "at most one authoritative release per framework" a database fact
+    rather than a handler convention (brief section 2.1). Reproducing the rule in
+    the double means a handler that could produce two authoritative releases fails
+    here instead of only under the real constraint.
+    """
+
+    def __init__(self) -> None:
+        self.releases: list[AttackReleaseRecord] = []
+        self.pinned: list[tuple[str, str, str]] = []
+        self.activations: list[tuple[str, str]] = []
+
+    # -- test-side helpers -------------------------------------------------
+
+    def get(self, *, framework: str, source_release: str) -> AttackReleaseRecord | None:
+        for release in self.releases:
+            if release.framework == framework and release.source_release == source_release:
+                return release
+        return None
+
+    def active_for(self, framework: str) -> tuple[AttackReleaseRecord, ...]:
+        return tuple(
+            release
+            for release in self.releases
+            if release.framework == framework and release.is_active
+        )
+
+    # -- AttackReleaseRepository -------------------------------------------
+
+    async def find(
+        self, *, framework: str, source_release: str
+    ) -> AttackReleaseRecord | None:
+        return self.get(framework=framework, source_release=source_release)
+
+    async def get_active(self, *, framework: str) -> AttackReleaseRecord | None:
+        active = self.active_for(framework)
+        return active[0] if active else None
+
+    async def list_for_framework(
+        self, *, framework: str
+    ) -> tuple[AttackReleaseRecord, ...]:
+        return tuple(
+            release for release in self.releases if release.framework == framework
+        )
+
+    async def list_active(self) -> tuple[AttackReleaseRecord, ...]:
+        return tuple(release for release in self.releases if release.is_active)
+
+    async def add(self, *, release: AttackReleaseRecord) -> None:
+        self.releases.append(release)
+        self._assert_single_active()
+
+    async def pin_fingerprint(
+        self, *, framework: str, source_release: str, content_fingerprint: str
+    ) -> None:
+        self.pinned.append((framework, source_release, content_fingerprint))
+        self._replace(
+            framework=framework,
+            source_release=source_release,
+            content_fingerprint=content_fingerprint,
+        )
+
+    async def activate(self, *, framework: str, source_release: str, now: datetime) -> None:
+        """Activate one release and deactivate the framework's others, in one pass."""
+        self.activations.append((framework, source_release))
+        self.releases = [
+            replace(release, status=ATTACK_RELEASE_STATUS_ACTIVE, activated_at=now)
+            if release.framework == framework and release.source_release == source_release
+            else replace(release, status=ATTACK_RELEASE_STATUS_INACTIVE)
+            if release.framework == framework
+            else release
+            for release in self.releases
+        ]
+        self._assert_single_active()
+
+    def _replace(
+        self, *, framework: str, source_release: str, content_fingerprint: str
+    ) -> None:
+        self.releases = [
+            replace(release, content_fingerprint=content_fingerprint)
+            if release.framework == framework and release.source_release == source_release
+            else release
+            for release in self.releases
+        ]
+
+    def _assert_single_active(self) -> None:
+        seen: set[str] = set()
+        for release in self.releases:
+            if not release.is_active:
+                continue
+            assert release.framework not in seen, (
+                "uq_attack_release_single_active: two ACTIVE releases for framework "
+                f"{release.framework!r}"
+            )
+            seen.add(release.framework)
+
+
 class FakeAttackTechniqueRepository:
     """In-memory canonical-technique store for the pinned releases."""
 
     def __init__(self) -> None:
         self.rows: list[AttackTechniqueRecord] = []
         self.add_many_calls: list[tuple[AttackTechniqueRecord, ...]] = []
-        self.deactivate_calls: list[tuple[str, str]] = []
+        self.active_calls: list[tuple[str, str, bool]] = []
 
     def for_release(self, source_release: str) -> tuple[AttackTechniqueRecord, ...]:
         return tuple(row for row in self.rows if row.source_release == source_release)
@@ -554,22 +772,36 @@ class FakeAttackTechniqueRepository:
             if row.framework == framework and row.source_release == source_release
         )
 
-    async def deactivate_except(self, *, framework: str, source_release: str) -> int:
-        self.deactivate_calls.append((framework, source_release))
-        changed = 0
+    async def list_for_release(
+        self, *, framework: str, source_release: str
+    ) -> tuple[AttackTechniqueRecord, ...]:
+        """Rows of one release, ordered as SQL orders them: (technique_id, stix_id)."""
+        return tuple(
+            sorted(
+                (
+                    row
+                    for row in self.rows
+                    if row.framework == framework and row.source_release == source_release
+                ),
+                key=lambda row: (row.technique_id, row.source_stix_id),
+            )
+        )
+
+    async def set_active_for_release(
+        self, *, framework: str, source_release: str, active: bool
+    ) -> int:
+        """Mirror ONE release's authority onto its rows; return the rows touched."""
+        self.active_calls.append((framework, source_release, active))
         updated: list[AttackTechniqueRecord] = []
+        matched = 0
         for row in self.rows:
-            if (
-                row.framework == framework
-                and row.source_release != source_release
-                and row.active
-            ):
-                updated.append(replace(row, active=False))
-                changed += 1
+            if row.framework == framework and row.source_release == source_release:
+                updated.append(replace(row, active=active))
+                matched += 1
             else:
                 updated.append(row)
         self.rows = updated
-        return changed
+        return matched
 
 
 class FakeRuntime:
@@ -577,6 +809,7 @@ class FakeRuntime:
 
     def __init__(self) -> None:
         self.attack_techniques = FakeAttackTechniqueRepository()
+        self.attack_releases = FakeAttackReleaseRepository()
         self.documents = FakeKnowledgeDocumentRepository()
         self.chunks = FakeKnowledgeChunkRepository()
         self.profiles = FakeEmbeddingProfileRepository()
@@ -604,6 +837,7 @@ class FakeUnitOfWork:
         self.knowledge_chunks = runtime.chunks
         self.embedding_profiles = runtime.profiles
         self.attack_techniques = runtime.attack_techniques
+        self.attack_releases = runtime.attack_releases
         self.events = runtime.events
 
     async def __aenter__(self) -> FakeUnitOfWork:
@@ -724,10 +958,12 @@ async def test_an_import_writes_canonical_rows_for_the_pinned_release() -> None:
     parser = RecordingParser()
     handler = _importer(runtime=runtime, parser=parser)
 
-    outcome = await handler.import_release(_command())
+    outcome = await handler.import_release(_command(activate=True))
 
     assert isinstance(outcome, AttackImportOutcome)
     assert outcome.release == RELEASE
+    assert outcome.release_created is True
+    assert outcome.release_active is True
     assert outcome.techniques_parsed == 2
     assert outcome.techniques_created == 2
     assert outcome.documents_created == 2
@@ -749,8 +985,17 @@ async def test_an_import_writes_canonical_rows_for_the_pinned_release() -> None:
     assert brute_force.tactics == ("credential-access",)
     assert brute_force.platforms == ("Linux", "Windows")
     assert brute_force.source_stix_id == T1110_STIX_ID
+    # The row's flag MIRRORS the owning release's authority; it is not an
+    # independent source of it (brief section 2.3).
     assert brute_force.active is True
     assert brute_force.created_at == T0
+
+    release = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
+    assert release is not None
+    assert release.is_active is True
+    assert release.technique_count == 2
+    assert release.activated_at == T0
+    assert release.content_fingerprint == outcome.content_fingerprint
 
 
 async def test_each_technique_becomes_a_global_mitre_attack_document() -> None:
@@ -837,10 +1082,29 @@ async def test_reimporting_the_same_release_and_bundle_changes_nothing() -> None
     assert len(runtime.attack_techniques.add_many_calls) == 1
 
 
-async def test_reimporting_a_changed_bundle_adds_a_version_not_a_second_row() -> None:
+async def test_reimporting_a_changed_bundle_conflicts_and_mutates_nothing() -> None:
+    """A pinned release is IMMUTABLE: different content under one name is refused.
+
+    The release name is a claim about content. Letting a second, different bundle
+    be imported as "v15.1" would silently rewrite what every citation naming that
+    release means, so the import fails closed -- and, because the check runs
+    before the first write, it leaves the canonical rows, the release record, the
+    documents, the versions, the content chunks and the embedding projections
+    exactly as they were (brief sections 2.2/2.3).
+    """
     runtime = FakeRuntime()
     handler = _importer(runtime=runtime)
-    await handler.import_release(_command())
+    first = await handler.import_release(_command(activate=True))
+
+    rows_before = list(runtime.attack_techniques.rows)
+    releases_before = list(runtime.attack_releases.releases)
+    documents_before = dict(runtime.documents.documents)
+    versions_before = dict(runtime.documents.versions)
+    chunks_before = dict(runtime.chunks.chunks)
+    embeddings_before = dict(runtime.chunks.embeddings)
+    commits_before = runtime.commits
+    add_many_before = len(runtime.attack_techniques.add_many_calls)
+    chunk_batches_before = len(runtime.chunks.added_batches)
 
     edited = _bundle(
         _attack_pattern(
@@ -853,31 +1117,62 @@ async def test_reimporting_a_changed_bundle_adds_a_version_not_a_second_row() ->
         ),
         _command_shell_object(),
     )
-    outcome = await handler.import_release(_command(payload=edited))
 
-    assert outcome.techniques_created == 0
+    with pytest.raises(AttackReleaseContentConflictError) as excinfo:
+        await handler.import_release(_command(payload=edited, activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_CONTENT_CONFLICT"
+    assert "a pinned release is immutable" in str(excinfo.value)
+    # Both fingerprints are named (they are hashes, not content), so an operator
+    # can tell "the bundle genuinely changed" from "two files were both v15.1".
+    assert first.content_fingerprint in str(excinfo.value)
+
+    assert runtime.attack_techniques.rows == rows_before
+    assert runtime.attack_releases.releases == releases_before
+    assert runtime.documents.documents == documents_before
+    assert runtime.documents.versions == versions_before
+    assert runtime.chunks.chunks == chunks_before
+    assert runtime.chunks.embeddings == embeddings_before
+    assert len(runtime.attack_techniques.add_many_calls) == add_many_before
+    assert len(runtime.chunks.added_batches) == chunk_batches_before
+    # The refusal happened inside the first transaction and never reached ingest,
+    # so nothing was committed at all -- not even a no-op.
+    assert runtime.commits == commits_before
+
+
+async def test_changed_content_under_a_new_release_is_a_new_document_version() -> None:
+    """A DIFFERENT release may legitimately carry different technique content.
+
+    Immutability is per release name, not per technique: v15.1's revised T1110 is
+    a new document version while every one of v14.1's canonical rows stays put.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    rows_before = runtime.attack_techniques.for_release("v14.1")
+
+    edited = _bundle(
+        _attack_pattern(
+            stix_id=T1110_STIX_ID,
+            technique_id="T1110",
+            name="Brute Force",
+            description="Revised upstream description.",
+            tactics=("credential-access",),
+            platforms=("Linux", "Windows"),
+        ),
+        _command_shell_object(),
+    )
+    outcome = await handler.import_release(_command(release="v15.1", payload=edited))
+
+    assert outcome.techniques_created == 2
     assert outcome.versions_ingested == 1
     assert outcome.unchanged == 1
-    assert await runtime.attack_techniques.count_for_release(
-        framework=FRAMEWORK, source_release=RELEASE
-    ) == 2
     document = await _document_for(runtime, "T1110")
     version = _version_of(runtime, document)
     assert version.version == 2
     assert "Revised upstream description." in version.normalized_content
-    # The canonical row is INSERT-ONLY: a release that already has rows is never
-    # rewritten, so it keeps the description (and hash) it was first imported
-    # with while the document moves on. Re-importing a release does not refresh
-    # its canonical rows -- correcting them would need an explicit re-import of
-    # the release under a new name.
-    row = await runtime.attack_techniques.find(
-        framework=FRAMEWORK, technique_id="T1110", source_release=RELEASE
-    )
-    assert row is not None
-    assert row.description == T1110_DESCRIPTION
-    _, domain_hash = normalize_and_hash(technique_document_body(_brute_force_technique()))
-    assert row.content_hash == domain_hash
-    assert row.content_hash != version.content_hash
+    # The older release is untouched: rows are never rewritten by a later import.
+    assert runtime.attack_techniques.for_release("v14.1") == rows_before
 
 
 # ---------------------------------------------------------------------------
@@ -898,14 +1193,30 @@ async def test_activate_flips_the_other_releases_rows_inactive_without_deleting_
     assert len(current) == 2
     assert all(row.active is False for row in previous)
     assert all(row.active is True for row in current)
+    # Authority is a fact about the RELEASE, and switching it is one operation.
+    assert [
+        release.source_release for release in runtime.attack_releases.active_for(FRAMEWORK)
+    ] == ["v15.1"]
+    switched_off = runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release="v14.1"
+    )
+    assert switched_off is not None
+    assert switched_off.is_active is False
+    assert runtime.attack_releases.activations == [
+        (FRAMEWORK, "v14.1"),
+        (FRAMEWORK, "v15.1"),
+    ]
     # Flagged, never deleted: the older release is still readable by its own
     # source_release, which is what makes the switch reversible.
     assert await runtime.attack_techniques.count_for_release(
         framework=FRAMEWORK, source_release="v14.1"
     ) == 2
-    assert runtime.attack_techniques.deactivate_calls == [
-        (FRAMEWORK, "v14.1"),
-        (FRAMEWORK, "v15.1"),
+    # The row flag is re-asserted from the release on every import rather than
+    # left to whatever happened to be written, so the two cannot disagree.
+    assert runtime.attack_techniques.active_calls == [
+        (FRAMEWORK, "v14.1", True),
+        (FRAMEWORK, "v14.1", False),
+        (FRAMEWORK, "v15.1", True),
     ]
 
 
@@ -931,6 +1242,13 @@ async def test_a_new_release_reuses_the_existing_documents() -> None:
 
 
 async def test_importing_without_activate_leaves_the_authoritative_release_alone() -> None:
+    """The backfill path can never produce a SECOND authoritative release.
+
+    ``activate=False`` writes a release whose rows are all INACTIVE: importing a
+    new release is not the same act as promoting it, so an operator can stage
+    v15.1 and switch later without a window in which two releases are
+    authoritative (brief sections 2.1/10).
+    """
     runtime = FakeRuntime()
     handler = _importer(runtime=runtime)
     await handler.import_release(_command(release="v14.1", activate=True))
@@ -938,10 +1256,196 @@ async def test_importing_without_activate_leaves_the_authoritative_release_alone
     outcome = await handler.import_release(_command(release="v15.1"))
 
     assert outcome.techniques_created == 2
-    # The backfill added rows and never touched the switch.
-    assert runtime.attack_techniques.deactivate_calls == [(FRAMEWORK, "v14.1")]
+    assert outcome.release_created is True
+    assert outcome.release_active is False
+
+    authoritative = runtime.attack_releases.active_for(FRAMEWORK)
+    assert [release.source_release for release in authoritative] == ["v14.1"]
+    staged = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v15.1")
+    assert staged is not None
+    assert staged.is_active is False
+    assert staged.activated_at is None
+
     assert all(row.active for row in runtime.attack_techniques.for_release("v14.1"))
-    assert all(row.active for row in runtime.attack_techniques.for_release("v15.1"))
+    assert all(not row.active for row in runtime.attack_techniques.for_release("v15.1"))
+    # The staging import re-asserted v14.1's authority and wrote v15.1 inactive by
+    # construction; it never reached for the switch at all.
+    assert runtime.attack_techniques.active_calls == [
+        (FRAMEWORK, "v14.1", True),
+        (FRAMEWORK, "v15.1", False),
+    ]
+    assert runtime.attack_releases.activations == [(FRAMEWORK, "v14.1")]
+
+
+async def test_activating_an_already_active_release_does_not_restamp_it() -> None:
+    """When a release became authoritative must not drift on an idempotent re-run."""
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(activate=True))
+    before = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
+    assert before is not None
+    assert before.activated_at == T0
+
+    later = FakeClock(datetime(2026, 9, 13, 10, 0, 0, tzinfo=UTC))
+    second = AttackImportHandler(
+        unit_of_work_factory=runtime.factory,
+        parser=RecordingParser(),
+        ingestion=_ingestion(runtime),
+        clock=later,
+    )
+    outcome = await second.import_release(_command(activate=True))
+
+    assert outcome.release_created is False
+    assert outcome.release_active is True
+    after = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
+    assert after == before
+    assert runtime.attack_releases.activations == [(FRAMEWORK, RELEASE)]
+
+
+async def test_a_semantically_identical_but_reordered_bundle_is_the_same_release() -> None:
+    """The fingerprint is over canonical CONTENT, never over the file's bytes.
+
+    MITRE's own exports are not byte-stable (object order and JSON key order move
+    between builds), so a release that hashed its input bytes could not be
+    re-imported at all. Here every object is reversed and every JSON key sorted,
+    and the import must still converge (brief sections 2.2/10).
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    first = await handler.import_release(_command(activate=True))
+
+    reordered = _reordered_bundle()
+    assert reordered != _full_bundle()
+
+    second = await handler.import_release(_command(payload=reordered, activate=True))
+
+    assert second.content_fingerprint == first.content_fingerprint
+    assert second.techniques_created == 0
+    assert second.versions_ingested == 0
+    assert second.unchanged == 2
+    release = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
+    assert release is not None
+    assert release.content_fingerprint == first.content_fingerprint
+    assert len(runtime.attack_releases.releases) == 1
+    assert len(runtime.attack_techniques.add_many_calls) == 1
+
+
+async def test_an_adopted_release_is_verified_against_stored_rows_and_then_pinned() -> None:
+    """A release adopted by the migration has no fingerprint until one is pinned.
+
+    Pinning must record a fact that was VERIFIED, so the handler re-derives the
+    fingerprint from the rows the database actually stores through the same
+    canonical function -- the incoming bundle is never trusted to describe what
+    is already there (brief section 2.2).
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+
+    # What the migration leaves behind: canonical rows, an authoritative release,
+    # and NO fingerprint, because the rows predate fingerprinting.
+    runtime.attack_releases._replace(
+        framework=FRAMEWORK, source_release="v14.1", content_fingerprint=None
+    )
+    assert runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release="v14.1"
+    ).content_fingerprint is None  # type: ignore[union-attr]
+
+    outcome = await handler.import_release(_command(release="v14.1"))
+
+    assert runtime.attack_releases.pinned == [
+        (FRAMEWORK, "v14.1", outcome.content_fingerprint)
+    ]
+    pinned = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v14.1")
+    assert pinned is not None
+    assert pinned.content_fingerprint == outcome.content_fingerprint
+    # A fingerprint derived from STORED rows, not from the bundle's own bytes.
+    assert outcome.content_fingerprint == fingerprint_from_records(
+        framework=FRAMEWORK,
+        source_release="v14.1",
+        techniques=runtime.attack_techniques.for_release("v14.1"),
+    )
+
+
+async def test_an_adopted_release_whose_stored_rows_disagree_is_refused() -> None:
+    """Adoption is a verification, not a rubber stamp."""
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    runtime.attack_releases._replace(
+        framework=FRAMEWORK, source_release="v14.1", content_fingerprint=None
+    )
+    rows_before = list(runtime.attack_techniques.rows)
+
+    edited = _bundle(
+        _attack_pattern(
+            stix_id=T1110_STIX_ID,
+            technique_id="T1110",
+            name="Brute Force",
+            description="Revised upstream description.",
+            tactics=("credential-access",),
+            platforms=("Linux", "Windows"),
+        ),
+        _command_shell_object(),
+    )
+
+    with pytest.raises(AttackReleaseContentConflictError) as excinfo:
+        await handler.import_release(_command(release="v14.1", payload=edited))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_CONTENT_CONFLICT"
+    assert runtime.attack_releases.pinned == []
+    assert runtime.attack_techniques.rows == rows_before
+
+
+async def test_a_crash_between_the_canonical_rows_and_the_documents_converges_on_retry() -> None:
+    """The canonical half commits FIRST, so a crash leaves a repairable release.
+
+    A release whose documents are only partly projected must be fixable by
+    re-running the same release: the canonical rows are not duplicated, no
+    content conflict is raised (the stored rows ARE this bundle), and the
+    documents complete. The reverse write order would leave documents belonging
+    to no canonical release, which no retry could repair (brief section 2.4).
+    """
+    runtime = FakeRuntime()
+    crashing = FakeEmbeddingProvider(fail_on_call=2)
+    handler = _importer(runtime=runtime, ingestion=_ingestion(runtime, provider=crashing))
+
+    with pytest.raises(RuntimeError, match="died mid-projection"):
+        await handler.import_release(_command(activate=True))
+
+    # The release IS authoritative and its canonical rows ARE complete: that half
+    # is committed before the first document is projected.
+    assert (
+        await runtime.attack_techniques.count_for_release(
+            framework=FRAMEWORK, source_release=RELEASE
+        )
+        == 2
+    )
+    release = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
+    assert release is not None
+    assert release.is_active is True
+    assert release.content_fingerprint is not None
+    # ...and the projection is genuinely partial.
+    assert len(runtime.documents.documents) == 1
+    assert len(runtime.attack_techniques.add_many_calls) == 1
+
+    outcome = await _importer(runtime=runtime).import_release(_command(activate=True))
+
+    assert outcome.techniques_created == 0
+    assert outcome.documents_created == 1
+    assert outcome.versions_ingested == 1
+    assert outcome.unchanged == 1
+    assert len(runtime.documents.documents) == 2
+    assert (
+        await runtime.attack_techniques.count_for_release(
+            framework=FRAMEWORK, source_release=RELEASE
+        )
+        == 2
+    )
+    # No duplicate canonical write, no second release, and no false conflict.
+    assert len(runtime.attack_techniques.add_many_calls) == 1
+    assert len(runtime.attack_releases.releases) == 1
+    assert runtime.attack_releases.pinned == []
 
 
 # ---------------------------------------------------------------------------

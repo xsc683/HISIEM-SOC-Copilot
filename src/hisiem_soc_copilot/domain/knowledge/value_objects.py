@@ -17,6 +17,7 @@ from .errors import (
     InvalidCitationError,
     InvalidContentHashError,
     InvalidKnowledgeDocumentError,
+    KnowledgeError,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,44 @@ def normalize_and_hash(raw: str) -> tuple[str, str]:
     return normalized, compute_content_hash(normalized)
 
 
+def content_hash_matches(*, normalized_content: str, content_hash: str) -> bool:
+    """True iff ``content_hash`` IS ``SHA-256(normalized_content)``.
+
+    The ONE place where "a stored hash and the content it describes agree" is
+    decided. It deliberately RECOMPUTES from the content rather than trusting the
+    stored value, so a row whose hash was edited -- or whose text was tampered
+    with while its hash stayed -- is a detected integrity failure and not a false
+    match. Every caller (the document-version entity, the immutable content-chunk
+    entity, their mappers, and the citation resolver) shares this function, so
+    there is exactly one definition of the invariant and no copied SHA-256.
+    """
+    if not is_valid_content_hash(content_hash):
+        return False
+    return compute_content_hash(normalized_content) == content_hash
+
+
+def require_content_hash_matches(
+    *, normalized_content: str, content_hash: str, error: type[KnowledgeError]
+) -> str:
+    """Return ``content_hash`` iff it matches its content, else raise ``error``.
+
+    ``error`` is supplied by the caller so each boundary keeps its own code --
+    ``INVALID_KNOWLEDGE_VERSION`` for a document version, ``INVALID_CONTENT_CHUNK``
+    for a chunk -- while the comparison itself stays in one place. Callers that
+    must not raise (the citation resolver reports a resolution REASON instead)
+    use :func:`content_hash_matches` directly.
+    """
+    require_valid_content_hash(content_hash)
+    if not content_hash_matches(
+        normalized_content=normalized_content, content_hash=content_hash
+    ):
+        raise error(
+            "content hash does not match the content it describes "
+            "(content/content_hash invariant violated)"
+        )
+    return content_hash
+
+
 def require_valid_content_hash(content_hash: str) -> str:
     """Return ``content_hash`` when it is a lowercase SHA-256 hex digest."""
     if not _SHA256_HEX.match(content_hash):
@@ -105,6 +144,13 @@ DEFAULT_MAX_TOKENS = 800
 DEFAULT_OVERLAP_TOKENS = 80
 #: Hard ceiling on ``max_tokens`` (brief section 22: ``max_tokens`` <= 800).
 MAX_TOKENS_CEILING = 800
+
+#: The first content-chunk generation for a document version. A generation is an
+#: APPEND-ONLY chunking of the same immutable version: a chunker change produces
+#: generation N+1 and leaves N in place, so a citation into N still resolves
+#: (brief section 3.3). Normal retrieval reads only the current (highest)
+#: generation.
+CHUNK_GENERATION_INITIAL = 1
 
 
 @dataclass(frozen=True)

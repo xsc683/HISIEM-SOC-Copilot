@@ -21,6 +21,7 @@ from uuid import UUID
 
 from ...domain.knowledge.entities import KnowledgeDocument, KnowledgeDocumentVersion
 from ...domain.knowledge.enums import SourceKind, Visibility
+from ...domain.knowledge.value_objects import CHUNK_GENERATION_INITIAL
 
 DEFAULT_RESULT_LIMIT = 5
 MAX_RESULT_LIMIT = 5
@@ -127,6 +128,13 @@ class KnowledgeChunkView:
 
     Repositories return this so tenant/visibility/active-version filtering happens
     in SQL, never by loading the corpus and filtering in Python (section 44).
+
+    ``chunk_id`` is the IMMUTABLE content-chunk id -- the citation target -- not
+    an embedding-projection row, so it stays valid when the projection is rebuilt
+    (brief section 3). The remaining fields beyond the content are provenance and
+    *ranking* metadata: they make the deterministic tie-break explainable in
+    business terms instead of by database-generated UUID (brief section 5.1/5.2).
+    They confer no authority.
     """
 
     chunk_id: UUID
@@ -143,6 +151,51 @@ class KnowledgeChunkView:
     document_status: str
     visibility: Visibility
     tenant_id: str | None
+    #: The document's natural key inside its scope, e.g. ``mitre-attack:T1110``.
+    external_key: str = ""
+    #: The immutable version's ordinal (1, 2, ...) within the document.
+    document_version_number: int = 1
+    #: Which chunk generation of that version this chunk belongs to.
+    chunk_generation: int = CHUNK_GENERATION_INITIAL
+
+
+def stable_ranking_key(
+    view: KnowledgeChunkView,
+) -> tuple[str, str, str, str, int, int, int]:
+    """The ONE deterministic tie-break order for ranked knowledge (brief section 5.1).
+
+    Ranking ties are broken by SEMANTIC business identity -- what the knowledge
+    IS -- and never by a database-generated surrogate::
+
+        (source_kind, visibility, tenant_id, external_key,
+         document_version_number, chunk_generation, ordinal)
+
+    A random UUID tie-break would make two runs over the same corpus disagree
+    whenever a tie occurred, which is precisely what a reproducible baseline
+    cannot tolerate. Every component here is stable under re-ingestion into a
+    fresh database: the same document at the same version, chunked by the same
+    chunker, always produces the same key.
+
+    ``visibility``/``tenant_id`` are part of the key because a GLOBAL document and
+    a TENANT document may share an ``external_key`` (the two partial unique
+    indexes allow exactly that), so without the scope the order would not be
+    total. A GLOBAL row has no tenant; ``tenant_id`` is folded to ``""`` for
+    ordering, which is safe because the fold is only ever applied WITHIN one
+    visibility value, where the tenant is uniform.
+
+    The SQL side of this order lives in the repository's ``_stable_order_columns``;
+    the two MUST stay identical, so the SQL uses ``COLLATE "C"`` (byte order),
+    which is exactly this function's ``str`` comparison order for UTF-8 text.
+    """
+    return (
+        view.source_kind.value,
+        view.visibility.value,
+        view.tenant_id or "",
+        view.external_key,
+        view.document_version_number,
+        view.chunk_generation,
+        view.ordinal,
+    )
 
 
 @dataclass(frozen=True)
@@ -162,30 +215,46 @@ class VectorCandidate:
 
 
 @dataclass(frozen=True)
-class KnowledgeChunkRecord:
-    """A chunk as it is persisted: a REBUILDABLE retrieval projection.
+class KnowledgeContentChunkRecord:
+    """An IMMUTABLE content chunk as it is persisted -- the citation target.
 
-    Chunks are not a domain aggregate. They can always be regenerated from the
-    immutable version, so they carry no business authority of their own.
+    Content identity and retrieval machinery are deliberately separate rows
+    (brief section 3.1). This half is written once per ``(document_version_id,
+    generation, ordinal)`` and is never rewritten, so a citation into it survives
+    re-embedding, projection rebuilds, rechunking, restarts, retirement, and
+    later versions. ``content_hash`` is derived from ``content`` by the one
+    domain hash function, never supplied by a caller.
     """
 
     id: UUID
     document_id: UUID
     document_version_id: UUID
+    generation: int
     ordinal: int
     heading_path: str
     content: str
     content_hash: str
     token_count: int
     language: str
+    chunker_version: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ChunkEmbeddingRecord:
+    """The REBUILDABLE embedding projection of one content chunk.
+
+    Carries no content and therefore no identity worth citing: it can be dropped
+    and recreated (a new embedding profile, a re-index) without invalidating a
+    single citation. Exactly one row per ``(content_chunk_id,
+    embedding_profile_id)``.
+    """
+
+    id: UUID
+    content_chunk_id: UUID
     embedding_profile_id: UUID
     embedding: tuple[float, ...]
-    created_at: datetime
-    #: The chunker that produced this projection. Persisted so ingestion can tell
-    #: whether a version's chunks are stale (older chunker, older embedding
-    #: profile) and must be rebuilt, instead of silently serving a projection that
-    #: no longer matches the frozen chunker configuration (brief section 22).
-    chunker_version: str
+    indexed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -193,17 +262,77 @@ class ChunkProjectionState:
     """What a document version's retrieval projection currently looks like.
 
     ``is_empty`` and the profile/chunker comparison are what let ingestion decide
-    between a true no-op and a rebuild. The version row is immutable either way:
-    only the rebuildable projection is ever regenerated.
+    between a true no-op, a re-embed, and a rechunk. The version row is immutable
+    either way: only the rebuildable projection is ever regenerated.
+
+    ``generation`` is the CURRENT (highest) content-chunk generation: a chunker
+    change appends generation N+1 rather than deleting N, which is what keeps an
+    older chunker's chunks -- and any citation into them -- resolvable (section
+    3.3).
+
+    ``embedding_profile_id`` names the ONE embedding space that FULLY covers the
+    current generation, and is ``None`` when none does or when more than one does.
+    That definition is what makes a re-embedding decision terminate: an ambiguous
+    or partial projection always reads as "not embedded", so the caller re-embeds
+    instead of oscillating between two spaces. ``embedding_count`` is the raw
+    number of projections, reported for operators and diagnostics.
     """
 
     embedding_profile_id: UUID | None
     chunker_version: str | None
     chunk_count: int
+    generation: int = CHUNK_GENERATION_INITIAL
+    embedding_count: int = 0
 
     @property
     def is_empty(self) -> bool:
         return self.chunk_count == 0
+
+    @property
+    def is_embedded(self) -> bool:
+        """True when one embedding space fully covers the current generation."""
+        return self.chunk_count > 0 and self.embedding_profile_id is not None
+
+
+@dataclass(frozen=True)
+class CorpusChunkFact:
+    """The canonical SEMANTIC facts about one eligible corpus chunk.
+
+    This is the unit the corpus fingerprint is built from (brief section 5.5). It
+    deliberately contains no database-generated UUID, no timestamp, no host, no
+    credential and no embedding vector: two independently ingested databases must
+    produce the same fingerprint for the same corpus, and only facts that are
+    reproducible from the corpus itself can do that.
+    """
+
+    visibility: Visibility
+    tenant_id: str | None
+    source_kind: SourceKind
+    external_key: str
+    document_version_number: int
+    document_content_hash: str
+    chunk_generation: int
+    ordinal: int
+    chunk_content_hash: str
+
+
+@dataclass(frozen=True)
+class CorpusSnapshot:
+    """The tenant-visible ACTIVE eligible corpus as reproducible facts.
+
+    "Eligible" is the retrieval definition, not a new one: an ACTIVE document,
+    visible to the tenant, whose active version has at least one content chunk in
+    its current generation. Repositories build this in SQL so an evaluation
+    precondition cannot read rows the tenant may not see (brief sections 5.3/44).
+    """
+
+    chunks: tuple[CorpusChunkFact, ...] = ()
+    document_count: int = 0
+    version_count: int = 0
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self.chunks)
 
 
 @dataclass(frozen=True)
@@ -224,6 +353,47 @@ class EmbeddingProfileRecord:
     @property
     def identifier(self) -> str:
         return f"{self.provider}:{self.model_id}:{self.dimension}:{self.profile_version}"
+
+
+@dataclass(frozen=True)
+class AttackReleaseRecord:
+    """One imported ATT&CK release, with its authority state and fingerprint.
+
+    Authority lives HERE, at release granularity, not on the technique rows: the
+    question "which release is authoritative for this framework" is one fact
+    about one release, and modelling it per technique is what let two releases be
+    authoritative at once (brief section 2.1). The database enforces "at most one
+    ACTIVE release per framework" with a partial unique index, so this record's
+    ``status`` cannot disagree with the constraint.
+
+    ``content_fingerprint`` is the deterministic fingerprint over the release's
+    canonical technique collection (section 2.2). It is ``None`` only for a
+    release adopted by the migration from rows that predate fingerprinting; a
+    release imported by the handler always carries one.
+    """
+
+    id: UUID
+    framework: str
+    source_release: str
+    content_fingerprint: str | None
+    status: str
+    technique_count: int
+    created_at: datetime
+    activated_at: datetime | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == ATTACK_RELEASE_STATUS_ACTIVE
+
+
+#: The two release authority states. There is deliberately no third STAGING
+#: state: a half-activated release is what the partial unique index exists to
+#: make impossible (brief section 2.1).
+ATTACK_RELEASE_STATUS_ACTIVE = "ACTIVE"
+ATTACK_RELEASE_STATUS_INACTIVE = "INACTIVE"
+
+#: Fingerprint of a release adopted from pre-fingerprint rows is UNKNOWN until an
+#: import pins it: ``None`` means exactly that, and is never treated as "matches".
 
 
 @dataclass(frozen=True)
@@ -255,6 +425,12 @@ class AttackImportOutcome:
     versions_ingested: int
     unchanged: int
     skipped: tuple[str, ...] = field(default=())
+    #: The release's authority state AFTER the import, and the fingerprint that
+    #: was pinned (or confirmed) for it. Reported so an operator can see which
+    #: release is authoritative instead of inferring it from a row count.
+    release_active: bool = False
+    content_fingerprint: str | None = None
+    release_created: bool = False
 
 
 class KnowledgeDocumentRepository(Protocol):
@@ -304,14 +480,23 @@ class KnowledgeDocumentRepository(Protocol):
 
 
 class KnowledgeChunkRepository(Protocol):
-    """Chunk (retrieval projection) persistence and candidate generation.
+    """Immutable content-chunk + rebuildable embedding-projection persistence.
 
     Candidate generation MUST filter in SQL: a tenant/visibility/active-version
     restriction applied after loading the corpus would read rows the caller is
     not allowed to see, and would not scale (brief sections 44/45).
+
+    There is deliberately NO ``delete_for_version``: P3-A offers no path that
+    destroys immutable historical chunk content, because that is exactly what
+    would make a historical citation unresolvable (brief section 3.2). The only
+    deletion available is of the REBUILDABLE embedding rows.
     """
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None: ...
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None: ...
+
+    async def add_embeddings(self, *, embeddings: Sequence[ChunkEmbeddingRecord]) -> None: ...
 
     async def count_for_version(self, *, document_version_id: UUID) -> int: ...
 
@@ -319,7 +504,32 @@ class KnowledgeChunkRepository(Protocol):
         self, *, document_version_id: UUID
     ) -> ChunkProjectionState: ...
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None: ...
+    async def list_content_chunks(
+        self, *, document_version_id: UUID, generation: int
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        """Read ONE generation's immutable chunks, in ordinal order.
+
+        Used to RE-EMBED a version that already has content but no projection in
+        the ACTIVE embedding space. Re-indexing reuses the very same content
+        chunks -- that is the point of separating content identity from the
+        projection -- so their ids, and every citation into them, survive the
+        rebuild unchanged (brief section 3.1).
+        """
+        ...
+
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
+        """Delete one generation's EMBEDDING rows; return how many were removed.
+
+        The content chunks of that generation are untouched: re-embedding under a
+        new profile replaces the projection, never the cited identity.
+        """
+        ...
+
+    async def delete_embeddings_for_profile(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID
+    ) -> int: ...
 
     async def lexical_candidates(
         self, *, tenant_id: str, search_terms: Sequence[str], limit: int
@@ -336,7 +546,25 @@ class KnowledgeChunkRepository(Protocol):
 
     async def get_chunk_view(
         self, *, tenant_id: str, chunk_id: UUID
-    ) -> KnowledgeChunkView | None: ...
+    ) -> KnowledgeChunkView | None:
+        """Read one content chunk for citation resolution.
+
+        Deliberately applies NO chunk-generation predicate: an older generation is
+        still legitimate history, and a citation into it must keep resolving
+        (brief section 3.3). Scope IS still enforced -- ``tenant_id`` is
+        mandatory and applied in SQL -- so a citation cannot cross tenants.
+        """
+        ...
+
+    async def corpus_snapshot(self, *, tenant_id: str) -> CorpusSnapshot:
+        """Return the tenant-visible ACTIVE eligible corpus as reproducible facts.
+
+        Used as the sealed-evaluation precondition (brief section 5.3): the driver
+        compares this against the fingerprint it expects from the fixture BEFORE
+        any metric runs, so an ambient or mutated corpus fails as
+        ``CORPUS_PRECONDITION_FAILED`` instead of producing a misleading score.
+        """
+        ...
 
 
 class EmbeddingProfileRepository(Protocol):
@@ -360,6 +588,56 @@ class EmbeddingProfileRepository(Protocol):
     async def retire_active(self, *, retired_at: datetime) -> None: ...
 
 
+class AttackReleaseRepository(Protocol):
+    """Release-level ATT&CK authority: at most one ACTIVE release per framework.
+
+    The single-active rule is a database fact (a per-framework partial unique
+    index), not an application convention, so ``activate`` cannot produce two
+    authoritative releases even under concurrency (brief section 2.1).
+    """
+
+    async def find(
+        self, *, framework: str, source_release: str
+    ) -> AttackReleaseRecord | None: ...
+
+    async def get_active(self, *, framework: str) -> AttackReleaseRecord | None: ...
+
+    async def list_for_framework(
+        self, *, framework: str
+    ) -> tuple[AttackReleaseRecord, ...]: ...
+
+    async def list_active(self) -> tuple[AttackReleaseRecord, ...]:
+        """Every ACTIVE release, across every framework.
+
+        The authority invariant is per framework, so the diagnostic that verifies
+        it needs the whole picture rather than one framework at a time: grouping
+        here is what turns "one active per framework" into a checkable fact
+        (brief sections 2.1/9.2).
+        """
+        ...
+
+    async def add(self, *, release: AttackReleaseRecord) -> None: ...
+
+    async def pin_fingerprint(
+        self, *, framework: str, source_release: str, content_fingerprint: str
+    ) -> None:
+        """Record the fingerprint of an adopted (pre-fingerprint) release.
+
+        Only ever called after the stored rows were re-derived through the SAME
+        canonical function and matched, so pinning records a fact that was
+        verified rather than one that was assumed.
+        """
+        ...
+
+    async def activate(self, *, framework: str, source_release: str, now: datetime) -> None:
+        """Make this release the framework's only ACTIVE one, in one statement.
+
+        Deactivates every other release of the framework and activates this one.
+        The partial unique index makes a second ACTIVE release fail at COMMIT.
+        """
+        ...
+
+
 class AttackTechniqueRepository(Protocol):
     """Canonical ATT&CK technique persistence for a pinned release."""
 
@@ -371,14 +649,26 @@ class AttackTechniqueRepository(Protocol):
 
     async def count_for_release(self, *, framework: str, source_release: str) -> int: ...
 
-    async def deactivate_except(self, *, framework: str, source_release: str) -> int:
-        """Mark every OTHER release's rows inactive; return how many changed.
+    async def list_for_release(
+        self, *, framework: str, source_release: str
+    ) -> tuple[AttackTechniqueRecord, ...]:
+        """Read a release's canonical rows, in a total deterministic order.
 
-        This is the explicit release switch of section 38. Rows are never
-        deleted -- an older release stays readable by its own ``source_release``
-        -- so "which release is authoritative" is a reversible flag rather than a
-        destructive act. Returns the number of rows actually flipped so an
-        operator can see the switch happened instead of assuming it did.
+        Used to re-derive an adopted release's fingerprint from what is actually
+        stored, so legacy adoption is verified against the database rather than
+        assumed from the incoming bundle (brief section 2.2).
+        """
+        ...
+
+    async def set_active_for_release(
+        self, *, framework: str, source_release: str, active: bool
+    ) -> int:
+        """Set the ``active`` flag on every row of ONE release; return rows changed.
+
+        Technique rows carry the flag because a technique is the unit a future
+        tool would read, but the flag is a MIRROR of the release's authority --
+        never an independent source of it (brief section 2.3). Rows are never
+        deleted, so an older release stays readable by its own ``source_release``.
         """
         ...
 

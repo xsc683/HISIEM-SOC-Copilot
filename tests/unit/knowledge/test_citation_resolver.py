@@ -16,8 +16,8 @@ import pytest
 from hisiem_soc_copilot.application.errors import InvalidKnowledgeQueryError
 from hisiem_soc_copilot.application.ports.knowledge import (
     ChunkProjectionState,
-    KnowledgeChunkRecord,
     KnowledgeChunkView,
+    KnowledgeContentChunkRecord,
     LexicalCandidate,
     VectorCandidate,
 )
@@ -66,7 +66,9 @@ class FakeChunkRepository:
         self.calls.append((tenant_id, chunk_id))
         return self.views.get(chunk_id)
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         raise NotImplementedError("resolution never writes chunks")
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
@@ -75,7 +77,9 @@ class FakeChunkRepository:
     async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
         raise NotImplementedError("resolution never inspects projection state")
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
         raise NotImplementedError("resolution never deletes chunks")
 
     async def lexical_candidates(
@@ -107,6 +111,7 @@ def _view(
     document_status: str = "ACTIVE",
     visibility: Visibility = Visibility.GLOBAL,
     tenant_id: str | None = None,
+    stored_content_hash: str | None = None,
 ) -> KnowledgeChunkView:
     return KnowledgeChunkView(
         chunk_id=chunk_id,
@@ -115,7 +120,7 @@ def _view(
         ordinal=0,
         heading_path="Detection",
         content=content,
-        content_hash=compute_content_hash(content),
+        content_hash=stored_content_hash or compute_content_hash(content),
         title="Brute Force Guidance",
         source_kind=SourceKind.CURATED_GUIDANCE,
         language="en",
@@ -227,7 +232,7 @@ async def test_a_well_formed_citation_for_an_unknown_chunk_does_not_resolve() ->
 
 
 # ---------------------------------------------------------------------------
-# content hash re-validation
+# content/hash integrity re-validation (brief section 3.4 / 8)
 # ---------------------------------------------------------------------------
 
 
@@ -241,7 +246,7 @@ async def test_a_citation_whose_hash_prefix_is_wrong_does_not_resolve() -> None:
     resolution = await resolver.resolve(tenant_id=TENANT, citation_id=mismatched)
 
     assert resolution.resolved is False
-    assert resolution.reason == "CONTENT_HASH_MISMATCH"
+    assert resolution.reason == "CONTENT_INTEGRITY_MISMATCH"
     assert resolution.chunk_id is None
 
 
@@ -254,7 +259,45 @@ async def test_a_fabricated_hash_prefix_confers_nothing() -> None:
     )
 
     assert resolution.resolved is False
-    assert resolution.reason == "CONTENT_HASH_MISMATCH"
+    assert resolution.reason == "CONTENT_INTEGRITY_MISMATCH"
+
+
+async def test_a_row_whose_stored_hash_does_not_describe_its_content_does_not_resolve() -> None:
+    """The STORED hash is a claim beside the content, not evidence (section 3.4).
+
+    An out-of-band edit that rewrote the stored hash -- leaving the text alone --
+    must not resolve, even though the citation prefix matches the stored value
+    exactly. Otherwise the citation would confirm a document that says nothing.
+    """
+    view = _view(stored_content_hash=compute_content_hash("some other body"))
+    resolver, _ = _resolver(view)
+
+    resolution = await resolver.resolve(tenant_id=TENANT, citation_id=_citation(view))
+
+    assert resolution.resolved is False
+    assert resolution.reason == "CONTENT_INTEGRITY_MISMATCH"
+    assert resolution.chunk_id is None
+
+
+async def test_a_row_whose_content_was_edited_under_a_stale_hash_does_not_resolve() -> None:
+    """The mirror case: the TEXT was changed and the hash left standing.
+
+    Both halves must agree. Recomputing from the content actually read is what
+    catches this, and it is why the resolver recomputes rather than trusting the
+    stored column.
+    """
+    view = _view(
+        content=CONTENT + " -- injected later, out of band.",
+        stored_content_hash=compute_content_hash(CONTENT),
+    )
+    resolver, _ = _resolver(view)
+
+    # The citation's prefix DOES match the stored hash, so the prefix check alone
+    # would have accepted this row; only the recomputation rejects it.
+    resolution = await resolver.resolve(tenant_id=TENANT, citation_id=_citation(_view()))
+
+    assert resolution.resolved is False
+    assert resolution.reason == "CONTENT_INTEGRITY_MISMATCH"
 
 
 @pytest.mark.parametrize("length", [8, 12, 16])

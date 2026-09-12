@@ -31,8 +31,8 @@ from hisiem_soc_copilot.application.ports.embedding import (
 from hisiem_soc_copilot.application.ports.knowledge import (
     ChunkProjectionState,
     EmbeddingProfileRecord,
-    KnowledgeChunkRecord,
     KnowledgeChunkView,
+    KnowledgeContentChunkRecord,
     KnowledgeQuery,
     LexicalCandidate,
     VectorCandidate,
@@ -107,7 +107,9 @@ class FakeChunkRepository:
     ) -> KnowledgeChunkView | None:
         return self.views.get(chunk_id)
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         raise NotImplementedError("retrieval never writes chunks")
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
@@ -116,7 +118,9 @@ class FakeChunkRepository:
     async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
         raise NotImplementedError("retrieval never inspects projection state")
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
         raise NotImplementedError("retrieval never deletes chunks")
 
 

@@ -31,10 +31,14 @@ from hisiem_soc_copilot.evaluation.knowledge import (
     CATEGORY_SEMANTIC_GUIDANCE,
     CATEGORY_TENANT_RUNBOOK,
     CORPUS,
+    CORPUS_PRECONDITION_FAILED,
     POISONED_DOCUMENT_KEYS,
     PROMPT_INJECTION_MARKERS,
     SUITE_ID,
     CorpusCase,
+    CorpusFact,
+    CorpusMode,
+    CorpusPreconditionError,
     EvalMode,
     EvalQuery,
     HybridGate,
@@ -45,9 +49,13 @@ from hisiem_soc_copilot.evaluation.knowledge import (
     SuiteResult,
     build_artifact,
     citation_resolution_rate,
+    corpus_fingerprint,
+    corpus_identity,
+    corpus_problems,
     cross_tenant_leakage_count,
     forbidden_retrieval_count,
     ndcg_at_k,
+    preflight_corpus,
     recall_at_k,
     reciprocal_rank,
     run_mode,
@@ -91,6 +99,18 @@ _EMBEDDING_PROFILE: dict[str, object] = {
     "provider": "fake",
     "model_id": "fake-embedding",
     "dimension": 8,
+}
+#: A SEALED corpus record as the driver supplies it. The artifact is required to
+#: carry one (brief section 5.5), so the fixture has to be shaped like the real
+#: thing rather than omitted from the test.
+_CORPUS_RECORD: dict[str, object] = {
+    "corpus_mode": CorpusMode.SEALED.value,
+    "sealed": True,
+    "corpus_fingerprint": "0" * 64,
+    "expected_corpus_fingerprint": "0" * 64,
+    "eligible_document_count": 3,
+    "eligible_version_count": 3,
+    "eligible_chunk_count": 7,
 }
 
 
@@ -180,6 +200,7 @@ def _artifact_for(suite: SuiteResult) -> dict[str, object]:
         suite=suite,
         retrieval_profile=_RETRIEVAL_PROFILE,
         embedding_profile=_EMBEDDING_PROFILE,
+        corpus=_CORPUS_RECORD,
     )
 
 
@@ -515,6 +536,7 @@ async def test_artifact_is_bounded_and_carries_no_forbidden_material(tmp_path: P
         "schema_version",
         "suite_id",
         "corpus_version",
+        "corpus",
         "retrieval_profile",
         "embedding_profile",
         "case_count",
@@ -525,6 +547,10 @@ async def test_artifact_is_bounded_and_carries_no_forbidden_material(tmp_path: P
         "hybrid_gate",
         "per_case",
     }
+
+    # What corpus was measured is part of the record, not an inference from the
+    # file name (brief section 5.5).
+    assert artifact["corpus"] == _CORPUS_RECORD
 
     keys: list[str] = []
     strings: list[str] = []
@@ -704,3 +730,266 @@ def test_poisoned_documents_carry_the_injection_markers_verbatim() -> None:
     # through the normal retrieval path (they carry no marker in metadata).
     for key in POISONED_DOCUMENT_KEYS:
         assert not any(key in case.forbidden_document_keys for case in CASES)
+
+
+# ---------------------------------------------------------------------------
+# Sealed corpus identity and preflight (brief sections 5.3-5.6)
+# ---------------------------------------------------------------------------
+
+
+def _fact(
+    *,
+    external_key: str = "curated:T1110",
+    content_hash: str = "a" * 64,
+    chunk_generation: int = 1,
+    ordinal: int = 0,
+    chunk_hash: str | None = None,
+    document_version_number: int = 1,
+    visibility: str = "GLOBAL",
+    tenant_id: str = "",
+    source_kind: str = "CURATED",
+) -> CorpusFact:
+    """One eligible chunk fact. Every default is a plain, reproducible value."""
+    return CorpusFact(
+        visibility=visibility,
+        tenant_id=tenant_id,
+        source_kind=source_kind,
+        external_key=external_key,
+        document_version_number=document_version_number,
+        document_content_hash=content_hash,
+        chunk_generation=chunk_generation,
+        ordinal=ordinal,
+        chunk_content_hash=chunk_hash or f"{ordinal:064d}",
+    )
+
+
+def _sealed_corpus() -> list[CorpusFact]:
+    """A small but structurally complete corpus: a GLOBAL and a TENANT document."""
+    return [
+        _fact(external_key="curated:T1110", ordinal=0),
+        _fact(external_key="curated:T1110", ordinal=1),
+        _fact(
+            external_key="runbook:isolate-host",
+            tenant_id="tenant-a",
+            visibility="TENANT",
+            source_kind="RUNBOOK",
+            content_hash="b" * 64,
+            ordinal=0,
+        ),
+    ]
+
+
+def test_corpus_fingerprint_ignores_order_and_duplicates() -> None:
+    """A GLOBAL document is seen once per tenant scope; the SET is what counts."""
+    facts = _sealed_corpus()
+    shuffles = [list(reversed(facts)), facts[1:] + facts[:1], facts + facts]
+    fingerprints = {corpus_fingerprint(order) for order in shuffles}
+    assert fingerprints == {corpus_fingerprint(facts)}
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("visibility", "TENANT"),
+        ("tenant_id", "tenant-b"),
+        ("source_kind", "MITRE_ATTACK"),
+        ("external_key", "curated:T1059"),
+        ("document_version_number", 2),
+        ("document_content_hash", "c" * 64),
+        ("chunk_generation", 2),
+        ("ordinal", 5),
+        ("chunk_content_hash", "d" * 64),
+    ],
+)
+def test_changing_any_semantic_fact_changes_the_fingerprint(field: str, value: object) -> None:
+    """The fingerprint binds every fact a corpus could differ in.
+
+    A field the fingerprint ignored would be a field two DIFFERENT corpora could
+    disagree on while both reported the same fingerprint -- which is exactly the
+    failure the sealed baseline exists to prevent.
+    """
+    facts = _sealed_corpus()
+    expected = corpus_fingerprint(facts)
+    # The GLOBAL fact is the one every field can be varied on independently: the
+    # TENANT one already carries the visibility this parametrization applies.
+    mutated = [dataclasses.replace(facts[0], **{field: value}), *facts[1:]]
+    assert corpus_fingerprint(mutated) != expected
+
+
+def test_corpus_fingerprint_is_a_stable_hex_digest_with_no_ambient_input() -> None:
+    facts = _sealed_corpus()
+    first = corpus_fingerprint(facts)
+    assert len(first) == 64
+    assert set(first) <= set("0123456789abcdef")
+    # No clock, no row UUID, no host, no credential participates: two independent
+    # computations over the same facts are byte-identical.
+    assert [corpus_fingerprint(facts) for _ in range(3)] == [first, first, first]
+
+
+def test_corpus_counts_are_derived_from_semantic_identity_not_from_rows() -> None:
+    """A GLOBAL document visible to three tenants is ONE document.
+
+    The driver unions per-tenant snapshots, so the same chunk fact arrives once
+    per scope. Counting rows would report a corpus three times the size of the
+    fixture, and every count in the artifact would disagree with the fingerprint
+    computed over the same set.
+    """
+    shared = _fact(external_key="curated:T1110", ordinal=0)
+    unioned = [shared, shared, shared]
+    identity = corpus_identity(mode=CorpusMode.SEALED, facts=unioned)
+    assert identity.eligible_document_count == 1
+    assert identity.eligible_version_count == 1
+    assert identity.eligible_chunk_count == 1
+
+
+def test_the_corpus_record_carries_the_fields_a_reader_needs() -> None:
+    facts = _sealed_corpus()
+    identity = corpus_identity(mode=CorpusMode.SEALED, facts=facts)
+    record = identity.as_record(expected_fingerprint="e" * 64)
+
+    assert record["corpus_mode"] == "SEALED"
+    assert record["sealed"] is True
+    assert record["corpus_fingerprint"] == identity.fingerprint
+    assert record["expected_corpus_fingerprint"] == "e" * 64
+    assert record["eligible_document_count"] == 2
+    assert record["eligible_version_count"] == 2
+    assert record["eligible_chunk_count"] == 3
+    # No field of the record is an ambient value.
+    assert set(record) == {
+        "corpus_mode",
+        "sealed",
+        "corpus_fingerprint",
+        "expected_corpus_fingerprint",
+        "eligible_document_count",
+        "eligible_version_count",
+        "eligible_chunk_count",
+    }
+
+
+def test_an_open_corpus_record_asserts_nothing() -> None:
+    """An ambient run cannot claim a corpus it never established (section 5.4)."""
+    identity = corpus_identity(mode=CorpusMode.OPEN_CORPUS, facts=_sealed_corpus())
+    record = identity.as_record(expected_fingerprint=None)
+    assert record["corpus_mode"] == "OPEN_CORPUS"
+    assert record["sealed"] is False
+    assert record["expected_corpus_fingerprint"] is None
+
+
+def test_preflight_accepts_the_expected_corpus() -> None:
+    facts = _sealed_corpus()
+    assert corpus_problems(expected=facts, actual=list(facts)) == []
+    preflight_corpus(expected=facts, actual=list(reversed(facts)))
+
+
+def test_preflight_rejects_an_unexpected_document() -> None:
+    expected = _sealed_corpus()
+    actual = expected + [_fact(external_key="operator:scratch", ordinal=0)]
+    with pytest.raises(CorpusPreconditionError) as excinfo:
+        preflight_corpus(expected=expected, actual=actual)
+    assert str(excinfo.value).startswith(CORPUS_PRECONDITION_FAILED)
+    assert "unexpected eligible document(s): CURATED:operator:scratch (GLOBAL, GLOBAL)" in str(
+        excinfo.value
+    )
+
+
+def test_preflight_rejects_an_unexpected_tenant_visible_document() -> None:
+    """A stray TENANT document is as fatal as a GLOBAL one -- for that tenant."""
+    expected = _sealed_corpus()
+    actual = expected + [
+        _fact(
+            external_key="runbook:extra",
+            tenant_id="tenant-a",
+            visibility="TENANT",
+            source_kind="RUNBOOK",
+            ordinal=0,
+        )
+    ]
+    problems = corpus_problems(expected=expected, actual=actual)
+    assert problems and "runbook:extra (tenant tenant-a, TENANT)" in problems[0]
+
+
+def test_preflight_rejects_a_missing_document() -> None:
+    expected = _sealed_corpus()
+    with pytest.raises(CorpusPreconditionError) as excinfo:
+        preflight_corpus(expected=expected, actual=expected[:1])
+    assert "expected document(s) missing or not eligible" in str(excinfo.value)
+    assert "curated:T1110 (GLOBAL, GLOBAL)" in str(excinfo.value)
+
+
+def test_preflight_rejects_a_changed_document_version_or_content() -> None:
+    expected = _sealed_corpus()
+    changed_version = [
+        *expected[:2],
+        dataclasses.replace(expected[2], document_version_number=2),
+    ]
+    problems = corpus_problems(expected=expected, actual=changed_version)
+    assert problems and "document version/content hash mismatch" in problems[0]
+    assert "expected version 1, found 2" in problems[0]
+
+    changed_content = [
+        expected[0],
+        dataclasses.replace(expected[1], document_content_hash="f" * 64),
+        expected[2],
+    ]
+    problems = corpus_problems(expected=expected, actual=changed_content)
+    assert problems and "document version/content hash mismatch" in problems[0]
+
+
+def test_preflight_rejects_a_changed_chunk_projection() -> None:
+    """Same document, same version, different chunks: a different corpus."""
+    expected = _sealed_corpus()
+    rechunked = [*expected[:1], dataclasses.replace(expected[1], ordinal=7), expected[2]]
+    problems = corpus_problems(expected=expected, actual=rechunked)
+    assert problems and "chunk projection mismatch" in problems[0]
+    assert "expected 2 content chunk(s)" in problems[0]
+
+    # A missing chunk is the other half of the same fact: the document and the
+    # version agree, and the projection does not.
+    unprojected = [expected[0], expected[2]]
+    problems = corpus_problems(expected=expected, actual=unprojected)
+    assert problems and "chunk projection mismatch" in problems[0]
+    assert "found 1 in" in problems[0]
+
+    tampered = [
+        *expected[:1],
+        dataclasses.replace(expected[1], chunk_content_hash="9" * 64),
+        expected[2],
+    ]
+    problems = corpus_problems(expected=expected, actual=tampered)
+    assert problems and "chunk projection mismatch" in problems[0]
+
+
+def test_preflight_reports_every_difference_it_found_rather_than_the_first() -> None:
+    expected = _sealed_corpus()
+    actual = [_fact(external_key="operator:scratch", ordinal=0)]
+    problems = corpus_problems(expected=expected, actual=actual)
+    assert len(problems) == 2
+    assert any(problem.startswith("unexpected eligible document(s)") for problem in problems)
+    assert any(
+        problem.startswith("expected document(s) missing") for problem in problems
+    )
+
+
+async def test_an_open_corpus_run_records_no_baseline_verdict() -> None:
+    """An ambient run still measures; it just cannot claim the baseline (5.4)."""
+    case = _case("c-one", relevant=("d1",))
+    rankings = {
+        (EvalMode.LEXICAL_ONLY.value, "c-one"): (_hit("d1", tenant_id="tenant-a"),),
+        (EvalMode.VECTOR_ONLY.value, "c-one"): (_hit("d1", tenant_id="tenant-a"),),
+        (EvalMode.HYBRID.value, "c-one"): (_hit("d1", tenant_id="tenant-a"),),
+    }
+    sealed_run = await run_suite(
+        cases=(case,), retrieve=_retriever(rankings), resolve=_resolver()
+    )
+    open_run = await run_suite(
+        cases=(case,), retrieve=_retriever(rankings), resolve=_resolver(), sealed=False
+    )
+
+    assert sealed_run.hybrid_gate == HybridGate.PASS.value
+    assert open_run.hybrid_gate == HybridGate.NOT_RUN.value
+    assert "--allow-ambient-corpus" in open_run.hybrid_gate_detail
+    # The measurement itself is still recorded: the corpus it was taken over is
+    # what makes a baseline, and that is precisely what this run did not fix.
+    assert [mode.mean_recall_at_k for mode in open_run.modes] == [
+        mode.mean_recall_at_k for mode in sealed_run.modes
+    ]

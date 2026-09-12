@@ -30,6 +30,7 @@ from hisiem_soc_copilot.application.commands.knowledge import (
     RetireKnowledgeOutcome,
 )
 from hisiem_soc_copilot.application.errors import (
+    EmbeddingProfileSwitchRequiresReindexError,
     KnowledgeEmbeddingProfileError,
     KnowledgeIngestionConflictError,
     NotFoundError,
@@ -45,10 +46,12 @@ from hisiem_soc_copilot.application.ports.embedding import (
     EmbeddingVector,
 )
 from hisiem_soc_copilot.application.ports.knowledge import (
+    CHUNK_GENERATION_INITIAL,
+    ChunkEmbeddingRecord,
     ChunkProjectionState,
     EmbeddingProfileRecord,
-    KnowledgeChunkRecord,
     KnowledgeChunkView,
+    KnowledgeContentChunkRecord,
     LexicalCandidate,
     VectorCandidate,
 )
@@ -71,6 +74,7 @@ from hisiem_soc_copilot.domain.knowledge.errors import (
 from hisiem_soc_copilot.domain.knowledge.events import KnowledgeEvent
 from hisiem_soc_copilot.domain.knowledge.value_objects import (
     ChunkerProfile,
+    compute_content_hash,
     normalize_and_hash,
     normalize_knowledge_content,
 )
@@ -289,32 +293,92 @@ class FakeKnowledgeDocumentRepository:
 class FakeKnowledgeChunkRepository:
     """In-memory KnowledgeChunkRepository double.
 
+    Content chunks (the immutable citation targets) and embeddings (the
+    rebuildable projection) live in SEPARATE maps, exactly as the two tables do,
+    so a handler that re-embeds in place -- or that deletes content it should have
+    kept -- is visible in the assertions instead of hidden behind one fused row.
+
     ``projection_state`` is DERIVED from the stored rows rather than scripted, so
     a handler that wrote chunks without a profile (or without a chunker version)
     fails the staleness comparison instead of passing a canned answer.
     """
 
     def __init__(self) -> None:
-        self.chunks: dict[UUID, KnowledgeChunkRecord] = {}
-        self.added_batches: list[tuple[KnowledgeChunkRecord, ...]] = []
-        self.deleted_versions: list[UUID] = []
+        self.chunks: dict[UUID, KnowledgeContentChunkRecord] = {}
+        self.embeddings: dict[tuple[UUID, UUID], ChunkEmbeddingRecord] = {}
+        self.added_batches: list[tuple[KnowledgeContentChunkRecord, ...]] = []
+        self.added_embedding_batches: list[tuple[ChunkEmbeddingRecord, ...]] = []
+        self.deleted_embeddings: list[tuple[UUID, int]] = []
+        self.deleted_profiles: list[tuple[UUID, UUID]] = []
 
-    def rows_for_version(self, document_version_id: UUID) -> tuple[KnowledgeChunkRecord, ...]:
+    # -- test-side helpers -------------------------------------------------
+
+    def generation_of(self, document_version_id: UUID) -> int:
+        generations = [
+            chunk.generation
+            for chunk in self.chunks.values()
+            if chunk.document_version_id == document_version_id
+        ]
+        return max(generations) if generations else CHUNK_GENERATION_INITIAL
+
+    def rows_for_version(
+        self,
+        document_version_id: UUID,
+        generation: int | None = None,
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        """The version's content chunks, in ordinal order (default: current gen)."""
+        if generation is None:
+            generation = self.generation_of(document_version_id)
         return tuple(
             sorted(
                 (
                     chunk
                     for chunk in self.chunks.values()
                     if chunk.document_version_id == document_version_id
+                    and chunk.generation == generation
                 ),
                 key=lambda chunk: chunk.ordinal,
             )
         )
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    def embeddings_for_version(
+        self, document_version_id: UUID
+    ) -> tuple[ChunkEmbeddingRecord, ...]:
+        chunk_ids = {
+            chunk.id
+            for chunk in self.chunks.values()
+            if chunk.document_version_id == document_version_id
+        }
+        return tuple(
+            embedding
+            for (chunk_id, _), embedding in self.embeddings.items()
+            if chunk_id in chunk_ids
+        )
+
+    def profiles_for(self, chunk: KnowledgeContentChunkRecord) -> tuple[UUID, ...]:
+        return tuple(
+            sorted(
+                embedding_profile_id
+                for (chunk_id, embedding_profile_id) in self.embeddings
+                if chunk_id == chunk.id
+            )
+        )
+
+    # -- KnowledgeChunkRepository -----------------------------------------
+
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         self.added_batches.append(tuple(chunks))
         for chunk in chunks:
             self.chunks[chunk.id] = chunk
+
+    async def add_embeddings(self, *, embeddings: Sequence[ChunkEmbeddingRecord]) -> None:
+        self.added_embedding_batches.append(tuple(embeddings))
+        for embedding in embeddings:
+            self.embeddings[
+                (embedding.content_chunk_id, embedding.embedding_profile_id)
+            ] = embedding
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return len(self.rows_for_version(document_version_id))
@@ -322,23 +386,60 @@ class FakeKnowledgeChunkRepository:
     async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
         rows = self.rows_for_version(document_version_id)
         if not rows:
-            return ChunkProjectionState(
-                embedding_profile_id=None, chunker_version=None, chunk_count=0
-            )
+            return ChunkProjectionState(None, None, 0)
+        per_profile: dict[UUID, int] = {}
+        for row in rows:
+            for profile_id in self.profiles_for(row):
+                per_profile[profile_id] = per_profile.get(profile_id, 0) + 1
+        # The ONE space that FULLY covers this generation, else None -- the same
+        # rule the SQL probe implements, so an ambiguous or partial projection
+        # reads as "not embedded" here too.
+        covering = [
+            profile_id for profile_id, count in per_profile.items() if count == len(rows)
+        ]
         return ChunkProjectionState(
-            embedding_profile_id=rows[0].embedding_profile_id,
+            embedding_profile_id=covering[0] if len(covering) == 1 else None,
             chunker_version=rows[0].chunker_version,
             chunk_count=len(rows),
+            generation=rows[0].generation,
+            embedding_count=sum(per_profile.values()),
         )
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
-        self.deleted_versions.append(document_version_id)
-        for chunk_id in [
+    async def list_content_chunks(
+        self, *, document_version_id: UUID, generation: int
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        return self.rows_for_version(document_version_id, generation)
+
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
+        """Delete ONE generation's EMBEDDING rows; content chunks are untouched."""
+        self.deleted_embeddings.append((document_version_id, generation))
+        chunk_ids = {
+            chunk.id for chunk in self.rows_for_version(document_version_id, generation)
+        }
+        removed = [key for key in self.embeddings if key[0] in chunk_ids]
+        for key in removed:
+            del self.embeddings[key]
+        return len(removed)
+
+    async def delete_embeddings_for_profile(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID
+    ) -> int:
+        self.deleted_profiles.append((document_version_id, embedding_profile_id))
+        chunk_ids = {
             chunk.id
             for chunk in self.chunks.values()
             if chunk.document_version_id == document_version_id
-        ]:
-            del self.chunks[chunk_id]
+        }
+        removed = [
+            key
+            for key in self.embeddings
+            if key[0] in chunk_ids and key[1] == embedding_profile_id
+        ]
+        for key in removed:
+            del self.embeddings[key]
+        return len(removed)
 
     async def lexical_candidates(
         self, *, tenant_id: str, search_terms: Sequence[str], limit: int
@@ -425,7 +526,8 @@ class _Snapshot:
 
     documents: dict[UUID, KnowledgeDocument]
     versions: dict[UUID, KnowledgeDocumentVersion]
-    chunks: dict[UUID, KnowledgeChunkRecord]
+    chunks: dict[UUID, KnowledgeContentChunkRecord]
+    embeddings: dict[tuple[UUID, UUID], ChunkEmbeddingRecord]
     profiles: list[EmbeddingProfileRecord]
     events: list[tuple[AppendableEvent, int]]
 
@@ -459,6 +561,7 @@ class FakeRuntime:
             documents=dict(self.documents.documents),
             versions=dict(self.documents.versions),
             chunks=dict(self.chunks.chunks),
+            embeddings=dict(self.chunks.embeddings),
             profiles=list(self.profiles.profiles),
             events=list(self.events.appended),
         )
@@ -467,6 +570,7 @@ class FakeRuntime:
         _fill(self.documents.documents, snapshot.documents)
         _fill(self.documents.versions, snapshot.versions)
         _fill(self.chunks.chunks, snapshot.chunks)
+        _fill(self.chunks.embeddings, snapshot.embeddings)
         _fill_list(self.profiles.profiles, snapshot.profiles)
         _fill_list(self.events.appended, snapshot.events)
 
@@ -656,27 +760,44 @@ def _seed_document(
     return document
 
 
+_SEEDED_CHUNK_CONTENT = "Adversaries may use brute force to obtain credentials."
+
+
 def _chunk_record(
     *,
     document: KnowledgeDocument,
     version: KnowledgeDocumentVersion,
-    profile_id: UUID,
     chunker_version: str = "structure-aware-v1",
-) -> KnowledgeChunkRecord:
-    return KnowledgeChunkRecord(
+) -> KnowledgeContentChunkRecord:
+    """An IMMUTABLE content chunk of ``version``, generation 1, ordinal 0."""
+    return KnowledgeContentChunkRecord(
         id=uuid4(),
         document_id=document.id,
         document_version_id=version.id,
+        generation=CHUNK_GENERATION_INITIAL,
         ordinal=0,
         heading_path="Brute force",
-        content="Adversaries may use brute force to obtain credentials.",
-        content_hash="0" * 64,
+        content=_SEEDED_CHUNK_CONTENT,
+        content_hash=compute_content_hash(_SEEDED_CHUNK_CONTENT),
         token_count=8,
         language="en",
+        chunker_version=chunker_version,
+        created_at=T0,
+    )
+
+
+def _embedding_record(
+    *,
+    chunk: KnowledgeContentChunkRecord,
+    profile_id: UUID,
+) -> ChunkEmbeddingRecord:
+    """The REBUILDABLE projection of ``chunk`` in one embedding space."""
+    return ChunkEmbeddingRecord(
+        id=uuid4(),
+        content_chunk_id=chunk.id,
         embedding_profile_id=profile_id,
         embedding=(0.5,) * DIMENSION,
-        created_at=T0,
-        chunker_version=chunker_version,
+        indexed_at=T0,
     )
 
 
@@ -770,9 +891,18 @@ async def test_chunks_are_indexed_in_the_embedding_space_that_was_activated() ->
     rows = runtime.chunks.rows_for_version(outcome.version.id)
     assert rows
     for chunk in rows:
-        assert chunk.embedding_profile_id == active.id
-        assert chunk.embedding == (0.5,) * DIMENSION
         assert chunk.language == "en"
+        assert chunk.generation == CHUNK_GENERATION_INITIAL
+    # The vectors live on the REBUILDABLE half, keyed by the content chunk they
+    # describe -- the content row itself carries no embedding and no profile.
+    embeddings = runtime.chunks.embeddings_for_version(outcome.version.id)
+    assert len(embeddings) == len(rows)
+    assert {embedding.content_chunk_id for embedding in embeddings} == {
+        chunk.id for chunk in rows
+    }
+    for embedding in embeddings:
+        assert embedding.embedding_profile_id == active.id
+        assert embedding.embedding == (0.5,) * DIMENSION
 
 
 # ---------------------------------------------------------------------------
@@ -963,8 +1093,16 @@ async def test_a_provider_failure_leaves_no_document_version_or_chunk_behind() -
 # ---------------------------------------------------------------------------
 
 
-def _seed_winner(runtime: FakeRuntime) -> tuple[KnowledgeDocument, KnowledgeDocumentVersion]:
-    """Store the document/version/chunk a concurrent writer just committed."""
+def _seed_winner(
+    runtime: FakeRuntime,
+    *,
+    profile_id: UUID | None = None,
+) -> tuple[KnowledgeDocument, KnowledgeDocumentVersion]:
+    """Store the document/version/chunk a concurrent writer just committed.
+
+    ``profile_id`` lets a test seed the corpus in an ALREADY-EXISTING embedding
+    space instead of registering a fresh one.
+    """
     normalized, content_hash = normalize_and_hash(CONTENT)
     document = _seed_document(runtime)
     version = KnowledgeDocumentVersion.create(
@@ -985,10 +1123,15 @@ def _seed_winner(runtime: FakeRuntime) -> tuple[KnowledgeDocument, KnowledgeDocu
     )
     document.clear_events()
     runtime.documents.versions[version.id] = version
-    profile = _profile(profile_id=uuid4())
-    runtime.profiles.profiles.append(profile)
-    record = _chunk_record(document=document, version=version, profile_id=profile.id)
+    if profile_id is None:
+        profile_id = uuid4()
+        runtime.profiles.profiles.append(_profile(profile_id=profile_id))
+    record = _chunk_record(document=document, version=version)
     runtime.chunks.chunks[record.id] = record
+    embedding = _embedding_record(chunk=record, profile_id=profile_id)
+    runtime.chunks.embeddings[(embedding.content_chunk_id, embedding.embedding_profile_id)] = (
+        embedding
+    )
     return document, version
 
 
@@ -1296,7 +1439,7 @@ async def test_reingesting_into_a_retired_document_never_silently_reactivates_it
 # ---------------------------------------------------------------------------
 
 
-async def test_a_different_active_profile_is_refused_unless_switching_is_allowed() -> None:
+async def test_a_different_active_profile_is_refused_before_any_write() -> None:
     runtime = FakeRuntime()
     other = _profile(profile_id=OTHER_PROFILE_ID, model_id="text-embedding-other")
     runtime.profiles.profiles.append(other)
@@ -1305,40 +1448,56 @@ async def test_a_different_active_profile_is_refused_unless_switching_is_allowed
     with pytest.raises(KnowledgeEmbeddingProfileError) as excinfo:
         await handler.ingest(_command())
 
-    assert "different embedding profile is already ACTIVE" in str(excinfo.value)
+    assert "the ACTIVE embedding profile is" in str(excinfo.value)
     assert await runtime.profiles.get_active() == other
     assert runtime.profiles.added == []
     assert runtime.profiles.retired == []
     assert runtime.documents.added == []
     assert runtime.chunks.added_batches == []
+    assert runtime.chunks.added_embedding_batches == []
     assert runtime.commits == 0
 
 
-async def test_switching_the_embedding_space_retires_the_previous_profile() -> None:
+async def test_allow_embedding_profile_switch_performs_no_partial_switch() -> None:
+    """Section 4.1: the flag is refused, and refusing leaves everything intact.
+
+    A different ACTIVE embedding space is a CORPUS-WIDE reindex, never a side
+    effect of one document's ingest. The old profile must still be the ACTIVE one
+    afterwards and the corpus already stored under it must still be
+    vector-retrievable -- which is exactly what a partial switch would destroy.
+    """
     runtime = FakeRuntime()
     other = _profile(profile_id=OTHER_PROFILE_ID, model_id="text-embedding-other")
     runtime.profiles.profiles.append(other)
+    # An existing corpus indexed in the OLD space.
+    document, version = _seed_winner(runtime, profile_id=OTHER_PROFILE_ID)
+    corpus_embeddings = runtime.chunks.embeddings_for_version(version.id)
+    assert corpus_embeddings and all(
+        embedding.embedding_profile_id == OTHER_PROFILE_ID
+        for embedding in corpus_embeddings
+    )
     handler = _handler(runtime=runtime, provider=_provider(runtime))
 
-    outcome = await handler.ingest(_command(allow_embedding_profile_switch=True))
+    with pytest.raises(EmbeddingProfileSwitchRequiresReindexError) as excinfo:
+        await handler.ingest(_command(allow_embedding_profile_switch=True))
 
-    assert runtime.profiles.retired == [T0]
-    previous = runtime.profiles.profiles[0]
-    assert previous.id == OTHER_PROFILE_ID
-    assert previous.status == "RETIRED"
-    assert previous.retired_at == T0
+    assert excinfo.value.code == "EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX"
+    # No partial switch: nothing retired, nothing added, no ACTIVE profile moved.
+    assert runtime.profiles.retired == []
+    assert runtime.profiles.added == []
     active = await runtime.profiles.get_active()
     assert active is not None
-    assert active.id != OTHER_PROFILE_ID
-    assert (active.provider, active.model_id, active.dimension) == (
-        PROVIDER,
-        MODEL_ID,
-        DIMENSION,
-    )
-    assert active.created_at == T0
-    assert sum(1 for profile in runtime.profiles.profiles if profile.status == "ACTIVE") == 1
-    for chunk in runtime.chunks.rows_for_version(outcome.version.id):
-        assert chunk.embedding_profile_id == active.id
+    assert active.id == OTHER_PROFILE_ID
+    assert sum(
+        1 for profile in runtime.profiles.profiles if profile.status == "ACTIVE"
+    ) == 1
+    # The old corpus is untouched and still addressable in its own space.
+    assert runtime.chunks.embeddings_for_version(version.id) == corpus_embeddings
+    assert runtime.chunks.added_batches == []
+    assert runtime.chunks.added_embedding_batches == []
+    assert runtime.documents.added == []
+    assert runtime.commits == 0
+    assert version.id == document.active_version_id
 
 
 async def test_a_retired_profile_for_the_same_identity_is_never_reactivated() -> None:
@@ -1355,11 +1514,26 @@ async def test_a_retired_profile_for_the_same_identity_is_never_reactivated() ->
     assert runtime.commits == 0
 
 
-async def test_a_stale_projection_is_rebuilt_without_touching_the_version_row() -> None:
+async def test_a_missing_projection_is_rebuilt_without_moving_a_citation() -> None:
+    """Section 3.2: a projection rebuild is invisible to every citation.
+
+    Only the EMBEDDING half is dropped -- the state a reindex, a lost vector
+    table, or a fresh embedding profile leaves behind. The content chunks keep
+    their ids, so a citation captured before the rebuild still names exactly the
+    same rows afterwards, and the immutable version row is never rewritten.
+    """
     runtime = FakeRuntime()
     handler = _handler(runtime=runtime, provider=_provider(runtime))
     first = await handler.ingest(_command())
-    runtime.chunks.chunks.clear()
+    active = await runtime.profiles.get_active()
+    assert active is not None
+    before = {
+        chunk.id: chunk.content_hash
+        for chunk in runtime.chunks.rows_for_version(first.version.id)
+    }
+    assert before
+    content_writes_before = len(runtime.chunks.added_batches)
+    runtime.chunks.embeddings.clear()
 
     second = await handler.ingest(_command())
 
@@ -1367,10 +1541,59 @@ async def test_a_stale_projection_is_rebuilt_without_touching_the_version_row() 
     assert second.projection_rebuilt is True
     assert second.chunk_count == 1
     assert second.version.id == first.version.id
-    assert runtime.chunks.deleted_versions == [first.version.id]
+    # Re-embedded IN PLACE: not one content chunk was added, removed or rewritten.
+    assert {
+        chunk.id: chunk.content_hash
+        for chunk in runtime.chunks.rows_for_version(first.version.id)
+    } == before
+    assert len(runtime.chunks.added_batches) == content_writes_before
+    assert runtime.chunks.deleted_profiles == [(first.version.id, active.id)]
+    assert len(runtime.chunks.embeddings_for_version(first.version.id)) == len(before)
     # Only the projection was regenerated; the immutable version row was not
     # rewritten by the second ingest.
     assert runtime.documents.version_writes == [first.version.id]
+
+
+async def test_a_rechunk_appends_a_generation_and_leaves_the_old_one_standing() -> None:
+    """Section 3.3: a chunker change must never delete historical content.
+
+    The second ingest runs a NEW chunker version. Replacing the version's chunks
+    would delete every citation target the first chunker produced, so instead the
+    new chunking is appended as generation 2. Normal retrieval moves on to the
+    newest generation; generation 1 stays exactly where it was.
+    """
+    runtime = FakeRuntime()
+    provider = _provider(runtime)
+    first = await _handler(runtime=runtime, provider=provider).ingest(_command())
+    generation_one = runtime.chunks.rows_for_version(first.version.id, 1)
+    assert [chunk.chunker_version for chunk in generation_one] == ["structure-aware-v1"]
+
+    rechunking = _handler(
+        runtime=runtime,
+        provider=provider,
+        chunker=StructureAwareChunker(
+            profile=ChunkerProfile(chunker_version="structure-aware-v2")
+        ),
+    )
+    assert rechunking.chunker_version == "structure-aware-v2"
+
+    second = await rechunking.ingest(_command())
+
+    assert second.version_created is False
+    assert second.projection_rebuilt is True
+    assert second.version.id == first.version.id
+    # Generation 1 is untouched: same rows, same ids, same hashes.
+    assert runtime.chunks.rows_for_version(first.version.id, 1) == generation_one
+    generation_two = runtime.chunks.rows_for_version(first.version.id, 2)
+    assert generation_two
+    assert {chunk.chunker_version for chunk in generation_two} == {"structure-aware-v2"}
+    assert runtime.chunks.generation_of(first.version.id) == 2
+    # Everything is still stored: nothing was deleted to make room.
+    assert len(runtime.chunks.chunks) == len(generation_one) + len(generation_two)
+    # The projection normal retrieval reads now describes generation 2.
+    state = await runtime.chunks.projection_state(document_version_id=first.version.id)
+    assert state.generation == 2
+    assert state.chunk_count == len(generation_two)
 
 
 # ---------------------------------------------------------------------------

@@ -37,9 +37,12 @@ class IngestKnowledgeDocument:
     language: str = "en"
     source_version: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    #: Explicit opt-in for changing the ACTIVE embedding space. Off by default
-    #: because switching it silently would make every chunk indexed under the
-    #: previous profile unreachable by retrieval; an operator has to say so.
+    #: Legacy opt-in for changing the ACTIVE embedding space. KEPT so an existing
+    #: caller is told WHY it is refused instead of failing on an unknown keyword,
+    #: but P3-A rejects it outright with
+    #: ``EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX``: a different ACTIVE
+    #: profile means a corpus-wide reindex, never a side effect of one document's
+    #: ingest (brief section 4.1). No value of this flag switches anything.
     allow_embedding_profile_switch: bool = False
     command_id: UUID = field(default_factory=uuid4)
 

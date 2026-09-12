@@ -18,6 +18,7 @@ from hisiem_soc_copilot.application.ports.knowledge import (
     KnowledgeQuery,
     LexicalCandidate,
     VectorCandidate,
+    stable_ranking_key,
 )
 from hisiem_soc_copilot.application.services.knowledge_retrieval import (
     MAX_CHUNKS_PER_DOCUMENT,
@@ -63,6 +64,11 @@ def _view(
     ordinal: int = 0,
     content: str = "T1110 brute force guidance",
     content_hash: str | None = None,
+    external_key: str = "curated:t1110",
+    document_version_number: int = 1,
+    chunk_generation: int = 1,
+    visibility: Visibility = Visibility.GLOBAL,
+    tenant_id: str | None = None,
 ) -> KnowledgeChunkView:
     return KnowledgeChunkView(
         chunk_id=chunk_id if chunk_id is not None else uuid4(),
@@ -77,8 +83,11 @@ def _view(
         language="en",
         source_version="2026.09",
         document_status="ACTIVE",
-        visibility=Visibility.GLOBAL,
-        tenant_id=None,
+        visibility=visibility,
+        tenant_id=tenant_id,
+        external_key=external_key,
+        document_version_number=document_version_number,
+        chunk_generation=chunk_generation,
     )
 
 
@@ -346,45 +355,103 @@ def test_rrf_rejects_a_non_positive_k() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fused_ties_break_on_document_id() -> None:
-    # Both candidates score 1/(k+1): rank 1 of one list each. Only the stable
-    # key decides, so the order must not depend on which list came first.
-    low_document = _view(chunk_id=uuid4(), document_id=DOC_LOW, ordinal=5)
-    high_document = _view(chunk_id=uuid4(), document_id=DOC_HIGH, ordinal=5)
-    assert str(DOC_LOW) < str(DOC_HIGH)
+def test_fused_ties_break_on_external_key_and_not_on_any_uuid() -> None:
+    """The tie-break is semantic business identity, never a surrogate (section 5.1).
 
-    forward = reciprocal_rank_fusion([_lexical(low_document)], [_vector(high_document)])
-    reverse = reciprocal_rank_fusion([_lexical(high_document)], [_vector(low_document)])
+    Both candidates score 1/(k+1): rank 1 of one list each, so only the stable key
+    decides. The keys are chosen so ``external_key`` points the OPPOSITE way from
+    the random ``chunk_id``/``document_id`` UUIDs -- a ranking that consulted any
+    UUID would come out reversed here, and would also differ between two fresh
+    databases.
+    """
+    low_key = _view(chunk_id=UUID(int=999), document_id=DOC_HIGH, external_key="alpha")
+    high_key = _view(chunk_id=UUID(int=1), document_id=DOC_LOW, external_key="beta")
+    assert str(low_key.chunk_id) > str(high_key.chunk_id)
+    assert str(low_key.document_id) > str(high_key.document_id)
+    assert stable_ranking_key(low_key) < stable_ranking_key(high_key)
 
-    assert forward == (low_document, high_document)
+    forward = reciprocal_rank_fusion([_lexical(low_key)], [_vector(high_key)])
+    reverse = reciprocal_rank_fusion([_lexical(high_key)], [_vector(low_key)])
+
+    assert forward == (low_key, high_key)
     assert reverse == forward
     for _ in range(5):
-        assert (
-            reciprocal_rank_fusion([_lexical(low_document)], [_vector(high_document)])
-            == forward
-        )
+        assert reciprocal_rank_fusion([_lexical(low_key)], [_vector(high_key)]) == forward
 
 
-def test_fused_ties_break_on_document_version_before_ordinal() -> None:
+def test_fused_ties_break_on_scope_before_external_key() -> None:
+    """A GLOBAL and a TENANT document may share an ``external_key``.
+
+    ``visibility`` precedes ``external_key`` in the key precisely so the two still
+    have a total order; without it the comparison would be ambiguous.
+    """
+    global_doc = _view(chunk_id=uuid4(), visibility=Visibility.GLOBAL, tenant_id=None)
+    tenant_doc = _view(
+        chunk_id=uuid4(), visibility=Visibility.TENANT, tenant_id="tenant-a"
+    )
+    assert global_doc.external_key == tenant_doc.external_key
+
+    fused = reciprocal_rank_fusion([_lexical(tenant_doc)], [_vector(global_doc)])
+
+    assert fused == (global_doc, tenant_doc)
+
+
+def test_fused_ties_break_on_version_number_before_ordinal() -> None:
+    """The version's ORDINAL (1, 2, ...), not its surrogate UUID, orders versions."""
     older_version = _view(
-        chunk_id=uuid4(), document_id=DOC_LOW, document_version_id=VERSION_ONE, ordinal=9
+        chunk_id=uuid4(),
+        document_id=DOC_LOW,
+        document_version_id=VERSION_TWO,
+        document_version_number=1,
+        ordinal=9,
     )
     newer_version = _view(
-        chunk_id=uuid4(), document_id=DOC_LOW, document_version_id=VERSION_TWO, ordinal=0
+        chunk_id=uuid4(),
+        document_id=DOC_LOW,
+        document_version_id=VERSION_ONE,
+        document_version_number=2,
+        ordinal=0,
     )
+    # The UUIDs run the other way, so a UUID ordering would invert this.
     assert str(VERSION_ONE) < str(VERSION_TWO)
 
-    fused = reciprocal_rank_fusion([_lexical(older_version)], [_vector(newer_version)])
+    fused = reciprocal_rank_fusion([_lexical(newer_version)], [_vector(older_version)])
 
     assert fused == (older_version, newer_version)
 
 
+def test_fused_ties_break_on_chunk_generation_before_ordinal() -> None:
+    """A rechunk appends generation N+1; the older generation still sorts first."""
+    first_generation = _view(
+        chunk_id=uuid4(), document_version_id=VERSION_ONE, chunk_generation=1, ordinal=4
+    )
+    second_generation = _view(
+        chunk_id=uuid4(), document_version_id=VERSION_ONE, chunk_generation=2, ordinal=0
+    )
+
+    fused = reciprocal_rank_fusion(
+        [_lexical(second_generation)], [_vector(first_generation)]
+    )
+
+    assert fused == (first_generation, second_generation)
+
+
 def test_fused_ties_break_on_ordinal_within_one_version() -> None:
     earlier = _view(
-        chunk_id=uuid4(), document_id=DOC_LOW, document_version_id=VERSION_ONE, ordinal=3
+        chunk_id=uuid4(),
+        document_id=DOC_LOW,
+        document_version_id=VERSION_ONE,
+        document_version_number=1,
+        chunk_generation=1,
+        ordinal=3,
     )
     later = _view(
-        chunk_id=uuid4(), document_id=DOC_LOW, document_version_id=VERSION_ONE, ordinal=7
+        chunk_id=uuid4(),
+        document_id=DOC_LOW,
+        document_version_id=VERSION_ONE,
+        document_version_number=1,
+        chunk_generation=1,
+        ordinal=7,
     )
 
     fused = reciprocal_rank_fusion([_lexical(later)], [_vector(earlier)])

@@ -32,6 +32,7 @@ from ...domain.knowledge.entities import require_valid_scope
 from ...domain.knowledge.enums import Visibility
 from ...domain.knowledge.value_objects import (
     CHUNKER_VERSION,
+    compute_content_hash,
     format_citation_id,
     parse_citation_id,
 )
@@ -54,6 +55,7 @@ from ..ports.knowledge import (
     LexicalCandidate,
     RetrievalProfile,
     VectorCandidate,
+    stable_ranking_key,
 )
 
 #: Reciprocal Rank Fusion constant (brief section 47). 60 is the value from the
@@ -249,9 +251,14 @@ def build_search_terms(query: KnowledgeQuery) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _stable_key(view: KnowledgeChunkView) -> tuple[str, str, int]:
-    """The documented tie-break order: document, version, ordinal (section 48)."""
-    return (str(view.document_id), str(view.document_version_id), view.ordinal)
+def _stable_key(view: KnowledgeChunkView) -> tuple[str, str, str, str, int, int, int]:
+    """The documented tie-break: the SEMANTIC identity, never a surrogate UUID.
+
+    Delegates to :func:`stable_ranking_key` so the Python fusion and the SQL
+    ``ORDER BY`` cannot drift apart -- the repository orders by the same seven
+    facts, in the same direction, with ``COLLATE "C"`` (brief sections 5.1/5.6).
+    """
+    return stable_ranking_key(view)
 
 
 def reciprocal_rank_fusion(
@@ -633,11 +640,21 @@ class KnowledgeCitationResolver:
                 resolved=False,
                 reason="SCOPE_MISMATCH",
             )
-        if not view.content_hash.startswith(parsed.content_hash_prefix):
+        # Integrity (brief section 3.4): the STORED hash is not evidence, it is a
+        # claim beside the content. Recompute the hash from the content actually
+        # read, and require BOTH that it equals the stored value and that the
+        # stored value carries the citation's prefix. A row whose text or whose
+        # hash was edited out-of-band therefore fails closed here instead of
+        # resolving to content the citation never named.
+        recomputed = compute_content_hash(view.content)
+        if (
+            recomputed != view.content_hash
+            or not view.content_hash.startswith(parsed.content_hash_prefix)
+        ):
             return CitationResolution(
                 citation_id=citation_id,
                 resolved=False,
-                reason="CONTENT_HASH_MISMATCH",
+                reason="CONTENT_INTEGRITY_MISMATCH",
             )
         return CitationResolution(
             citation_id=citation_id,

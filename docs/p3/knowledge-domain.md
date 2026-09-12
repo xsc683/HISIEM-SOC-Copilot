@@ -31,7 +31,7 @@ So knowledge is a peer context, not an entity inside Investigation:
 aggregate. A retrieval result reaches an investigation only as a citation
 attached to something else (in a future phase), never as an owned child.
 
-## 2. The two entities
+## 2. The entities
 
 ### `KnowledgeDocument` — the aggregate root
 
@@ -81,12 +81,84 @@ neither the bytes nor the row can change afterwards.
 | `metadata` | Free-form JSONB, stored and never interpreted |
 | `ingested_at`, `effective_at` | Timestamps |
 
-`__post_init__` re-normalizes `normalized_content` and rejects it if the result
-differs from the input. This is not paranoia: a version whose "normalized"
-content is not a fixed point of normalization carries a hash that a later
-re-normalization of the same bytes could not reproduce, which silently breaks
-provenance. Repairing the content at construction would be a *second* definition
-of the hash, so it is rejected instead.
+`__post_init__` enforces the invariant that makes `content_hash` mean anything,
+and it enforces it on **every** construction path — `create()`, a mapper load, and
+a test literal alike:
+
+```python
+compute_content_hash(normalized_content) == content_hash   # else InvalidKnowledgeVersionError
+```
+
+Two failure modes are rejected rather than repaired, and repairing either would
+be a *second* definition of the hash:
+
+1. `normalized_content` is not a fixed point of `normalize_knowledge_content`.
+   A version whose "normalized" content re-normalizes to something else carries a
+   hash that a later re-normalization of the same bytes could not reproduce.
+2. `content_hash` is not the hash of the content stored beside it. A row whose
+   hash and body disagree describes neither, so provenance is already broken
+   before anyone reads it.
+
+Both checks go through the one domain hash function. There is no second SHA-256
+in the mapper, the repository, or the migration.
+
+### `KnowledgeContentChunk` — immutable content identity
+
+The citation **target**. Written once and never rewritten.
+
+| Field | Notes |
+|---|---|
+| `id`, `document_id`, `document_version_id` | UUIDs |
+| `generation` | ≥ 1. A rechunk of the same version is a **new** generation; the old one is left intact |
+| `ordinal` | ≥ 0, unique within `(document_version_id, generation)` |
+| `heading_path` | The section path the chunk came from |
+| `content` | The chunk text. **immutable** |
+| `content_hash` | Lowercase SHA-256 hex, derived from `content` by `create()` |
+| `token_count`, `language` | Bounds and metadata |
+| `chunker_version` | Which chunker produced it |
+| `created_at` | |
+
+Why it is a separate entity from the embedding row is the whole point:
+
+- Content identity is written once and never rewritten, so a citation into it
+  stays resolvable across re-embedding, retrieval-projection rebuilds, process
+  restarts, document retirement, the activation of a later document version, and
+  a rechunk.
+- The embedding row is a **rebuildable projection** of it. Dropping and recreating
+  every embedding row breaks no citation, because no citation names one.
+
+The same content/content_hash self-validation the version entity enforces is
+enforced here too, at the entity boundary and through the **same** shared helper:
+`create()` derives the hash from the content instead of accepting one, and
+`__post_init__` re-checks the pair on every load. A chunk whose stored hash is not
+the hash of its stored text is rejected, never repaired.
+
+### `KnowledgeChunkEmbedding` — the rebuildable projection
+
+`(content_chunk_id, embedding_profile_id, embedding, indexed_at)`, unique on
+`(content_chunk_id, embedding_profile_id)`.
+
+It carries **no content and no hash**. That absence is the design rather than an
+omission: nothing can be cited *through* this table, so rebuilding it is a purely
+operational act. It is the only knowledge table expected to be dropped and
+recreated.
+
+### `AttackRelease` — the pinned release and its authority
+
+| Field | Notes |
+|---|---|
+| `id`, `framework`, `source_release` | Unique on `(framework, source_release)` |
+| `content_fingerprint` | SHA-256 over the release's canonical technique collection. `NULL` only for a release the migration adopted from rows that predate fingerprinting |
+| `status` | `ACTIVE` \| `INACTIVE`. A **per-framework partial unique index** makes "at most one ACTIVE release per framework" a database fact |
+| `technique_count`, `created_at`, `activated_at` | |
+
+Authority lives **here**, at release granularity — not on the technique rows.
+"Which release is authoritative for this framework" is one fact about one release;
+modelling it per technique is what previously allowed two releases to be
+authoritative at once. `attack_technique` remains the pinned technique *snapshot*
+— one row per technique — and each row references its release by
+`(framework, source_release)`. See [security-boundary.md](security-boundary.md)
+§11 for the immutability rule and its fingerprint.
 
 ## 3. Normalization and hashing
 
@@ -173,6 +245,14 @@ Chunk ordinal and content hash are deterministic: the same normalized content
 plus the same profile yields the same count, the same ordinals, and the same
 per-chunk hashes, independent of file path and line endings.
 
+A chunker change produces a **new generation** for the same
+`document_version_id` rather than a rewrite. `CHUNK_GENERATION_INITIAL = 1`;
+normal retrieval selects only the highest generation present for a version, and
+the older generation is left on disk untouched — which is what keeps a citation
+captured before the rechunk resolvable. **No P3-A path deletes a historical
+generation.** There is deliberately no "rechunk destructively" operation to
+provide one.
+
 ## 7. Events
 
 Three append-only audit facts, recorded inside the same transaction as the rows:
@@ -198,6 +278,7 @@ document bodies.
 | `InvalidKnowledgeDocumentError` | `INVALID_KNOWLEDGE_DOCUMENT` |
 | `InvalidKnowledgeScopeError` | `INVALID_KNOWLEDGE_SCOPE` |
 | `InvalidKnowledgeVersionError` | `INVALID_KNOWLEDGE_VERSION` |
+| `InvalidKnowledgeChunkError` | `INVALID_CONTENT_CHUNK` |
 | `KnowledgeDocumentStateError` | *(from `StateTransitionError`)* |
 | `InvalidMitreBundleError` | `INVALID_MITRE_BUNDLE` |
 | `InvalidContentHashError` | `INVALID_CONTENT_HASH` |
@@ -222,9 +303,13 @@ in `infrastructure/persistence/repositories/knowledge.py`.
 
 Restating the invariant because it is the thing most likely to erode:
 
-- `KnowledgeDocument` is **versioned knowledge truth**.
-- `KnowledgeChunk` is a **rebuildable retrieval projection**.
+- `KnowledgeDocumentVersion` is **versioned knowledge truth**.
+- `KnowledgeContentChunk` is **immutable content identity** — the citation target.
+- `KnowledgeChunkEmbedding` is a **rebuildable retrieval projection**.
 - An embedding is a **rebuildable index**.
+- An `AttackRelease` is the **authoritative pinned snapshot** of an external
+  corpus, and its authority extends no further than "this is the release the
+  canonical rows came from".
 - A retrieval score is a **ranking signal**.
 - A citation is a **validated reference**.
 

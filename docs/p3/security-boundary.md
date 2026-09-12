@@ -10,9 +10,11 @@ Knowledge is **reference material**, and reference material carries no authority
 
 | Artifact | What it is | What it is *not* |
 |---|---|---|
-| `KnowledgeDocument` | Versioned knowledge truth | An authority |
-| `KnowledgeChunk` | A rebuildable retrieval projection | Domain truth |
+| `KnowledgeDocumentVersion` | Versioned knowledge truth | An authority |
+| `KnowledgeContentChunk` | Immutable content identity — the citation target | Domain truth |
+| `KnowledgeChunkEmbedding` | A rebuildable retrieval projection | Domain truth |
 | An embedding | A rebuildable index | A judgement |
+| An `AttackRelease` | The authoritative pinned snapshot of an external corpus | A policy |
 | A retrieval score | A ranking signal | A verdict |
 | A citation | A validated reference | A grant |
 
@@ -50,6 +52,16 @@ refactor that filters in Python instead of in SQL fails the test.
 `GLOBAL ⟺ tenant_id IS NULL` and `TENANT ⟺ tenant_id IS NOT NULL` are a database
 `CHECK` constraint (`ck_knowledge_document_knowledge_document_scope_coherent`),
 so an incoherent scope is **unrepresentable**, not merely discouraged.
+
+Citation resolution is scoped the same way and re-validated **inside the
+resolver**, not only inside the repository. A citation is a handle a caller can
+hold long after the retrieval that produced it — and, because a citation is a
+durable string, long after the caller's access changed — so the scope cannot be
+allowed to depend on the handle having been obtained legitimately. Another
+tenant's chunk resolves to `SCOPE_MISMATCH`; it never resolves to content.
+
+The scope is re-checked even though the repository query is already tenant-scoped.
+A resolver must not depend on any single layer being right about visibility.
 
 Visibility is a **scope, not a permission**. There is deliberately no
 `PUBLIC`/`PRIVATE`/`ORG`/`GROUP`/`USER`/`CONFIDENTIAL` enum value: those would be
@@ -154,6 +166,34 @@ and no chunk rows exist. The embedding call happens **outside** the mutation
 transaction, and the short transaction that follows re-checks for a concurrent
 winner.
 
+### The `ACTIVE` profile cannot be switched by a single document's ingest
+
+When an `ACTIVE` profile exists and the configured provider's descriptor identity
+differs from it, **any** ordinary document ingest fails closed with
+`EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX` — including one that passes
+`allow_embedding_profile_switch=True`. The flag is retained only so an existing
+caller receives that diagnosis instead of an unrecognised-argument error, and
+`--allow-embedding-profile-switch` is documented as legacy and always refused.
+
+There is no partial switch in P3-A. Letting one document's ingest retire the old
+profile and create a new `ACTIVE` one would leave the corpus half-embedded in two
+incomparable spaces while retrieval cheerfully compared distances across them —
+the precise failure the one-`ACTIVE`-profile model exists to prevent.
+
+After a refusal:
+
+- the old `ACTIVE` profile is **still** the `ACTIVE` profile;
+- the existing corpus is still vector-retrievable;
+- no second profile row exists, so `uq_embedding_profile_single_active` is intact;
+- no embedding-projection row was rewritten.
+
+The corpus-wide flow that *would* be correct — stage a new profile, run a full
+reindex, validate completeness, activate atomically, retire the old profile — is
+documented for a future phase and deliberately **not implemented** here. A
+`STAGING` status was considered and not added, on the grounds that a status
+production retrieval must never use is a status that will eventually be used by
+accident.
+
 ## 7. The model cannot reach any of this (P3-B is NOT YET ACTIVE)
 
 The ToolRegistry's model-selectable surface is **exactly**:
@@ -213,7 +253,82 @@ holding the artifact can recompute it. A run over the deterministic test fixture
 is labelled `PLUMBING_ONLY` — in the artifact's filename as well as inside the
 JSON — so it can never be quoted as a semantic quality claim.
 
-## 10. Where each claim is tested
+## 10. ATT&CK release integrity
+
+ATT&CK knowledge is imported from local, operator-supplied STIX 2.1 JSON. Two
+rules make the imported corpus an *authority* rather than whatever the last import
+happened to write.
+
+### 10.1 A pinned release is immutable
+
+A release name is an immutability claim: "v14.1" must mean the same technique
+collection forever, or a citation, a document version, and a canonical row can all
+describe different facts while claiming the same release. The
+**release fingerprint** is what makes that checkable.
+
+```python
+FINGERPRINT_SCHEMA = "attack-release-fingerprint/v1"
+
+release_fingerprint(framework, source_release, techniques) -> "<64 hex>"
+```
+
+- It is a SHA-256 over the canonical JSON of the release's technique collection,
+  sorted by `(technique_id, source_stix_id)`.
+- Each technique is reduced to the fields `attack_technique` actually stores —
+  `technique_id`, `source_stix_id`, `name`, `description`, `tactics`,
+  `platforms`, and the technique's own content hash — with `tactics`/`platforms`
+  sorted and deduped, because those are unordered ATT&CK attributes.
+- The result is therefore **independent of input JSON object order** and of the
+  order of the STIX objects in the bundle, and it is re-derivable from the
+  database alone.
+
+The consequences are the contract:
+
+| Situation | Behaviour |
+|---|---|
+| First import of a release | The fingerprint is persisted on `attack_release` |
+| Same release, same fingerprint | Idempotent: the import converges, nothing is rewritten |
+| Same release, **different** fingerprint | Fail closed with `ATTACK_RELEASE_CONTENT_CONFLICT`, detected **before any mutation** |
+| Release adopted from pre-fingerprint rows | `content_fingerprint IS NULL`; the first import that pins it compares against the rows actually stored, using the same one function |
+
+A refused import leaves **no** canonical `attack_technique` row, no
+`KnowledgeDocument`, no `KnowledgeDocumentVersion`, no change to the authoritative
+release, and no embedding-projection row behind. The check runs first, so "nothing
+was changed" is true rather than reconstructed afterwards.
+
+The knowledge document produced by an import is a **retrieval projection of the
+canonical release**, not an independent source of truth: the canonical row hash
+and the projected document version content come from the same canonical function,
+so they cannot drift.
+
+### 10.2 Exactly one release is authoritative per framework
+
+Authority lives on the **release** row (`attack_release.status`), not on the
+technique rows, because "which release is authoritative for this framework" is one
+fact about one release. It is enforced by a per-framework partial unique index, so
+a second `ACTIVE` release for one framework fails at `COMMIT` rather than
+silently producing two authorities — application code cannot survive two
+concurrent activations, and a database constraint can.
+
+Activating a release flips this release's rows to `active = true` and every other
+release **of the same framework** to `active = false`, in one transaction. A
+release that is never activated creates only `INACTIVE` rows; it never displaces
+the current authority.
+
+When the pre-existing data is genuinely ambiguous — more than one release of a
+framework already claiming authority — the migration and `knowledge doctor`
+report `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` rather than guessing. Guessing would
+silently choose which canonical knowledge is authoritative, and that is an
+operator's decision, not a migration's.
+
+### 10.3 No network, no URL
+
+The import port reads a **local file path** and has no URL or network capability.
+There is no runtime fetch of any ATT&CK bundle, so the corpus cannot change under
+an evaluation, and an air-gapped deployment is the supported configuration rather
+than a degraded one.
+
+## 11. Where each claim is tested
 
 Every claim above is pinned by an executable test. The mapping is kept here so a
 reviewer can go from a sentence in this document to the thing that would fail if
@@ -230,6 +345,9 @@ the sentence stopped being true.
 | Section 5 — bounds are rejections, never truncations | `tests/unit/knowledge/test_security_boundary.py`, `tests/unit/knowledge/test_chunker.py`, `tests/unit/knowledge/test_ingestion_handler.py` |
 | Section 6 — embedding validation fails closed | `tests/unit/knowledge/test_security_boundary.py`, `tests/unit/knowledge/test_embedding_providers.py` |
 | Section 7 — P3-B tools are catalogued but not selectable | `tests/architecture/test_knowledge_boundary.py` |
+| Section 10.1 — a pinned release is immutable; a conflicting re-import fails closed | `tests/unit/knowledge/test_attack_import.py` |
+| Section 10.2 — exactly one authoritative release per framework | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
+| Section 10.3 — the import port has no network capability | `tests/architecture/test_knowledge_boundary.py` |
 | Section 8 — secrets never reach the surface | `tests/unit/knowledge/test_knowledge_cli.py`, `tests/unit/knowledge/test_diagnostics.py` |
 | Section 9 — no LLM judge; the artifact is recomputable and labelled | `tests/unit/evaluation/knowledge/test_evaluation_knowledge.py` |
 | Scope rules, normalization, hashing, lifecycle | `tests/unit/knowledge/test_domain_knowledge.py` |
@@ -244,7 +362,10 @@ the sentence stopped being true.
 | `doctor` readiness verdicts and URL redaction | `tests/unit/knowledge/test_diagnostics.py` |
 | Read-scoped connections are released, not garbage-collected | `tests/unit/knowledge/test_container_read_scope.py` |
 | The evaluation driver is re-runnable against a live corpus | `tests/unit/knowledge/test_evaluation_driver.py` |
-| Real-database constraints, indexes, and migration cycle | `tests/integration/persistence/test_knowledge_persistence.py` |
+| Section 2 — a citation survives reindexing, rechunking, retirement, and later versions; cross-tenant and tampered content fail closed | `tests/unit/knowledge/test_citation_resolver.py`, `tests/unit/knowledge/test_retrieval_ranking.py` |
+| Section 6 — the `ACTIVE` embedding profile cannot be switched by an ingest | `tests/unit/knowledge/test_ingestion_handler.py` |
+| Sealed corpus precondition, corpus fingerprint, and the ambient escape hatch | `tests/unit/evaluation/knowledge/test_evaluation_knowledge.py`, `tests/unit/knowledge/test_evaluation_driver.py` |
+| Real-database constraints, indexes, and migration cycle | `tests/integration/persistence/test_knowledge_persistence.py`, `tests/integration/migrations/test_migration_round_trip.py` |
 
 The security-boundary claims are additionally asserted against a **real
 PostgreSQL** by `tests/integration/persistence/test_knowledge_persistence.py`,

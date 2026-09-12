@@ -21,6 +21,7 @@ from ...application.ports.durable import (
     ToolInvocationStore,
 )
 from ...application.ports.knowledge import (
+    AttackReleaseRepository,
     AttackTechniqueRepository,
     EmbeddingProfileRepository,
     KnowledgeChunkRepository,
@@ -57,6 +58,7 @@ from .repositories.durable import (
 )
 from .repositories.investigation import SqlAlchemyInvestigationRepository
 from .repositories.knowledge import (
+    SqlAlchemyAttackReleaseRepository,
     SqlAlchemyAttackTechniqueRepository,
     SqlAlchemyEmbeddingProfileRepository,
     SqlAlchemyKnowledgeChunkRepository,
@@ -102,10 +104,13 @@ _KNOWLEDGE_UNIQUE_CONSTRAINTS = (
     "uq_knowledge_document_tenant_key",
     "uq_knowledge_document_version_number",
     "uq_knowledge_document_version_content_hash",
-    "uq_knowledge_chunk_version_ordinal",
+    "uq_knowledge_content_chunk_generation_ordinal",
+    "uq_knowledge_chunk_embedding_content_profile",
     "uq_embedding_profile_identity",
     "uq_embedding_profile_single_active",
     "uq_attack_technique_release",
+    "uq_attack_release_framework_source_release",
+    "uq_attack_release_single_active",
 )
 
 
@@ -170,6 +175,9 @@ class SqlAlchemyUnitOfWork:
         )
         self.embedding_profiles: EmbeddingProfileRepository = (
             SqlAlchemyEmbeddingProfileRepository(self._session)
+        )
+        self.attack_releases: AttackReleaseRepository = (
+            SqlAlchemyAttackReleaseRepository(self._session)
         )
         self.attack_techniques: AttackTechniqueRepository = (
             SqlAlchemyAttackTechniqueRepository(self._session)

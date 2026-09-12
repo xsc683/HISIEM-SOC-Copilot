@@ -13,6 +13,12 @@ no-op / new version / projection rebuild, persist the version and its chunks, an
 move the active pointer. Version, chunks, and pointer therefore converge
 together or not at all.
 
+Rebuilding a projection NEVER deletes content. The immutable content chunks (the
+rows a citation names) and the rebuildable embedding rows are separate tables, so
+a re-embed keeps the chunk ids and a rechunk appends a new generation beside the
+old one (brief section 3). Moving the corpus to a different embedding space is
+refused outright here -- that is a corpus-wide reindex, not an ingest (section 4).
+
 Concurrency (section 28) is resolved by the DATABASE, not by hoping: the unique
 constraints on ``(document_id, version)`` and ``(document_id, content_hash)`` are
 the arbiter. A loser of the race does not leak an ``IntegrityError``; the
@@ -40,7 +46,10 @@ from ...domain.knowledge.errors import (
     KnowledgeBoundsExceededError,
     KnowledgeDocumentStateError,
 )
-from ...domain.knowledge.value_objects import normalize_and_hash
+from ...domain.knowledge.value_objects import (
+    CHUNK_GENERATION_INITIAL,
+    normalize_and_hash,
+)
 from ..commands.knowledge import (
     IngestKnowledgeDocument,
     IngestKnowledgeOutcome,
@@ -48,6 +57,7 @@ from ..commands.knowledge import (
     RetireKnowledgeOutcome,
 )
 from ..errors import (
+    EmbeddingProfileSwitchRequiresReindexError,
     KnowledgeEmbeddingProfileError,
     KnowledgeIngestionConflictError,
     NotFoundError,
@@ -55,7 +65,11 @@ from ..errors import (
 from ..ports.chunking import ChunkingPort, DocumentChunk
 from ..ports.clock import ClockPort
 from ..ports.embedding import EmbeddingBatch, EmbeddingProvider
-from ..ports.knowledge import EmbeddingProfileRecord, KnowledgeChunkRecord
+from ..ports.knowledge import (
+    ChunkEmbeddingRecord,
+    EmbeddingProfileRecord,
+    KnowledgeContentChunkRecord,
+)
 from ..ports.unit_of_work import UnitOfWork
 
 #: How many times a losing racer re-reads and retries before reporting a
@@ -132,6 +146,21 @@ class KnowledgeIngestionHandler:
                 "ingesting a document requires an embedding provider; configure "
                 "EMBEDDING_PROVIDER, EMBEDDING_BASE_URL, EMBEDDING_MODEL and "
                 "EMBEDDING_DIMENSION before ingesting knowledge"
+            )
+        if command.allow_embedding_profile_switch:
+            # The flag is kept so an existing caller gets a DIAGNOSIS instead of an
+            # unexpected keyword error, but it no longer enables anything: moving
+            # the corpus to another embedding space is a corpus-wide reindex, and
+            # P3-A deliberately has no per-document path that starts one (section
+            # 4.1). Rejecting it before any read is what makes "no partial switch"
+            # true even for a caller that asked for one.
+            raise EmbeddingProfileSwitchRequiresReindexError(
+                "allow_embedding_profile_switch is not available: changing the "
+                "ACTIVE embedding space requires a whole-corpus reindex "
+                "(stage -> reindex every document -> validate completeness -> "
+                "activate atomically), which P3-A does not implement. Ingest "
+                "without the flag in the current embedding space, or run a "
+                "corpus-wide reindex out of band."
             )
         self._require_bounds(command.content)
         normalized, content_hash = normalize_and_hash(command.content)
@@ -214,7 +243,7 @@ class KnowledgeIngestionHandler:
         chunks: Sequence[DocumentChunk],
         batch: EmbeddingBatch,
     ) -> IngestKnowledgeOutcome:
-        profile = await self._resolve_embedding_profile(uow, command, batch)
+        profile = await self._resolve_embedding_profile(uow, batch)
 
         document = await uow.knowledge_documents.find_by_external_key(
             tenant_id=command.tenant_id,
@@ -273,13 +302,20 @@ class KnowledgeIngestionHandler:
             ingested_at=self._clock.utc_now(),
         )
         await uow.knowledge_documents.add_version(version=version)
-        await uow.knowledge_chunks.add_many(
-            chunks=self._records(
-                document=document,
-                version=version,
-                chunks=chunks,
-                batch=batch,
-                profile=profile,
+        # Content identity and the vector projection are written as two sets of
+        # rows in ONE transaction: the immutable chunks that citations name, and
+        # the rebuildable embeddings that retrieval compares. A first chunking of a
+        # version is generation 1, and nothing in P3-A ever rewrites it (section 3.3).
+        content_chunks = self._content_chunk_records(
+            document=document,
+            version=version,
+            chunks=chunks,
+            generation=CHUNK_GENERATION_INITIAL,
+        )
+        await uow.knowledge_chunks.add_content_chunks(chunks=content_chunks)
+        await uow.knowledge_chunks.add_embeddings(
+            embeddings=self._embedding_records(
+                content_chunks=content_chunks, batch=batch, profile=profile
             )
         )
         document.activate_version(
@@ -314,14 +350,27 @@ class KnowledgeIngestionHandler:
         """Handle content that is already versioned.
 
         The version row is IMMUTABLE, so the only thing that can legitimately
-        change is the rebuildable projection. That happens when the ACTIVE
-        embedding space or the chunker version moved on, and it is the reason
-        ``chunker_version`` is persisted per chunk (section 22): without it a
-        re-index would be indistinguishable from a fresh index.
+        change is the retrieval projection -- and the projection has two halves
+        that go stale independently, which is precisely why they are two tables:
+
+        * the CHUNKING (content chunks), which is generation-scoped and
+          append-only. A changed ``chunker_version`` adds generation N+1 and
+          leaves N exactly where it is, because deleting N would delete the rows
+          historical citations resolve against (section 3.3). ``chunker_version``
+          is persisted per chunk (section 22) so that a re-index is
+          distinguishable from a fresh index.
+        * the EMBEDDING space (embedding rows), which is freely rebuildable. A
+          missing or non-ACTIVE projection re-embeds the EXISTING content chunks
+          in place -- same ids, same content, so not one citation moves.
 
         A matching version that is NOT the active one is left completely alone --
         it is history, and re-ingesting old content must never roll the active
         pointer backwards.
+
+        Idempotence follows from the three-way split: whatever state the version
+        is in, re-running the identical ingest either returns the no-op outcome
+        (projection matches) or converges to a state whose projection matches, and
+        the caller can only distinguish them by ``projection_rebuilt``.
         """
         if version.id != document.active_version_id:
             return IngestKnowledgeOutcome(
@@ -338,12 +387,11 @@ class KnowledgeIngestionHandler:
         state = await uow.knowledge_chunks.projection_state(
             document_version_id=version.id
         )
-        stale = (
-            state.is_empty
-            or state.embedding_profile_id != profile.id
-            or state.chunker_version != self._chunker.chunker_version
-        )
-        if not stale:
+        if (
+            state.is_embedded
+            and state.embedding_profile_id == profile.id
+            and state.chunker_version == self._chunker.chunker_version
+        ):
             return IngestKnowledgeOutcome(
                 document=document,
                 version=version,
@@ -353,25 +401,58 @@ class KnowledgeIngestionHandler:
                 projection_rebuilt=False,
             )
 
-        # The projection is stale. Rebuild it wholesale rather than patching: a
-        # partial re-index would mix two chunkers or two vector spaces inside one
-        # version, which is exactly the state the ACTIVE-profile rule exists to
-        # make impossible (section 16).
-        await uow.knowledge_chunks.delete_for_version(document_version_id=version.id)
-        await uow.knowledge_chunks.add_many(
-            chunks=self._records(
-                document=document,
-                version=version,
-                chunks=chunks,
-                batch=batch,
-                profile=profile,
+        if not state.is_empty and state.chunker_version == self._chunker.chunker_version:
+            stored = await uow.knowledge_chunks.list_content_chunks(
+                document_version_id=version.id, generation=state.generation
+            )
+            if self._same_chunking(stored, chunks):
+                # Only the VECTOR half is stale. Re-embed the immutable chunks in
+                # place rather than re-chunking them: new chunk rows would move
+                # every citation target of this version for no reason at all, and a
+                # citation has to survive a reindex (section 3.2).
+                await uow.knowledge_chunks.delete_embeddings_for_profile(
+                    document_version_id=version.id, embedding_profile_id=profile.id
+                )
+                await uow.knowledge_chunks.add_embeddings(
+                    embeddings=self._embedding_records(
+                        content_chunks=stored, batch=batch, profile=profile
+                    )
+                )
+                await uow.commit()
+                return IngestKnowledgeOutcome(
+                    document=document,
+                    version=version,
+                    chunk_count=len(stored),
+                    document_created=document_created,
+                    version_created=False,
+                    projection_rebuilt=True,
+                )
+
+        # The CHUNKING differs (or there is none yet). Append a new generation
+        # rather than replacing the old one, so the previous generation's rows --
+        # and every citation into them -- stay resolvable while normal retrieval
+        # moves on to the newest generation (section 3.3). Nothing here deletes a
+        # content chunk, and that is the point.
+        generation = (
+            CHUNK_GENERATION_INITIAL if state.is_empty else state.generation + 1
+        )
+        content_chunks = self._content_chunk_records(
+            document=document,
+            version=version,
+            chunks=chunks,
+            generation=generation,
+        )
+        await uow.knowledge_chunks.add_content_chunks(chunks=content_chunks)
+        await uow.knowledge_chunks.add_embeddings(
+            embeddings=self._embedding_records(
+                content_chunks=content_chunks, batch=batch, profile=profile
             )
         )
         await uow.commit()
         return IngestKnowledgeOutcome(
             document=document,
             version=version,
-            chunk_count=len(chunks),
+            chunk_count=len(content_chunks),
             document_created=document_created,
             version_created=False,
             projection_rebuilt=True,
@@ -383,7 +464,6 @@ class KnowledgeIngestionHandler:
     async def _resolve_embedding_profile(
         self,
         uow: UnitOfWork,
-        command: IngestKnowledgeDocument,
         batch: EmbeddingBatch,
     ) -> EmbeddingProfileRecord:
         """Resolve (or create) the ACTIVE embedding space for this ingestion.
@@ -411,22 +491,28 @@ class KnowledgeIngestionHandler:
             )
 
         active = await uow.embedding_profiles.get_active()
-        if active is not None and not command.allow_embedding_profile_switch:
-            # Refusing is the safe default: switching spaces retires the old
-            # profile, and every chunk indexed under it stops being returned by
-            # retrieval until it is re-ingested. That is an operator decision, not
-            # a side effect of uploading a file (sections 16/18).
-            raise KnowledgeEmbeddingProfileError(
-                "a different embedding profile is already ACTIVE; ingesting in a "
-                "new embedding space would make every chunk indexed under the "
-                "current profile unreachable by retrieval. Re-run with "
-                "allow_embedding_profile_switch to retire the current profile and "
-                "index new content in this space (existing content must then be "
-                "re-ingested to become retrievable again)"
+        if active is not None:
+            # A different space with an ACTIVE profile already in place: refuse, and
+            # refuse BEFORE any write. Retiring the old profile here -- which is
+            # what a switch would amount to -- is a corpus-wide act, because every
+            # vector stored under it was produced by a different model and is not
+            # comparable with the new one. One document's ingest must never decide
+            # that (section 4.1). The ACTIVE profile is left exactly as it was, so
+            # the existing corpus stays vector-retrievable.
+            raise EmbeddingProfileSwitchRequiresReindexError(
+                "the ACTIVE embedding profile is "
+                f"{active.provider}:{active.model_id} (dimension {active.dimension}) "
+                "but this ingestion is configured for "
+                f"{descriptor.provider}:{descriptor.model_id} "
+                f"(dimension {descriptor.dimension}); refusing to move the corpus "
+                "to a different embedding space from a single document ingest. "
+                "Every vector already stored belongs to the current profile and is "
+                "not comparable with the new one, so the switch is a corpus-wide "
+                "reindex: stage the new profile, reindex the whole corpus, validate "
+                "completeness, then activate atomically. No partial switch is "
+                "performed and the current profile stays ACTIVE."
             )
         now = self._clock.utc_now()
-        if active is not None:
-            await uow.embedding_profiles.retire_active(retired_at=now)
         profile = EmbeddingProfileRecord(
             id=uuid4(),
             provider=descriptor.provider,
@@ -503,41 +589,101 @@ class KnowledgeIngestionHandler:
                 f"{chunk_count} chunks"
             )
 
-    def _records(
+    def _content_chunk_records(
         self,
         *,
         document: KnowledgeDocument,
         version: KnowledgeDocumentVersion,
         chunks: Sequence[DocumentChunk],
+        generation: int,
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        """Build the IMMUTABLE half: one row per chunk, never rewritten later.
+
+        Each row carries the chunker that produced it and the generation it belongs
+        to, which is what lets a later chunker append a new generation instead of
+        destroying this one. ``content_hash`` comes from the chunker, which derives
+        it with the one domain hash function -- and the persistence mapper
+        recomputes it through the domain entity on the way in, so a hash that does
+        not describe its content can never be stored (section 8).
+        """
+        now = self._clock.utc_now()
+        return tuple(
+            KnowledgeContentChunkRecord(
+                id=uuid4(),
+                document_id=document.id,
+                document_version_id=version.id,
+                generation=generation,
+                ordinal=chunk.ordinal,
+                heading_path=chunk.heading_path,
+                content=chunk.content,
+                content_hash=chunk.content_hash,
+                token_count=chunk.token_count,
+                language=version.language,
+                chunker_version=self._chunker.chunker_version,
+                created_at=now,
+            )
+            for chunk in chunks
+        )
+
+    def _embedding_records(
+        self,
+        *,
+        content_chunks: Sequence[KnowledgeContentChunkRecord],
         batch: EmbeddingBatch,
         profile: EmbeddingProfileRecord,
-    ) -> tuple[KnowledgeChunkRecord, ...]:
+    ) -> tuple[ChunkEmbeddingRecord, ...]:
+        """Build the REBUILDABLE half: one projection row per content chunk.
+
+        The vectors must line up one-for-one with the chunks they describe, in the
+        same order, so the count is checked here as well as in
+        :meth:`_require_batch_matches` -- this method is also called on the
+        re-embed path, where the batch was produced for the freshly chunked content
+        and is being applied to the chunks already stored.
+        """
+        if len(batch.vectors) != len(content_chunks):
+            raise InvalidKnowledgeVersionError(
+                f"embedding provider returned {len(batch.vectors)} vectors for "
+                f"{len(content_chunks)} chunks"
+            )
         now = self._clock.utc_now()
-        records: list[KnowledgeChunkRecord] = []
-        for chunk, vector in zip(chunks, batch.vectors, strict=True):
+        records: list[ChunkEmbeddingRecord] = []
+        for chunk, vector in zip(content_chunks, batch.vectors, strict=True):
             if len(vector.values) != profile.dimension:
                 raise InvalidKnowledgeVersionError(
                     f"chunk {chunk.ordinal} has {len(vector.values)} dimensions but "
                     f"the embedding profile declares {profile.dimension}"
                 )
             records.append(
-                KnowledgeChunkRecord(
+                ChunkEmbeddingRecord(
                     id=uuid4(),
-                    document_id=document.id,
-                    document_version_id=version.id,
-                    ordinal=chunk.ordinal,
-                    heading_path=chunk.heading_path,
-                    content=chunk.content,
-                    content_hash=chunk.content_hash,
-                    token_count=chunk.token_count,
-                    language=version.language,
+                    content_chunk_id=chunk.id,
                     embedding_profile_id=profile.id,
                     embedding=tuple(float(value) for value in vector.values),
-                    created_at=now,
-                    chunker_version=self._chunker.chunker_version,
+                    indexed_at=now,
                 )
             )
         return tuple(records)
+
+    def _same_chunking(
+        self,
+        stored: Sequence[KnowledgeContentChunkRecord],
+        fresh: Sequence[DocumentChunk],
+    ) -> bool:
+        """True when the stored chunking is byte-identical to a fresh chunking.
+
+        Compared as ``(ordinal, content_hash)`` pairs so the batch computed in
+        phase 1 lines up positionally with the rows that will receive its vectors.
+        A chunker that declares one version but emits different text is a chunker
+        bug, not a reason to move a citation target: when this returns False the
+        caller appends a new generation instead, which is correct either way and
+        keeps the old rows resolvable.
+        """
+        if len(stored) != len(fresh):
+            return False
+        return all(
+            row.ordinal == chunk.ordinal and row.content_hash == chunk.content_hash
+            for row, chunk in zip(stored, fresh, strict=True)
+        )
 
     async def _flush_events(self, uow: UnitOfWork, document: KnowledgeDocument) -> None:
         """Persist pending knowledge events in the SAME transaction as the state.
@@ -579,7 +725,9 @@ class KnowledgeIngestionHandler:
             state = await uow.knowledge_chunks.projection_state(
                 document_version_id=version.id
             )
-            if state.is_empty:
+            if not state.is_embedded:
+                # Either nothing is chunked or the ACTIVE space does not FULLY
+                # cover the current generation; both mean phase 2 has real work.
                 return None
             profile = await uow.embedding_profiles.find_by_identity(
                 provider=expected_identity[0],

@@ -24,12 +24,20 @@ from ..shared.identifiers import utc_now
 from . import events as ev
 from .enums import DocumentStatus, SourceKind, Visibility
 from .errors import (
+    InvalidKnowledgeChunkError,
     InvalidKnowledgeDocumentError,
     InvalidKnowledgeScopeError,
     InvalidKnowledgeVersionError,
     KnowledgeDocumentStateError,
 )
-from .value_objects import is_valid_content_hash, normalize_knowledge_content
+from .value_objects import (
+    CHUNK_GENERATION_INITIAL,
+    CHUNKER_VERSION,
+    compute_content_hash,
+    is_valid_content_hash,
+    normalize_knowledge_content,
+    require_content_hash_matches,
+)
 
 MAX_TITLE_CHARS = 512
 MAX_EXTERNAL_KEY_CHARS = 512
@@ -92,6 +100,18 @@ class KnowledgeDocumentVersion:
             raise InvalidKnowledgeVersionError(
                 "normalized_content must already be normalized"
             )
+        # And the hash must actually BE the hash of that content (brief section 7).
+        # Format validity alone is not provenance: a version whose stored hash was
+        # edited, or whose content was rewritten while the hash stayed, would
+        # still satisfy "a lowercase SHA-256 hex digest" while citing nothing real.
+        # Recomputed through the one domain hash function via the shared helper --
+        # never a copied SHA-256, and never by re-deriving a new hash here, which
+        # would be a second definition of the same fact.
+        require_content_hash_matches(
+            normalized_content=self.normalized_content,
+            content_hash=self.content_hash,
+            error=InvalidKnowledgeVersionError,
+        )
         _require_bounded_text(
             self.title,
             field_name="title",
@@ -147,6 +167,96 @@ class KnowledgeDocumentVersion:
             metadata=dict(metadata or {}),
             ingested_at=ingested_at or utc_now(),
             effective_at=effective_at,
+        )
+
+
+@dataclass(frozen=True)
+class KnowledgeContentChunk:
+    """One IMMUTABLE piece of a version's chunked content.
+
+    This entity is the citation TARGET (brief section 3). It is deliberately
+    separate from the embedding projection row that makes it retrievable:
+
+    - content identity (this entity) is written once and never rewritten, so a
+      citation into it stays resolvable across re-embedding, retrieval-projection
+      rebuilds, restarts, retirement, and later versions;
+    - the embedding row is a REBUILDABLE projection of it and may be dropped and
+      recreated freely without breaking any historical citation.
+
+    ``generation`` is what makes a chunker change non-destructive: a new chunking
+    of the same ``document_version_id`` is a NEW generation, and the old one is
+    left intact. ``ordinal`` is unique within ``(document_version_id, generation)``.
+    """
+
+    id: UUID
+    document_id: UUID
+    document_version_id: UUID
+    generation: int
+    ordinal: int
+    content: str
+    content_hash: str
+    token_count: int
+    language: str = "en"
+    heading_path: str = ""
+    chunker_version: str = CHUNKER_VERSION
+    created_at: datetime = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if self.generation < CHUNK_GENERATION_INITIAL:
+            raise InvalidKnowledgeChunkError(
+                f"chunk generation must be >= {CHUNK_GENERATION_INITIAL}"
+            )
+        if self.ordinal < 0:
+            raise InvalidKnowledgeChunkError("chunk ordinal must be >= 0")
+        if not self.content:
+            raise InvalidKnowledgeChunkError("chunk content must not be empty")
+        if self.token_count < 0:
+            raise InvalidKnowledgeChunkError("chunk token_count must be >= 0")
+        if not self.chunker_version.strip():
+            raise InvalidKnowledgeChunkError("chunk chunker_version must not be empty")
+        # The same content/content_hash invariant the document version enforces
+        # (brief section 8), through the same shared helper: a citation resolves
+        # only if the chunk's hash is genuinely the hash of the chunk's text.
+        require_content_hash_matches(
+            normalized_content=self.content,
+            content_hash=self.content_hash,
+            error=InvalidKnowledgeChunkError,
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        id: UUID,
+        document_id: UUID,
+        document_version_id: UUID,
+        generation: int,
+        ordinal: int,
+        content: str,
+        token_count: int,
+        language: str = "en",
+        heading_path: str = "",
+        chunker_version: str = CHUNKER_VERSION,
+        created_at: datetime | None = None,
+    ) -> KnowledgeContentChunk:
+        """Derive ``content_hash`` from ``content`` instead of accepting one.
+
+        The hash is computed here so a caller cannot supply a hash that does not
+        describe the content it is stored with.
+        """
+        return cls(
+            id=id,
+            document_id=document_id,
+            document_version_id=document_version_id,
+            generation=generation,
+            ordinal=ordinal,
+            content=content,
+            content_hash=compute_content_hash(content),
+            token_count=token_count,
+            language=language,
+            heading_path=heading_path,
+            chunker_version=chunker_version,
+            created_at=created_at or utc_now(),
         )
 
 

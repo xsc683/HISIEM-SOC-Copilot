@@ -290,18 +290,27 @@ async def test_a_resolver_read_failure_backs_off_within_bounds() -> None:
         outbox, _FlakyResolver(str(uuid4()), failures=10_000), _CountingRunner()
     )
 
-    deltas = []
+    seconds: list[int] = []
+    scheduled_at: list[datetime] = []
     for _ in range(8):
         before = datetime.now(UTC)
         outbox.advance(3_600)
         assert await dispatcher.drain_once() == 1
         _, code, scheduled = outbox.failed_schedules[-1]
         assert code == "RESOLVE_ERROR"
-        deltas.append(scheduled - before)
+        seconds.append(round((scheduled - before).total_seconds()))
+        scheduled_at.append(scheduled)
 
     # 2, 4, 8, … seconds, capped — a bounded attempt rate, not a hot loop.
-    assert [round(d.total_seconds()) for d in deltas] == [2, 4, 8, 16, 32, 64, 120, 120]
-    assert deltas == sorted(deltas)
+    assert seconds == [2, 4, 8, 16, 32, 64, 120, 120]
+    # Non-decreasing, and strictly growing in absolute terms. The growth is asserted
+    # against the SCHEDULED INSTANTS rather than against the per-iteration deltas:
+    # each delta is measured against a fresh wall clock, so comparing those at
+    # microsecond precision would assert something about this machine's scheduler
+    # (two 120s retries one microsecond apart would fail) rather than about the
+    # backoff being bounded and non-decreasing.
+    assert scheduled_at == sorted(scheduled_at)
+    assert len(set(scheduled_at)) == len(scheduled_at)
 
 
 async def test_a_resolver_that_recovers_delivers_the_same_row() -> None:

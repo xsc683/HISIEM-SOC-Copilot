@@ -88,13 +88,70 @@ class KnowledgeIngestionConflictError(ApplicationError):
 class KnowledgeEmbeddingProfileError(ApplicationError):
     """The configured embedding space cannot be used for this write.
 
-    Covers "the profile for this provider is retired" and "a different profile is
-    already ACTIVE and switching was not explicitly requested". Both are operator
-    decisions, so both are refused loudly rather than resolved silently
-    (brief sections 16/18).
+    Covers "the profile for this provider is retired" and "the configured provider
+    has no ACTIVE profile yet". Both are operator decisions, so both are refused
+    loudly rather than resolved silently (brief sections 16/18).
     """
 
     code = "KNOWLEDGE_EMBEDDING_PROFILE"
+
+
+class EmbeddingProfileSwitchRequiresReindexError(KnowledgeEmbeddingProfileError):
+    """An ordinary ingest cannot move the corpus to a different embedding space.
+
+    Switching the ACTIVE profile is a CORPUS-wide act: every vector in the
+    existing corpus was produced by the old model, and the new one's vectors are
+    not comparable with them. Allowing one document's ingest to retire the old
+    profile and create a new ACTIVE one would leave the corpus half-embedded in
+    two incomparable spaces while retrieval happily compared them -- the precise
+    failure the ACTIVE-profile model exists to prevent (brief section 4).
+
+    P3-A therefore refuses the switch outright: no flag enables it, and the old
+    ACTIVE profile stays active with its corpus still vector-retrievable. The
+    correct corpus-wide flow (stage -> full reindex -> validate -> atomic
+    activation -> retire) is documented but deliberately NOT implemented here.
+    """
+
+    code = "EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX"
+
+
+class AttackReleaseContentConflictError(ApplicationError):
+    """A pinned ATT&CK release already exists with different content.
+
+    The release name is an immutability claim: re-importing different bytes under
+    an existing release name would rewrite what an already-pinned release means,
+    silently invalidating every citation that named it. Detected BEFORE any
+    mutation, so a refused import leaves no canonical row, no knowledge document,
+    no document version, no active-release change and no embedding projection
+    behind (brief sections 2.2/2.3).
+    """
+
+    code = "ATTACK_RELEASE_CONTENT_CONFLICT"
+
+
+class AttackReleaseAuthorityAmbiguousError(ApplicationError):
+    """More than one release of a framework is authoritative.
+
+    Impossible for releases imported or migrated by this code -- the per-framework
+    partial unique index forbids it -- but data written by an earlier schema could
+    contain it. The ambiguity is reported for an operator to resolve explicitly
+    rather than guessed away, because guessing would silently choose which
+    canonical knowledge is authoritative (brief section 9.2).
+    """
+
+    code = "ATTACK_RELEASE_AUTHORITY_AMBIGUOUS"
+
+
+class KnowledgeCorpusPreconditionError(ApplicationError):
+    """The corpus under evaluation is not the corpus the baseline expects.
+
+    A sealed evaluation must refuse to score an ambient or drifted corpus: an
+    unexpected document, a missing expected one, or a changed version/chunk
+    projection changes what is being measured, and reporting a metric from it
+    would be a number that describes something else entirely (brief section 5.3).
+    """
+
+    code = "CORPUS_PRECONDITION_FAILED"
 
 
 class InvalidKnowledgeQueryError(ApplicationError):

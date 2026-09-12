@@ -33,6 +33,18 @@ from .corpus import (
     CorpusCase,
     CorpusDocument,
 )
+from .corpus_identity import (
+    CORPUS_FINGERPRINT_SCHEMA,
+    CORPUS_PRECONDITION_FAILED,
+    CorpusFact,
+    CorpusIdentity,
+    CorpusMode,
+    CorpusPreconditionError,
+    corpus_fingerprint,
+    corpus_identity,
+    corpus_problems,
+    preflight_corpus,
+)
 from .metrics import (
     bounded_document_keys,
     citation_resolution_rate,
@@ -62,6 +74,8 @@ from .runner import (
 
 __all__ = [
     "CASES",
+    "CORPUS_FINGERPRINT_SCHEMA",
+    "CORPUS_PRECONDITION_FAILED",
     "CATEGORIES",
     "CATEGORY_ATTACK_QUERY",
     "CATEGORY_CROSS_TENANT_DENIED",
@@ -85,6 +99,10 @@ __all__ = [
     "CaseResult",
     "CorpusCase",
     "CorpusDocument",
+    "CorpusFact",
+    "CorpusIdentity",
+    "CorpusMode",
+    "CorpusPreconditionError",
     "EvalMode",
     "EvalQuery",
     "HybridGate",
@@ -97,10 +115,14 @@ __all__ = [
     "bounded_document_keys",
     "build_artifact",
     "citation_resolution_rate",
+    "corpus_fingerprint",
+    "corpus_identity",
+    "corpus_problems",
     "cross_tenant_leakage_count",
     "forbidden_retrieval_count",
     "hybrid_verdict",
     "ndcg_at_k",
+    "preflight_corpus",
     "recall_at_k",
     "reciprocal_rank",
     "run_mode",

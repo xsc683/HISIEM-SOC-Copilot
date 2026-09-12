@@ -33,14 +33,25 @@ READY = "READY"
 DEGRADED = "DEGRADED"
 NOT_READY = "NOT_READY"
 
-#: The tables P3-A creates. Names are the frozen schema of sections 11-15/36.
+#: The tables P3-A creates. Names are the frozen schema of sections 11-15/36, in
+#: the shape the closure brief requires: content identity and the rebuildable
+#: embedding projection are SEPARATE tables (section 3.1), and ATT&CK authority
+#: lives on a release row rather than on the technique snapshot (section 2.1).
 KNOWLEDGE_TABLES: tuple[str, ...] = (
     "knowledge_document",
     "knowledge_document_version",
     "embedding_profile",
-    "knowledge_chunk",
+    "knowledge_content_chunk",
+    "knowledge_chunk_embedding",
+    "attack_release",
     "attack_technique",
 )
+
+#: The pre-closure chunk table. Superseded by ``knowledge_content_chunk`` plus
+#: ``knowledge_chunk_embedding``; P3-A never reads or writes it. It is reported
+#: rather than dropped so an operator who finds it knows what it is, and so the
+#: upgrade path can leave every pre-existing chunk exactly where it was.
+LEGACY_CHUNK_TABLE = "knowledge_chunk"
 
 #: The remediation for the one failure that is genuinely confusing: the vector
 #: extension is installed, but into a schema that a ``search_path=copilot``
@@ -157,10 +168,18 @@ async def collect_diagnostics(
             )
         else:
             checks.append(await _check_active_profile(unit_of_work_factory))
+            checks.append(await _check_attack_release_authority(unit_of_work_factory))
+            checks.append(await _check_legacy_chunk_table(engine))
     else:
         # Do not pile on: every later check would fail for the same reason and
         # bury the one that matters.
-        for name in ("vector_extension", "knowledge_schema", "active_embedding_profile"):
+        for name in (
+            "vector_extension",
+            "knowledge_schema",
+            "active_embedding_profile",
+            "attack_release_authority",
+            "legacy_chunk_table",
+        ):
             checks.append(
                 DiagnosticCheck(name, FAIL, "not checked: the database is unreachable")
             )
@@ -252,4 +271,104 @@ async def _check_active_profile(
         OK,
         f"{profile.provider}/{profile.model_id} dim={profile.dimension} "
         f"{profile.distance_metric}",
+    )
+
+
+async def _check_attack_release_authority(
+    unit_of_work_factory: Callable[[], UnitOfWork],
+) -> DiagnosticCheck:
+    """Assert at most one authoritative ATT&CK release per framework (section 2.1).
+
+    Authority lives on the RELEASE row, so the invariant is a statement about
+    ``attack_release`` and the check reads exactly that table. The schema already
+    enforces it with a per-framework partial unique index, and this is the runtime
+    assertion of the same fact -- which is what makes it worth running: an operator
+    who restores a dump, or applies a migration set out of order, can end up with
+    the index missing, and then the rows are the only witness left. It is also the
+    surface where the ambiguity the upgrade deliberately refused to resolve (see
+    the migration and ``docs/p3/p3-a-operations.md``) becomes visible.
+    """
+    async with unit_of_work_factory() as uow:
+        active = await uow.attack_releases.list_active()
+
+    by_framework: dict[str, list[str]] = {}
+    for release in active:
+        by_framework.setdefault(release.framework, []).append(release.source_release)
+
+    ambiguous = {
+        framework: sorted(releases)
+        for framework, releases in by_framework.items()
+        if len(releases) > 1
+    }
+    if ambiguous:
+        detail = "; ".join(
+            f"{framework}: {', '.join(releases)}"
+            for framework, releases in sorted(ambiguous.items())
+        )
+        return DiagnosticCheck(
+            "attack_release_authority",
+            FAIL,
+            f"ATTACK_RELEASE_AUTHORITY_AMBIGUOUS - more than one ACTIVE release for "
+            f"{detail}. Exactly one release per framework may be authoritative; "
+            "reactivate the intended release and leave the others inactive, then "
+            "re-run this check (see docs/p3/p3-a-operations.md)",
+        )
+    if not active:
+        return DiagnosticCheck(
+            "attack_release_authority",
+            WARN,
+            "no ACTIVE ATT&CK release: every canonical technique row is "
+            "non-authoritative. One way to arrive here is the upgrade reporting "
+            "ATTACK_RELEASE_AUTHORITY_AMBIGUOUS, which it does when the "
+            "pre-existing rows claimed more than one release of a framework and "
+            "it therefore refused to choose; the other is simply that nothing has "
+            "been imported yet. Either way the fix is the same -- import the "
+            "intended release with --activate (see docs/p3/p3-a-operations.md)",
+        )
+    return DiagnosticCheck(
+        "attack_release_authority",
+        OK,
+        "authoritative: "
+        + "; ".join(
+            f"{framework} -> {releases[0]}"
+            for framework, releases in sorted(by_framework.items())
+        ),
+    )
+
+
+async def _check_legacy_chunk_table(engine: AsyncEngine) -> DiagnosticCheck:
+    """Report the pre-closure ``knowledge_chunk`` table; never act on it.
+
+    The upgrade copies every existing chunk into the immutable
+    ``knowledge_content_chunk`` / ``knowledge_chunk_embedding`` pair and then
+    LEAVES the old table standing, so ``downgrade`` can put the pre-closure rows
+    back exactly as they were (section 9.1). P3-A never reads or writes it, so an
+    operator who finds it in the catalog should not mistake it for live schema --
+    and a diagnostic that stayed silent about it would leave exactly that doubt.
+
+    The row count is read through a fixed statement with no interpolation and no
+    bound value beyond the catalog lookup: a diagnostic never builds SQL from
+    anything an operator typed (section 1).
+    """
+    async with engine.connect() as connection:
+        present = (
+            await connection.execute(
+                text(
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() AND table_name = :name"
+                ),
+                {"name": LEGACY_CHUNK_TABLE},
+            )
+        ).scalar_one()
+        if not present:
+            return DiagnosticCheck("legacy_chunk_table", OK, "absent")
+        rows = (
+            await connection.execute(text("SELECT count(*) FROM knowledge_chunk"))
+        ).scalar_one()
+
+    return DiagnosticCheck(
+        "legacy_chunk_table",
+        OK,
+        f"{LEGACY_CHUNK_TABLE} present with {rows} superseded row(s): kept only so a "
+        "downgrade can restore them byte for byte, never read or written by P3-A",
     )

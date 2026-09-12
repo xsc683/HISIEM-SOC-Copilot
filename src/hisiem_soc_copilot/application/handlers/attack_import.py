@@ -17,11 +17,24 @@ code path as an operator's runbook. There is no second ingestion path to keep
 honest, and the interface layer is never the thing that decides what a document
 says.
 
-Ordering and failure: the canonical rows are committed first, in one short
-transaction, and the documents follow one at a time. A crash between the two
-leaves a complete release whose documents are partially ingested -- which a
-re-run converges, because both halves are idempotent. The reverse order would
-leave documents belonging to no canonical release, which no re-run could repair.
+Ordering and failure: the canonical rows and the release record are committed
+first, in one short transaction, and the documents follow one at a time. A crash
+between the two leaves a complete release whose documents are partially ingested
+-- which a re-run converges, because both halves are idempotent. The reverse order
+would leave documents belonging to no canonical release, which no re-run could
+repair.
+
+Release integrity (brief section 2) adds three rules on top of that:
+
+* Authority is a property of the RELEASE, not of each technique row. At most one
+  release per framework is ACTIVE, enforced by a per-framework partial unique
+  index, so ``activate=False`` cannot leave two authoritative releases behind.
+* A pinned release is IMMUTABLE. Each release carries a deterministic fingerprint
+  of its canonical technique collection; the same release with the same
+  fingerprint converges, and the same release with different content fails closed
+  with ``ATTACK_RELEASE_CONTENT_CONFLICT`` before anything is written.
+* The technique rows' ``active`` flag MIRRORS the release's authority and is never
+  an independent source of it, so the two cannot disagree after a switch.
 """
 
 from __future__ import annotations
@@ -34,16 +47,22 @@ from uuid import uuid4
 from ...domain.knowledge.enums import SourceKind, Visibility
 from ...domain.knowledge.value_objects import normalize_and_hash
 from ..commands.knowledge import ImportAttackRelease, IngestKnowledgeDocument
-from ..errors import ApplicationError
+from ..errors import ApplicationError, AttackReleaseContentConflictError
 from ..ports.attack import FRAMEWORK, AttackBundle, AttackBundleParser, AttackTechnique
 from ..ports.clock import ClockPort
-from ..ports.knowledge import AttackImportOutcome, AttackTechniqueRecord
+from ..ports.knowledge import (
+    ATTACK_RELEASE_STATUS_INACTIVE,
+    AttackImportOutcome,
+    AttackReleaseRecord,
+    AttackTechniqueRecord,
+)
 from ..ports.unit_of_work import UnitOfWork
 from ..services.attack_projection import (
     technique_document_body,
     technique_document_title,
     technique_external_key,
 )
+from ..services.attack_release_fingerprint import fingerprint_from_records
 from .knowledge import KnowledgeIngestionHandler
 
 #: A real Enterprise bundle is a few MB; this bound exists so a mistaken path (a
@@ -104,7 +123,7 @@ class AttackImportHandler:
         # before anything is written: a bad bundle is never partially imported.
         bundle = self._parser.parse(command.payload)
 
-        created = await self._persist_release(command, bundle)
+        outcome = await self._persist_release(command, bundle)
         documents_created, versions_ingested, unchanged = await self._ingest_documents(
             command, bundle
         )
@@ -112,45 +131,186 @@ class AttackImportHandler:
         return AttackImportOutcome(
             release=command.release,
             techniques_parsed=len(bundle.techniques),
-            techniques_created=created,
+            techniques_created=outcome.created,
             documents_created=documents_created,
             versions_ingested=versions_ingested,
             unchanged=unchanged,
             skipped=bundle.skipped_ids,
+            release_active=outcome.release_active,
+            content_fingerprint=outcome.content_fingerprint,
+            release_created=outcome.release_created,
         )
 
     # ------------------------------------------------------------------
-    # canonical technique rows
+    # canonical technique rows + release authority
     # ------------------------------------------------------------------
-    async def _persist_release(self, command: ImportAttackRelease, bundle: AttackBundle) -> int:
-        """Write the release's canonical rows; return how many were new.
+    async def _persist_release(
+        self, command: ImportAttackRelease, bundle: AttackBundle
+    ) -> _ReleaseOutcome:
+        """Write the release and its canonical rows; return what changed.
 
         The whole release lands in ONE transaction, including the optional
         activation switch, so an operator can never observe a release that is
         half-inserted or half-activated.
+
+        The immutability check runs BEFORE the first mutation: a release name whose
+        existing content differs from this bundle is refused outright, so a
+        rejected import leaves the canonical rows, the knowledge documents, the
+        document versions, the active release and the embedding projections all
+        exactly as they were (brief sections 2.2/2.3).
         """
         now = self._clock.utc_now()
+        framework = command.framework
+        release = command.release
+
         async with self._uow_factory() as uow:
-            existing = await uow.attack_techniques.count_for_release(
-                framework=command.framework, source_release=command.release
+            # Every READ happens before the first write, so a refused import leaves
+            # the canonical rows, the knowledge documents, the document versions,
+            # the active release and the embedding projections exactly as they were
+            # (brief sections 2.2/2.3).
+            existing = await uow.attack_releases.find(
+                framework=framework, source_release=release
             )
-            created = 0
-            if existing == 0:
-                records = tuple(
-                    _record_of(technique, command.release, command.framework, now)
-                    for technique in bundle.techniques
+            others = tuple(
+                item
+                for item in await uow.attack_releases.list_for_framework(
+                    framework=framework
                 )
+                if item.source_release != release
+            )
+
+            active = command.activate or (
+                existing is not None and existing.is_active
+            )
+            # The canonical rows are built BEFORE the fingerprint, because the
+            # fingerprint is defined over exactly these rows. One function computes
+            # each row's content hash and one function fingerprints the collection,
+            # so the release fingerprint and the document projected from those rows
+            # cannot describe different content (brief section 2.3).
+            records = tuple(
+                _record_of(technique, release, framework, now, active=active)
+                for technique in bundle.techniques
+            )
+            fingerprint = fingerprint_from_records(
+                framework=framework,
+                source_release=release,
+                techniques=records,
+            )
+            if existing is not None:
+                # Read-only verification: adopting a pre-fingerprint release must
+                # re-derive what is STORED, never trust the incoming bundle.
+                await self._verify_pinned_release(
+                    uow, existing, fingerprint=fingerprint, framework=framework
+                )
+
+            release_created = False
+            if existing is None:
+                # Inserted INACTIVE and activated by an explicit UPDATE afterwards,
+                # so activating can never race the per-framework partial unique
+                # index (which forbids two ACTIVE releases at COMMIT).
+                await uow.attack_releases.add(
+                    release=AttackReleaseRecord(
+                        id=uuid4(),
+                        framework=framework,
+                        source_release=release,
+                        content_fingerprint=fingerprint,
+                        status=ATTACK_RELEASE_STATUS_INACTIVE,
+                        technique_count=len(bundle.techniques),
+                        created_at=now,
+                        activated_at=None,
+                    )
+                )
+                release_created = True
+
+            # Only a real transition is written: re-importing an already-active
+            # release must not restamp its activation time, or "when did this
+            # become authoritative" would drift on every idempotent re-run.
+            transitions_to_active = active and (
+                existing is None or not existing.is_active
+            )
+
+            created = 0
+            if existing is None or (
+                await uow.attack_techniques.count_for_release(
+                    framework=framework, source_release=release
+                )
+                == 0
+            ):
+                # The very same rows the fingerprint was taken over.
                 await uow.attack_techniques.add_many(techniques=records)
                 created = len(records)
-            if command.activate:
-                # Section 38: switching which release is authoritative is an
-                # explicit act. Rows are flagged, never deleted, so an older
-                # release stays readable by its own ``source_release``.
-                await uow.attack_techniques.deactivate_except(
-                    framework=command.framework, source_release=command.release
+
+            # The technique rows' flag is a MIRROR of release authority, so it is
+            # re-asserted on every path rather than left to depend on how the rows
+            # happened to be written.
+            #
+            # Only an import that LEAVES this release authoritative may clear the
+            # framework's others. Staging a release (``activate=False``) is not the
+            # same act as promoting it, and deposing the current release as a side
+            # effect of importing a bundle an operator has not adopted would be a
+            # silent authority change (brief section 2.1).
+            if active:
+                for other in others:
+                    await uow.attack_techniques.set_active_for_release(
+                        framework=framework,
+                        source_release=other.source_release,
+                        active=False,
+                    )
+            await uow.attack_techniques.set_active_for_release(
+                framework=framework, source_release=release, active=active
+            )
+            if transitions_to_active:
+                await uow.attack_releases.activate(
+                    framework=framework, source_release=release, now=now
                 )
+
             await uow.commit()
-        return created
+
+        return _ReleaseOutcome(
+            created=created,
+            release_created=release_created,
+            release_active=active,
+            content_fingerprint=fingerprint,
+        )
+
+    async def _verify_pinned_release(
+        self,
+        uow: UnitOfWork,
+        existing: AttackReleaseRecord,
+        *,
+        fingerprint: str,
+        framework: str,
+    ) -> None:
+        """Fail closed unless this bundle IS the already-pinned release.
+
+        An adopted release (fingerprint ``None``, written before this table
+        existed) is verified against what the database actually stores and then
+        pinned; a pinned release is compared directly. Both paths read only, so a
+        conflict leaves zero mutations behind.
+        """
+        if existing.content_fingerprint is None:
+            stored = await uow.attack_techniques.list_for_release(
+                framework=framework, source_release=existing.source_release
+            )
+            stored_fingerprint = fingerprint_from_records(
+                framework=framework,
+                source_release=existing.source_release,
+                techniques=stored,
+            )
+            if stored_fingerprint != fingerprint:
+                raise AttackReleaseContentConflictError(
+                    _conflict_message(existing, fingerprint)
+                )
+            await uow.attack_releases.pin_fingerprint(
+                framework=framework,
+                source_release=existing.source_release,
+                content_fingerprint=fingerprint,
+            )
+            return
+        if existing.content_fingerprint != fingerprint:
+            raise AttackReleaseContentConflictError(
+                _conflict_message(existing, fingerprint)
+            )
 
     # ------------------------------------------------------------------
     # knowledge documents
@@ -190,14 +350,52 @@ class AttackImportHandler:
         return documents_created, versions_ingested, unchanged
 
 
+@dataclass(frozen=True)
+class _ReleaseOutcome:
+    """What ``_persist_release`` did, for the caller's report."""
+
+    created: int
+    release_created: bool
+    release_active: bool
+    content_fingerprint: str
+
+
+def _conflict_message(existing: AttackReleaseRecord, fingerprint: str) -> str:
+    """Refusal text that names the release without leaking either content set.
+
+    The two fingerprints are safe to print (they are hashes, not content) and are
+    the only way an operator can tell "someone genuinely changed the bundle" from
+    "two different files were both labelled v14.1".
+    """
+    return (
+        f"ATT&CK release {existing.source_release!r} is already pinned for "
+        f"framework {existing.framework!r} with content fingerprint "
+        f"{existing.content_fingerprint or 'UNKNOWN'}, but this bundle hashes to "
+        f"{fingerprint}; a pinned release is immutable, so the import was "
+        "refused without changing any canonical row or knowledge document"
+    )
+
+
 def _record_of(
-    technique: AttackTechnique, release: str, framework: str, now: datetime
+    technique: AttackTechnique,
+    release: str,
+    framework: str,
+    now: datetime,
+    *,
+    active: bool,
 ) -> AttackTechniqueRecord:
     """Build the canonical row for one technique.
 
     The content hash is the DOMAIN hash of the same body the document is ingested
     from, computed by the one hashing rule (section 8) rather than by a second
-    implementation living here.
+    implementation living here. It is also the field the release fingerprint binds,
+    so the canonical row and the projected document version are demonstrably the
+    same content -- the projection is a view of this row, not an independent
+    authority (brief section 2.3).
+
+    ``active`` mirrors the OWNING RELEASE's authority, which the caller has
+    already resolved; a technique row never decides for itself whether it is
+    authoritative.
     """
     _, content_hash = normalize_and_hash(technique_document_body(technique))
     return AttackTechniqueRecord(
@@ -211,6 +409,6 @@ def _record_of(
         platforms=technique.platforms,
         source_stix_id=technique.stix_id,
         content_hash=content_hash,
-        active=True,
+        active=active,
         created_at=now,
     )

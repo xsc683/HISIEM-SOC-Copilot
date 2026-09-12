@@ -52,11 +52,12 @@ from hisiem_soc_copilot.application.ports.embedding import (
     EmbeddingVector,
 )
 from hisiem_soc_copilot.application.ports.knowledge import (
+    ChunkEmbeddingRecord,
     ChunkProjectionState,
     EmbeddingProfileRecord,
-    KnowledgeChunkRecord,
     KnowledgeChunkRepository,
     KnowledgeChunkView,
+    KnowledgeContentChunkRecord,
     KnowledgeDocumentRepository,
     KnowledgeHit,
     KnowledgeQuery,
@@ -192,7 +193,9 @@ class ScopedChunkRepository:
                 return view
         return None
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         raise NotImplementedError("retrieval never writes chunks")
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
@@ -201,7 +204,9 @@ class ScopedChunkRepository:
     async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
         raise NotImplementedError("retrieval never inspects projection state")
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
         raise NotImplementedError("retrieval never deletes chunks")
 
 
@@ -1156,14 +1161,28 @@ class RecordingDocumentRepository:
 
 
 class RecordingChunkRepository:
-    """Chunk double that records every write attempt."""
+    """Chunk double that records every write attempt.
+
+    Content chunks (the citation targets) and embeddings (the rebuildable
+    projection) are recorded separately, so "nothing was written" is asserted
+    against BOTH halves -- a handler that skipped the content write but left an
+    embedding row behind would otherwise pass.
+    """
 
     def __init__(self) -> None:
-        self.added: list[KnowledgeChunkRecord] = []
+        self.added: list[KnowledgeContentChunkRecord] = []
+        self.added_embeddings: list[ChunkEmbeddingRecord] = []
         self.deleted: list[UUID] = []
+        self.deleted_embeddings: list[tuple[UUID, int]] = []
+        self.deleted_profiles: list[tuple[UUID, UUID]] = []
 
-    async def add_many(self, *, chunks: Sequence[KnowledgeChunkRecord]) -> None:
+    async def add_content_chunks(
+        self, *, chunks: Sequence[KnowledgeContentChunkRecord]
+    ) -> None:
         self.added.extend(chunks)
+
+    async def add_embeddings(self, *, embeddings: Sequence[ChunkEmbeddingRecord]) -> None:
+        self.added_embeddings.extend(embeddings)
 
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return 0
@@ -1173,8 +1192,23 @@ class RecordingChunkRepository:
             embedding_profile_id=None, chunker_version=None, chunk_count=0
         )
 
-    async def delete_for_version(self, *, document_version_id: UUID) -> None:
+    async def list_content_chunks(
+        self, *, document_version_id: UUID, generation: int
+    ) -> tuple[KnowledgeContentChunkRecord, ...]:
+        return ()
+
+    async def delete_embeddings_for_version_generation(
+        self, *, document_version_id: UUID, generation: int
+    ) -> int:
+        self.deleted_embeddings.append((document_version_id, generation))
         self.deleted.append(document_version_id)
+        return 0
+
+    async def delete_embeddings_for_profile(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID
+    ) -> int:
+        self.deleted_profiles.append((document_version_id, embedding_profile_id))
+        return 0
 
     async def lexical_candidates(self, **kwargs: Any) -> tuple[LexicalCandidate, ...]:
         raise NotImplementedError("ingestion never generates candidates")
@@ -1378,7 +1412,10 @@ def _assert_nothing_written(uow: StubUnitOfWork) -> None:
     assert uow.knowledge_documents.saved == []
     assert uow.knowledge_documents.added_versions == []
     assert uow.knowledge_chunks.added == []
+    assert uow.knowledge_chunks.added_embeddings == []
     assert uow.knowledge_chunks.deleted == []
+    assert uow.knowledge_chunks.deleted_embeddings == []
+    assert uow.knowledge_chunks.deleted_profiles == []
     assert uow.embedding_profiles.added == []
     assert uow.commits == 0
 
@@ -1399,6 +1436,10 @@ async def test_a_successful_ingestion_is_the_positive_control() -> None:
     assert len(uow.knowledge_documents.added) == 1
     assert len(uow.knowledge_documents.added_versions) == 1
     assert len(uow.knowledge_chunks.added) == 2
+    assert len(uow.knowledge_chunks.added_embeddings) == 2
+    assert {embedding.content_chunk_id for embedding in uow.knowledge_chunks.added_embeddings} == {
+        chunk.id for chunk in uow.knowledge_chunks.added
+    }
     assert len(uow.embedding_profiles.added) == 1
     assert uow.embedding_profiles.added[0].status == "ACTIVE"
     assert uow.knowledge_documents.added[0].active_version_id == (

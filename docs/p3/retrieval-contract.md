@@ -43,6 +43,10 @@ has no `instructions`, no `action`, no `severity`, no `authority`. That absence 
 asserted against the exact frozen field set, so adding one in a future change
 fails a test rather than quietly widening what a retrieval can express.
 
+`chunk_id` names an **immutable content chunk** (`knowledge_content_chunk`) — the
+citation target — and never an embedding-projection row. That is what makes the
+citation in `citation_id` outlive every rebuild described in §7.
+
 `MAX_RESULT_LIMIT = 5` — a request for more is **rejected**, not clamped.
 
 ## 2. The scope is mandatory
@@ -137,10 +141,42 @@ path.
 
 Candidate budgets per channel: **20 lexical, 20 vector**, fused down to at most 5.
 
-**Tie-break order** (documented, applied to the fusion result):
-`(document_id, document_version_id, ordinal)`, ascending as strings. Two
-candidates with an identical fused score therefore always come back in the same
-order.
+**Tie-break order**: the ONE stable semantic key, shared by the SQL candidate
+queries and the Python fusion so the two can never disagree.
+
+```python
+stable_ranking_key(view) -> (
+    source_kind, visibility, tenant_id or "", external_key,
+    document_version_number, chunk_generation, ordinal,
+)
+```
+
+Ranking ties are broken by **semantic business identity** — what the knowledge
+*is* — and never by a database-generated surrogate. A `uuid4` tie-break makes two
+databases that ingested the same corpus order two equally-scored chunks
+differently, which is precisely what a reproducible baseline cannot tolerate;
+`document_id`/`document_version_id` are both random UUIDs, so neither may appear
+in the key.
+
+Every component is stable under re-ingestion into a fresh database: the same
+document at the same version, chunked by the same chunker, always produces the
+same key.
+
+- `visibility`/`tenant_id` are in the key because a `GLOBAL` document and a
+  `TENANT` document may share an `external_key` (the two partial unique indexes
+  allow exactly that), so without the scope the order would not be **total**.
+  `tenant_id` folds to `""` for ordering, which is safe because the fold is only
+  applied *within* one visibility value, where the tenant is uniform anyway.
+- `ordinal` is unique within `(document_version_id, generation)`, which is what
+  makes the key total rather than merely nearly total.
+
+The SQL twin is `_stable_order_columns()`, which orders by the channel's own
+score first and then by exactly these columns, using `COLLATE "C"`. The `C`
+collation is not decoration: the database's default collation is locale-dependent
+and would order `external_key` differently on two machines, whereas `C` (byte
+order) is identical to Python's `str` comparison for UTF-8 text — which is what
+makes the SQL order and the Python key *provably* the same order. The vector
+channel orders by cosine distance and then by the same columns.
 
 **Diversification:** at most `max_chunks_per_document = 2` chunks per document.
 The first pass takes candidates in rank order while each document is under its
@@ -152,6 +188,14 @@ empty one. `truncated` reports whether anything was dropped.
 **Excerpts** are collapsed and truncated to `MAX_EXCERPT_CHARS = 480`. Bounded so
 a hit is a *pointer* to content, never a way to smuggle a whole document into a
 future model context.
+
+### Which generation is retrieved
+
+Normal retrieval selects **only the highest `generation` present for the
+version**. A rechunk writes a new generation and leaves the old one intact; the
+older generation stops being returned by `retrieve` and keeps resolving through
+`resolve`. Nothing in the retrieval path deletes a chunk generation, so a
+citation captured before a rechunk is not affected by one.
 
 ## 6. The retrieval profile
 
@@ -176,7 +220,18 @@ plus the same profile yields the same order. The defaults **are** the frozen
 
 ## 7. Citations
 
-Format: `kcit:<chunk_uuid>:<content_hash_prefix>`
+Format: `kcit:<content_chunk_uuid>:<content_hash_prefix>`
+
+The UUID is an **immutable content chunk** id. This is the specific change that
+makes a citation durable, and it is worth stating as the invariant it is:
+
+> **A historical citation must survive retrieval reindexing.**
+
+The identifier therefore names content identity, never a disposable retrieval
+row. Under the previous model the citation named a row that a projection rebuild
+dropped and recreated with fresh `uuid4`s, so every citation captured before the
+rebuild became permanently unresolvable — silently, because the string still
+parsed.
 
 - The chunk UUID is canonical-form (`str(UUID(x)) == x`).
 - The hash prefix is 8–16 lowercase hex digits (12 by default).
@@ -193,15 +248,44 @@ version, and then re-checks:
 | The chunk exists and is readable by this tenant | `CHUNK_NOT_FOUND` |
 | Scope is coherent (`GLOBAL` ⟺ no tenant) | *(raised)* |
 | `TENANT` document belongs to the calling tenant | `SCOPE_MISMATCH` |
-| The chunk's hash starts with the prefix in the string | `CONTENT_HASH_MISMATCH` |
+| The stored hash equals the hash **recomputed from the content actually read** | `CONTENT_INTEGRITY_MISMATCH` |
+| That stored hash starts with the prefix in the string | `CONTENT_INTEGRITY_MISMATCH` |
+
+Both integrity checks are needed, and they catch different tampering. A stored
+hash is not evidence; it is a *claim written beside the content*. The resolver
+recomputes `compute_content_hash(actual chunk content)` and requires the
+recomputed value to equal the stored full hash **and** the stored hash to carry
+the citation's prefix. Editing the text out-of-band breaks the first; editing the
+stored hash to match a forged prefix breaks the second. Either way the answer is
+`unresolved` with an explicit reason, and no exception escapes to the caller.
 
 The scope is re-validated **even though the repository is already tenant-scoped**:
 a resolver must not depend on a single layer being right about visibility.
 
 Unlike normal retrieval, resolution **deliberately still works for RETIRED
-documents and historical versions**. A citation captured in a past investigation
-must remain explainable after the document it points at has been superseded or
-withdrawn. Normal `search` excludes retired documents; `resolve` does not.
+documents and historical versions, and for superseded chunk generations**. A
+citation captured in a past investigation must remain explainable after the
+document it points at has been superseded or withdrawn. Normal `retrieve`
+excludes retired documents and non-current generations; `resolve` excludes
+neither.
+
+A citation therefore still resolves after each of:
+
+| Event | Why it still resolves |
+|---|---|
+| Embedding-profile rebuild (same generation) | Citations never name an embedding row |
+| Vector re-embedding | Same reason — content identity is untouched |
+| Retrieval-projection rebuild | Content chunks are not part of the projection |
+| Process restart | Nothing about resolution is in-process state |
+| Document retirement | Retirement is a lifecycle transition, not a content change |
+| New document version activated | The old version's chunks are untouched |
+| Rechunk (new generation) | The old generation is retained and still resolvable |
+| Crossing tenants | It does **not** resolve — `SCOPE_MISMATCH` |
+
+The only thing that makes a historical citation unresolvable is genuine deletion
+of immutable historical knowledge, and **P3-A offers no destructive delete**. The
+one way to arrive there is an operator deleting rows by hand, which is why the
+integrity checks above are recomputed rather than read from a stored claim.
 
 Resolution proves **provenance** — this chunk, of this immutable version, with
 this hash, exists and is readable by this tenant. It proves nothing about
@@ -217,6 +301,15 @@ correctness and grants nothing.
 | Provider identity ≠ ACTIVE profile identity | `KnowledgeRetrievalUnavailableError` |
 | Provider returns a different profile than it declared | `KnowledgeRetrievalUnavailableError` |
 | Embedding dimension ≠ profile dimension | `KnowledgeRetrievalUnavailableError` |
+| A document ingest would switch the ACTIVE embedding profile | `EmbeddingProfileSwitchRequiresReindexError` (`EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX`) |
+
+The last row is the whole of §4: when an `ACTIVE` profile exists and the
+configured provider's identity differs from it, **any** ordinary document ingest
+fails explicitly — including one that passes `allow_embedding_profile_switch=True`.
+There is no partial switch and no single-document cutover in P3-A. The flag is
+retained only so an existing caller receives that diagnosis instead of an
+unrecognised-argument error. See
+[p3-a-operations.md](p3-a-operations.md) §5.
 
 `LEXICAL_ONLY` never needs an embedding provider or a profile, which is why it
 keeps working when the vector channel is unavailable — and why `doctor` reports

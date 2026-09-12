@@ -38,6 +38,18 @@ class InvalidKnowledgeVersionError(KnowledgeError):
     code = "INVALID_KNOWLEDGE_VERSION"
 
 
+class InvalidKnowledgeChunkError(KnowledgeError):
+    """Raised when an immutable content chunk violates its integrity invariants.
+
+    A content chunk is the identity a citation points at (brief section 3), so a
+    chunk whose stored ``content_hash`` is not the hash of its own content is not
+    a repairable row: it is a broken citation target, and it fails at the
+    boundary instead of being silently re-hashed.
+    """
+
+    code = "INVALID_CONTENT_CHUNK"
+
+
 class KnowledgeDocumentStateError(StateTransitionError):
     """Raised when a command would perform an illegal document transition."""
 

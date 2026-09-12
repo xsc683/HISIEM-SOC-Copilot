@@ -41,10 +41,18 @@ from ..application.commands.knowledge import (
 )
 from ..application.errors import ApplicationError, KnowledgeRetrievalUnavailableError
 from ..application.ports.embedding import EmbeddingProvider
-from ..application.ports.knowledge import KnowledgeHit, KnowledgeQuery
+from ..application.ports.knowledge import (
+    CorpusChunkFact,
+    KnowledgeHit,
+    KnowledgeQuery,
+)
 from ..application.services.knowledge_retrieval import RetrievalMode
 from ..bootstrap.container import Container
 from ..domain.knowledge.enums import DocumentStatus, SourceKind, Visibility
+from ..domain.knowledge.value_objects import (
+    CHUNK_GENERATION_INITIAL,
+    normalize_and_hash,
+)
 from ..evaluation.knowledge import (
     CASES,
     CORPUS,
@@ -53,12 +61,16 @@ from ..evaluation.knowledge import (
     SUITE_ID,
     TENANTS,
     CorpusDocument,
+    CorpusFact,
+    CorpusMode,
     EvalMode,
     EvalQuery,
     HybridGate,
     ModeUnavailableError,
     RetrievedHit,
     build_artifact,
+    corpus_identity,
+    preflight_corpus,
     run_suite,
     write_artifact,
 )
@@ -77,6 +89,11 @@ ARTIFACT_SUBDIR = "knowledge"
 #: NAME, not only inside the JSON: a file named ``...-plumbing-only.json`` cannot
 #: be quoted as a semantic baseline by someone who never opened it.
 PLUMBING_SUFFIX = "-plumbing-only"
+
+#: Marks an artifact produced over a corpus the run did NOT establish was the
+#: fixture (brief section 5.4). Same reasoning as :data:`PLUMBING_SUFFIX`: the
+#: marker goes in the FILE NAME so the distinction survives being quoted.
+OPEN_CORPUS_SUFFIX = "-open-corpus"
 
 #: The tenant scope a retirement of a GLOBAL corpus document is issued from.
 #: Retirement is not a tenant-owned act for a GLOBAL document -- any tenant scope
@@ -105,6 +122,7 @@ async def run_knowledge_evaluation(
     overwrite: bool = False,
     skip_ingest: bool = False,
     allow_embedding_profile_switch: bool = False,
+    allow_ambient_corpus: bool = False,
 ) -> int:
     """Ingest (unless told not to), run every requested mode, write the artifact.
 
@@ -131,6 +149,33 @@ async def run_knowledge_evaluation(
             allow_switch=allow_embedding_profile_switch,
         )
     await _retire_corpus_documents(container, entries)
+
+    # The corpus precondition runs BEFORE a single retrieval, because a score is
+    # the most dangerous possible output: a ranking measured over the wrong corpus
+    # is not merely useless, it is a number someone would quote (section 5.3).
+    corpus_mode = CorpusMode.OPEN_CORPUS if allow_ambient_corpus else CorpusMode.SEALED
+    expected_facts = (
+        () if corpus_mode is CorpusMode.OPEN_CORPUS else _expected_corpus_facts(container)
+    )
+    actual_facts = await _actual_corpus_facts(container)
+    expected_fingerprint: str | None = None
+    if corpus_mode is CorpusMode.SEALED:
+        preflight_corpus(expected=expected_facts, actual=actual_facts)
+        expected_fingerprint = corpus_identity(
+            mode=corpus_mode, facts=expected_facts
+        ).fingerprint
+    identity = corpus_identity(mode=corpus_mode, facts=actual_facts)
+    print(
+        f"corpus: {identity.mode.value} fingerprint={identity.fingerprint[:16]} "
+        f"documents={identity.eligible_document_count} "
+        f"versions={identity.eligible_version_count} "
+        f"chunks={identity.eligible_chunk_count}"
+    )
+    if corpus_mode is CorpusMode.OPEN_CORPUS:
+        print(
+            "  WARNING: --allow-ambient-corpus: this run measured whatever the "
+            "database holds and cannot produce a sealed KB-GOLDEN-V1 baseline"
+        )
 
     retrieval = container.knowledge_retrieval_service(embedding_provider=provider)
     resolver = container.knowledge_citation_resolver()
@@ -160,15 +205,27 @@ async def run_knowledge_evaluation(
         return resolution.resolved
 
     suite = await run_suite(
-        cases=CASES, retrieve=retrieve, resolve=resolve, modes=requested, k=k
+        cases=CASES,
+        retrieve=retrieve,
+        resolve=resolve,
+        modes=requested,
+        k=k,
+        sealed=corpus_mode is CorpusMode.SEALED,
     )
     artifact = build_artifact(
         suite=suite,
         retrieval_profile=_retrieval_profile(container),
         embedding_profile=_embedding_profile(provider, plumbing_only=plumbing_only),
+        corpus=identity.as_record(expected_fingerprint=expected_fingerprint),
     )
     written = write_artifact(
-        _artifact_path(container, k=k, plumbing_only=plumbing_only, out_dir=out_dir),
+        _artifact_path(
+            container,
+            k=k,
+            plumbing_only=plumbing_only,
+            open_corpus=corpus_mode is CorpusMode.OPEN_CORPUS,
+            out_dir=out_dir,
+        ),
         artifact,
         overwrite=overwrite,
     )
@@ -330,6 +387,96 @@ async def _retire_corpus_documents(
 
 
 # ---------------------------------------------------------------------------
+# corpus identity (brief section 5)
+# ---------------------------------------------------------------------------
+def _expected_corpus_facts(container: Container) -> tuple[CorpusFact, ...]:
+    """The eligible corpus the SEALED fixture declares, as reproducible facts.
+
+    Derived with the production functions rather than restated here: the document
+    body is normalized and hashed by the one domain rule, and chunked by the one
+    frozen chunker bound to the configured bounds. A second implementation of
+    either would let the expectation drift away from what ingestion actually
+    produced, which is the only thing that makes the comparison meaningful.
+
+    Two values are asserted rather than derived, and both are properties of a
+    sealed corpus:
+
+    * ``document_version_number`` is 1 -- the fixture's documents are the FIRST
+      version of each document. A database holding a second version of a corpus
+      document is not holding the sealed corpus, and failing here is how that gets
+      noticed instead of being averaged into a score.
+    * ``document_key`` is the external key, because that is what ingestion used
+      (the fixture's key IS the knowledge external key).
+
+    Retired corpus documents are excluded, because a retired document is not
+    eligible for retrieval (section 9) -- and the harness retires exactly the
+    documents the fixture names as retired.
+    """
+    chunker = container.knowledge_chunker()
+    facts: list[CorpusFact] = []
+    for document in CORPUS:
+        if document.document_key in RETIRED_DOCUMENT_KEYS:
+            continue
+        normalized, content_hash = normalize_and_hash(document.content)
+        for chunk in chunker.chunk_document(normalized):
+            facts.append(
+                CorpusFact(
+                    visibility=document.visibility,
+                    tenant_id=document.tenant_id or "",
+                    source_kind=document.source_kind,
+                    external_key=document.document_key,
+                    document_version_number=1,
+                    document_content_hash=content_hash,
+                    chunk_generation=CHUNK_GENERATION_INITIAL,
+                    ordinal=chunk.ordinal,
+                    chunk_content_hash=chunk.content_hash,
+                )
+            )
+    return tuple(facts)
+
+
+async def _actual_corpus_facts(container: Container) -> tuple[CorpusFact, ...]:
+    """The corpus the DATABASE actually holds, read through the tenant scope.
+
+    Read once per corpus tenant and unioned. A GLOBAL document is visible to every
+    tenant, so it is returned by every one of those reads; the fact set is deduped
+    by :func:`corpus_identity`, which is also why the counts it reports are
+    documents rather than rows.
+
+    Every read goes through ``corpus_snapshot(tenant_id=...)``, whose scope
+    predicate is applied IN SQL. A document belonging to another tenant therefore
+    never enters this list, which is what makes "no cross-tenant read" a property
+    of the query rather than of a Python filter.
+    """
+    facts: list[CorpusFact] = []
+    async with container.unit_of_work() as uow:
+        for tenant in TENANTS:
+            snapshot = await uow.knowledge_chunks.corpus_snapshot(tenant_id=tenant)
+            facts.extend(_fact_of(chunk) for chunk in snapshot.chunks)
+    return tuple(facts)
+
+
+def _fact_of(chunk: CorpusChunkFact) -> CorpusFact:
+    """Map one persisted fact onto the evaluation boundary's plain-data form.
+
+    The mapping is the whole point of the boundary: the sealed package describes a
+    corpus with strings and integers and never learns that a ``Visibility`` or a
+    ``SourceKind`` exists.
+    """
+    return CorpusFact(
+        visibility=chunk.visibility.value,
+        tenant_id=chunk.tenant_id or "",
+        source_kind=chunk.source_kind.value,
+        external_key=chunk.external_key,
+        document_version_number=chunk.document_version_number,
+        document_content_hash=chunk.document_content_hash,
+        chunk_generation=chunk.chunk_generation,
+        ordinal=chunk.ordinal,
+        chunk_content_hash=chunk.chunk_content_hash,
+    )
+
+
+# ---------------------------------------------------------------------------
 # artifact inputs
 # ---------------------------------------------------------------------------
 def _retrieved_hit(hit: KnowledgeHit, *, entries: dict[UUID, _CorpusEntry]) -> RetrievedHit:
@@ -418,15 +565,28 @@ def _embedding_profile(
 
 
 def _artifact_path(
-    container: Container, *, k: int, plumbing_only: bool, out_dir: str | None
+    container: Container,
+    *,
+    k: int,
+    plumbing_only: bool,
+    open_corpus: bool,
+    out_dir: str | None,
 ) -> Path:
+    """Where the artifact lands, with every caveat the run carries in its NAME.
+
+    The two markers compose rather than override each other: a run over an ambient
+    corpus with the deterministic fixture is neither a baseline nor a semantic
+    measurement, and the file name has to say both.
+    """
     root = (
         Path(out_dir)
         if out_dir
         else Path(container.settings.evaluation.runs_dir) / ARTIFACT_SUBDIR
     )
-    name = f"kb-golden-v1-k{k}{PLUMBING_SUFFIX if plumbing_only else ''}.json"
-    return root / name
+    markers = (PLUMBING_SUFFIX if plumbing_only else "") + (
+        OPEN_CORPUS_SUFFIX if open_corpus else ""
+    )
+    return root / f"kb-golden-v1-k{k}{markers}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +605,19 @@ def _render_summary(
         f"{SUITE_ID} (corpus {artifact['corpus_version']}) "
         f"cases={artifact['case_count']} k={k}"
     ]
+    corpus = _mapping(artifact["corpus"])
+    lines.append(
+        f"corpus: {corpus['corpus_mode']} "
+        f"fingerprint={str(corpus['corpus_fingerprint'])[:16]} "
+        f"documents={corpus['eligible_document_count']} "
+        f"versions={corpus['eligible_version_count']} "
+        f"chunks={corpus['eligible_chunk_count']}"
+    )
+    if not corpus["sealed"]:
+        lines.append(
+            "  NOT A SEALED BASELINE: this run measured an ambient corpus, so its "
+            "numbers describe the database rather than the KB-GOLDEN-V1 fixture"
+        )
     embedding = _mapping(artifact["embedding_profile"])
     if plumbing_only:
         lines.append(

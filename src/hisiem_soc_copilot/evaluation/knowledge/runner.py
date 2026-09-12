@@ -49,6 +49,15 @@ from .metrics import (
 #: noise.
 HYBRID_RECALL_TOLERANCE = 0.02
 
+#: Why an unsealed run reports no gate verdict. Stated as a constant because the
+#: artifact and the screen must not drift into two different explanations of the
+#: same absence.
+_OPEN_CORPUS_DETAIL = (
+    "the corpus was not sealed (--allow-ambient-corpus), so this run measured "
+    "whatever the database currently holds; a hybrid verdict is only meaningful "
+    "over the corpus the suite is scored against"
+)
+
 #: Categories whose cases exist specifically to test that mixing two channels
 #: finds what neither channel finds alone. A hybrid result must retrieve every
 #: one of them; a miss here cannot be excused by a tolerance.
@@ -281,8 +290,18 @@ async def run_suite(
         EvalMode.HYBRID,
     ),
     k: int = 5,
+    sealed: bool = True,
 ) -> SuiteResult:
-    """Run every requested mode and compute the hybrid verdict."""
+    """Run every requested mode and compute the hybrid verdict.
+
+    ``sealed=False`` records that the caller did NOT establish that the corpus
+    under test is the fixture (brief section 5.4). The verdict is then ``NOT_RUN``
+    rather than whatever the numbers happened to show: a gate compares two
+    channels over a KNOWN corpus, and with an ambient corpus there is nothing that
+    makes the comparison mean what a baseline claims it means. The metrics are
+    still recorded -- they are a real measurement of a real corpus -- but the
+    run cannot produce the standard baseline verdict.
+    """
     if k < 1:
         raise ValueError("k must be >= 1")
     ordered = tuple(EvalMode(mode) for mode in modes)
@@ -293,6 +312,8 @@ async def run_suite(
         ]
     )
     verdict, detail = hybrid_verdict(mode_results, requested=ordered)
+    if not sealed:
+        verdict, detail = HybridGate.NOT_RUN, _OPEN_CORPUS_DETAIL
     return SuiteResult(
         suite_id=suite_id,
         corpus_version=corpus_version,

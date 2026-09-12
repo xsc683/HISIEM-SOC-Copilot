@@ -19,15 +19,25 @@ happens.
    set, knowledge lookup stays catalog-only, the knowledge CLI is unreachable from
    the agent, and only the non-production ``knowledge``/``evaluation_harness``
    packages may see the evaluation oracle.
+5. The P3-A closure's own guarantees, each asserted where it could be undone: the
+   ATT&CK import path cannot reach the network, tenant scope is a mandatory
+   keyword on every retrieval entry point, the sealed evaluation package imports
+   nothing ambient, a citation names immutable content rather than a rebuildable
+   projection row, and the legacy embedding-profile switch flag has no executable
+   path behind it.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
+
+from hisiem_soc_copilot.application.ports.clock import SystemClock
 
 SRC = Path(__file__).resolve().parent.parent.parent / "src"
 PKG = SRC / "hisiem_soc_copilot"
@@ -461,3 +471,268 @@ def test_only_the_non_production_knowledge_and_harness_see_evaluation() -> None:
     # And the exception is REAL -- otherwise the allow-list is dead code that
     # would hide a later removal of the boundary it documents.
     assert "knowledge" in importers
+
+
+# ---------------------------------------------------------------------------
+# 5. P3-A closure guards (brief section 11)
+#
+# Each one pins a property the closure created, in the place where it could be
+# quietly undone: the ATT&CK import port, the retrieval entry points, the sealed
+# evaluation package, the citation target, and the embedding-profile switch.
+# ---------------------------------------------------------------------------
+
+ATTACK_PORT = PKG / "application" / "ports" / "attack.py"
+RETRIEVAL_SERVICE = PKG / "application" / "services" / "knowledge_retrieval.py"
+EVALUATION_KNOWLEDGE_DIR = PKG / "evaluation" / "knowledge"
+
+#: Every module a runtime network fetch would arrive through. Pinned rather than
+#: discovered, because the promise is "this port cannot reach the network" and a
+#: new spelling of that capability is exactly what the guard exists to catch.
+NETWORK_MODULES = frozenset(
+    {
+        "aiohttp",
+        "ftplib",
+        "http",
+        "httpx",
+        "requests",
+        "socket",
+        "ssl",
+        "urllib",
+        "urllib3",
+        "websockets",
+    }
+)
+
+#: The ONLY stdlib the sealed-evaluation package may touch: serialization and
+#: pure data structures. No clock, no randomness, no host, no driver -- which is
+#: what makes a sealed run reproducible from the corpus facts alone.
+#: ``__future__`` is a compiler directive rather than an import that runs, so it
+#: is listed beside them rather than treated as an exception.
+EVALUATION_ALLOWED_STDLIB = frozenset(
+    {"__future__", "collections", "dataclasses", "enum", "hashlib", "json", "pathlib", "typing"}
+)
+
+
+def _functions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+
+
+def _imported_modules(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every top-level module name imported by ``tree``, with its line."""
+    found: list[tuple[str, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend((alias.name, node.lineno) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            found.append((node.module, node.lineno))
+    return found
+
+
+def test_the_attack_import_port_cannot_reach_the_network() -> None:
+    """Section 33: the bundle is pinned locally; the port has no fetch capability.
+
+    Asserted on the AST rather than on behaviour, because the risk is a future
+    ADDITION (a ``fetch(url)`` method, an injected client) rather than a bug in
+    today's code. A port with no URL literal and no network import cannot be
+    asked to download anything, which is a stronger promise than "it currently
+    does not".
+    """
+    tree = ast.parse(ATTACK_PORT.read_text(encoding="utf-8"))
+    offenders: list[str] = []
+
+    for module, line in _imported_modules(tree):
+        if module.split(".")[0] in NETWORK_MODULES:
+            offenders.append(f"imports {module} at line {line}")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "http://" in node.value or "https://" in node.value:
+                offenders.append(f"URL literal at line {node.lineno}")
+        elif isinstance(node, ast.Name) and node.id.lower() in {"urlopen", "urlretrieve"}:
+            offenders.append(f"name {node.id!r} at line {node.lineno}")
+
+    assert not offenders, (
+        "the ATT&CK import port must have no network capability: " + "; ".join(offenders)
+    )
+    # Positive control: the port really was parsed and really does declare the
+    # protocol this rule is about.
+    names = {node.name for node in _functions(tree)}
+    classes = {node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)}
+    assert "parse" in names and "AttackBundleParser" in classes, (sorted(names), sorted(classes))
+
+
+def test_no_network_import_survives_anywhere_in_the_attack_path() -> None:
+    """The port is not the only place a download could hide: the parser counts too."""
+    offenders: list[str] = []
+    for path in _python_files(PKG / "infrastructure") + _python_files(PKG / "application"):
+        target = str(path.relative_to(PKG))
+        if "attack" not in target:
+            continue
+        for module, line in _imported_modules(ast.parse(path.read_text(encoding="utf-8"))):
+            if module.split(".")[0] in NETWORK_MODULES:
+                offenders.append(f"{target}:{line}: imports {module}")
+    assert not offenders, "ATT&CK parsing is offline by construction: " + "; ".join(offenders)
+
+
+def test_ordinary_retrieval_requires_a_mandatory_tenant_id_keyword() -> None:
+    """Section 40: tenant scope is an argument, never an ambient default.
+
+    Every ``tenant_id`` parameter in the retrieval service must be keyword-only
+    and must have NO default. A positional or defaulted scope is how a caller
+    silently reads another tenant's knowledge, so the SHAPE of the signature is
+    the guard -- not a runtime check a future overload could bypass.
+    """
+    tree = ast.parse(RETRIEVAL_SERVICE.read_text(encoding="utf-8"))
+    seen: set[str] = set()
+    offenders: list[str] = []
+
+    for node in _functions(tree):
+        args = node.args
+        positional = [*args.posonlyargs, *args.args]
+        if not any(arg.arg == "tenant_id" for arg in [*positional, *args.kwonlyargs]):
+            continue
+        seen.add(node.name)
+        if any(arg.arg == "tenant_id" for arg in positional):
+            offenders.append(f"{node.name}: tenant_id is positional")
+            continue
+        index = [arg.arg for arg in args.kwonlyargs].index("tenant_id")
+        if args.kw_defaults[index] is not None:
+            offenders.append(f"{node.name}: tenant_id has a default")
+
+    assert not offenders, "tenant scope must be a required keyword: " + "; ".join(offenders)
+    # And the guard really did look at the entry points it names.
+    assert {"retrieve", "resolve"} <= seen, sorted(seen)
+
+
+def test_the_sealed_evaluation_package_takes_no_ambient_input() -> None:
+    """Sections 5.5/5.6: no clock, no randomness, no host, no driver.
+
+    A reproducible baseline is a claim about the WHOLE package, not about the
+    ranking function alone: one ``uuid4()`` in the artifact writer is enough to
+    make two runs over one corpus disagree. So the rule is an allow-list of
+    imports, and the list is deliberately short.
+    """
+    offenders: list[str] = []
+    for path in _python_files(EVALUATION_KNOWLEDGE_DIR):
+        for module, line in _imported_modules(ast.parse(path.read_text(encoding="utf-8"))):
+            top = module.split(".")[0]
+            if top not in sys.stdlib_module_names:
+                offenders.append(f"{path.name}:{line}: imports non-stdlib {module}")
+            elif top not in EVALUATION_ALLOWED_STDLIB:
+                offenders.append(f"{path.name}:{line}: imports {module}")
+
+    assert not offenders, (
+        "the sealed evaluation package must be a pure function of its corpus: "
+        + "; ".join(offenders)
+    )
+
+
+def test_the_citation_target_is_immutable_content_not_a_projection_row() -> None:
+    """Section 3.1: the identity that survives a reindex is CONTENT identity.
+
+    Two halves, because either alone is escapable: the domain formats a citation
+    from a content hash (so the handle cannot encode a disposable row id), and
+    the rebuildable projection row carries no content and no hash column (so a
+    citation can never be re-pointed at one).
+    """
+    from uuid import UUID
+
+    from hisiem_soc_copilot.domain.knowledge.value_objects import (
+        compute_content_hash,
+        format_citation_id,
+        parse_citation_id,
+    )
+    from hisiem_soc_copilot.infrastructure.persistence.orm.knowledge import (
+        KnowledgeChunkEmbeddingRow,
+        KnowledgeContentChunkRow,
+    )
+
+    content = "Repeated failed logons from one source address."
+    digest = compute_content_hash(content)
+    citation = format_citation_id(
+        chunk_id=UUID("00000000-0000-4000-8000-0000000000aa"), content_hash=digest
+    )
+    parsed = parse_citation_id(citation)
+    assert parsed is not None
+    assert digest.startswith(parsed.content_hash_prefix)
+
+    content_columns = set(KnowledgeContentChunkRow.__table__.columns.keys())
+    embedding_columns = set(KnowledgeChunkEmbeddingRow.__table__.columns.keys())
+
+    assert {"content", "content_hash"} <= content_columns
+    # The projection is exactly that: a vector plus the identity of the chunk it
+    # projects. Nothing about it is citable, so rebuilding it cannot move a
+    # citation's target.
+    assert "content" not in embedding_columns
+    assert "content_hash" not in embedding_columns
+    assert "content_chunk_id" in embedding_columns
+
+
+def test_no_per_document_embedding_profile_switch_path_is_executable() -> None:
+    """Section 4.1: the legacy flag is a DIAGNOSIS, not a switch.
+
+    Behavioural, and built so the failure mode is specific: the UoW factory
+    raises if it is ever called, so a handler that opened a transaction and only
+    THEN refused the switch fails here instead of passing by raising the right
+    exception a little too late.
+    """
+    from hisiem_soc_copilot.application.commands.knowledge import IngestKnowledgeDocument
+    from hisiem_soc_copilot.application.errors import (
+        EmbeddingProfileSwitchRequiresReindexError,
+    )
+    from hisiem_soc_copilot.application.handlers.knowledge import KnowledgeIngestionHandler
+    from hisiem_soc_copilot.application.ports.embedding import (
+        EmbeddingBatch,
+        EmbeddingProfileDescriptor,
+    )
+    from hisiem_soc_copilot.domain.knowledge.enums import SourceKind, Visibility
+
+    opened: list[str] = []
+
+    class _ForbiddenUnitOfWork:
+        async def __aenter__(self) -> object:
+            opened.append("entered")
+            raise AssertionError("the switch must be refused before any read")
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    class _Provider:
+        @property
+        def descriptor(self) -> EmbeddingProfileDescriptor:
+            return EmbeddingProfileDescriptor(provider="test", model_id="m", dimension=4)
+
+        async def embed_documents(self, texts: Sequence[str]) -> EmbeddingBatch:
+            raise AssertionError("no document may be embedded for a refused switch")
+
+    class _Chunker:
+        @property
+        def chunker_version(self) -> str:
+            return "test-chunker/v1"
+
+        def chunk_document(self, text: str) -> tuple[object, ...]:
+            raise AssertionError("the switch must be refused before any chunking")
+
+    handler = KnowledgeIngestionHandler(
+        unit_of_work_factory=lambda: _ForbiddenUnitOfWork(),
+        embedding_provider=_Provider(),
+        chunker=_Chunker(),
+        clock=SystemClock(),
+    )
+    command = IngestKnowledgeDocument(
+        source_kind=SourceKind.CURATED_GUIDANCE,
+        external_key="curated:switch",
+        visibility=Visibility.GLOBAL,
+        title="Switch",
+        content="body",
+        allow_embedding_profile_switch=True,
+    )
+
+    with pytest.raises(EmbeddingProfileSwitchRequiresReindexError):
+        asyncio.run(handler.ingest(command))
+
+    assert opened == [], "the refusal must happen before the handler reads anything"

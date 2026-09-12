@@ -110,19 +110,26 @@ def build_artifact(
     suite: SuiteResult,
     retrieval_profile: Mapping[str, object],
     embedding_profile: Mapping[str, object],
+    corpus: Mapping[str, object],
 ) -> dict[str, object]:
     """Build the artifact mapping from a completed suite.
 
-    ``retrieval_profile`` and ``embedding_profile`` are supplied by the caller as
-    plain mappings. The evaluation boundary forbids this package from importing
-    the production profile types, and it is also the right split: the profile
-    descriptors are an INPUT to the measurement, so the harness records what it
-    was told rather than reaching for a configuration of its own.
+    ``retrieval_profile``, ``embedding_profile`` and ``corpus`` are supplied by the
+    caller as plain mappings. The evaluation boundary forbids this package from
+    importing the production profile types, and it is also the right split: those
+    descriptors are an INPUT to the measurement, so the harness records what it was
+    told rather than reaching for a configuration of its own.
+
+    ``corpus`` is REQUIRED rather than optional (brief section 5.5). An artifact
+    that omits what corpus it measured cannot be re-checked by anyone, and a
+    default here would let a future caller produce exactly such a file by
+    forgetting an argument.
     """
     return {
         "schema_version": SCHEMA_VERSION,
         "suite_id": suite.suite_id,
         "corpus_version": suite.corpus_version,
+        "corpus": dict(corpus),
         "retrieval_profile": dict(retrieval_profile),
         "embedding_profile": dict(embedding_profile),
         "case_count": suite.case_count,

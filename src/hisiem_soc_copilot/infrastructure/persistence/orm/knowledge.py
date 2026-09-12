@@ -1,24 +1,39 @@
-"""ORM models for the knowledge subsystem (brief sections 10-16, 36-38).
+"""ORM models for the knowledge subsystem (brief sections 2, 3, 10-16, 36-38).
 
-Five tables, three different kinds of thing:
+Seven live tables, four different kinds of thing, plus one retired leftover:
 
 ``knowledge_document`` / ``knowledge_document_version``
     The authoritative knowledge truth. A document is identified by
     ``(source_kind, external_key)`` inside a scope, and its content lives in
     immutable versions that are only ever appended.
 
-``knowledge_chunk``
-    A REBUILDABLE retrieval projection, not a domain aggregate. Chunks can be
-    regenerated from an immutable version at any time, so nothing authoritative
-    depends on them.
+``knowledge_content_chunk``
+    The IMMUTABLE citation target: one piece of a version's content, written once
+    and never rewritten, addressable across re-embedding, projection rebuilds,
+    rechunking, restarts, retirement, and later versions.
 
-``embedding_profile`` / ``attack_technique``
-    Supporting records: which vector space the chunks were indexed in (at most
-    one ACTIVE), and the canonical ATT&CK technique rows for a pinned release.
+``knowledge_chunk_embedding``
+    A REBUILDABLE retrieval projection of a content chunk. It can be dropped and
+    recreated at any time, because a citation names the content chunk and not this
+    row -- which is why re-indexing no longer breaks historical citations.
+
+``embedding_profile`` / ``attack_release`` / ``attack_technique``
+    Supporting records: which vector space the corpus was indexed in (at most one
+    ACTIVE), which ATT&CK release is authoritative per framework (at most one
+    ACTIVE, by partial unique index), and the canonical technique rows of a pinned
+    release.
+
+``knowledge_chunk``
+    The PRE-CLOSURE chunk table, declared but never read or written: content and
+    embedding used to share a row here, which is what made an old citation die
+    with the index. The upgrade copies every row into the pair above and leaves
+    the table standing, and this class exists so ``alembic check`` does not
+    report that deliberate survival as drift.
 
 The database is the final arbiter for the invariants the domain also checks: the
-scope CHECK constraints make "GLOBAL with a tenant" unrepresentable, and the two
-PARTIAL unique indexes make a duplicated document impossible without relying on
+scope CHECK constraints make "GLOBAL with a tenant" unrepresentable, and the
+PARTIAL unique indexes make a duplicated document, a second ACTIVE embedding
+profile, and a second authoritative ATT&CK release impossible without relying on
 NULL-uniqueness semantics (``NULL`` never conflicts in a plain unique index, so a
 single ``(source_kind, external_key)`` index would silently allow duplicate
 global documents).
@@ -36,6 +51,7 @@ from sqlalchemy import (
     CheckConstraint,
     Computed,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -51,6 +67,7 @@ _SOURCE_KINDS = "'MITRE_ATTACK','CURATED_GUIDANCE','TENANT_RUNBOOK'"
 _VISIBILITIES = "'GLOBAL','TENANT'"
 _DOCUMENT_STATUSES = "'ACTIVE','RETIRED'"
 _PROFILE_STATUSES = "'ACTIVE','RETIRED'"
+_RELEASE_STATUSES = "'ACTIVE','INACTIVE'"
 _DISTANCE_METRICS = "'COSINE'"
 _NORMALIZATIONS = "'NONE','L2'"
 
@@ -244,7 +261,25 @@ class EmbeddingProfileRow(CopilotBase):
 
 
 class KnowledgeChunkRow(CopilotBase):
-    """A rebuildable retrieval projection of one immutable version's content."""
+    """The PRE-CLOSURE chunk table, kept so the upgrade is non-destructive.
+
+    ``knowledge_chunk`` was content and embedding in one row, which is why a
+    re-index used to break historical citations. It is no longer read or written
+    by any P3-A path: retrieval reads ``knowledge_content_chunk`` and its
+    ``knowledge_chunk_embedding`` projection, and ingestion writes only those.
+
+    It is still DECLARED, for two load-bearing reasons. The new migration leaves
+    every pre-existing row exactly where it was rather than dropping the table,
+    so ``downgrade -1`` restores the pre-closure schema byte for byte instead of
+    reconstructing rows it might not be able to represent (a content chunk with
+    no embedding row yet has no faithful ``knowledge_chunk`` form). And a table
+    that exists in the database but not in the metadata is permanent
+    ``alembic check`` drift, which would mask the NEXT real drift.
+
+    ``knowledge doctor`` reports this table and its row count, so an operator who
+    finds it in the catalog knows it is superseded residue rather than live
+    schema.
+    """
 
     __tablename__ = "knowledge_chunk"
     __table_args__ = (
@@ -260,9 +295,6 @@ class KnowledgeChunkRow(CopilotBase):
             "ordinal",
             unique=True,
         ),
-        # Full-text search over the chunk's own text. The vector is COMPUTED, so
-        # the lexical projection can never drift from the content it describes --
-        # there is no code path that can forget to update it.
         Index("ix_knowledge_chunk_lexical", "lexical_document", postgresql_using="gin"),
     )
 
@@ -291,9 +323,6 @@ class KnowledgeChunkRow(CopilotBase):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, nullable=False)
     language: Mapped[str] = mapped_column(String(16), nullable=False)
-    # Which chunker produced this projection. Without it, a chunker configuration
-    # change would leave undocumented stale projections in place and there would
-    # be no way to notice (brief section 22).
     chunker_version: Mapped[str] = mapped_column(String(64), nullable=False)
     embedding_profile_id: Mapped[UUID] = mapped_column(
         ForeignKey(
@@ -304,10 +333,6 @@ class KnowledgeChunkRow(CopilotBase):
         nullable=False,
         index=True,
     )
-    # UNTYPED ``vector``: no fixed dimension is baked into the schema, so a second
-    # embedding model of a different size does not need a migration. The
-    # dimension contract is enforced by the embedding profile plus exact
-    # comparison inside one ACTIVE profile (brief section 16).
     embedding: Mapped[list[float]] = mapped_column(VECTOR(), nullable=False)
     lexical_document: Mapped[str] = mapped_column(
         TSVECTOR,
@@ -320,12 +345,209 @@ class KnowledgeChunkRow(CopilotBase):
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
 
+class KnowledgeContentChunkRow(CopilotBase):
+    """One IMMUTABLE content chunk -- the identity a citation points at.
+
+    Split out from the embedding projection (brief section 3.1) because the two
+    have opposite lifetimes. This row is written once and never rewritten: it is
+    the citation target, so a re-embedding, a retrieval-projection rebuild, a
+    process restart, a retirement or a later version must all leave it intact.
+
+    ``generation`` makes a chunker change non-destructive: rechunking the same
+    immutable version appends generation N+1 and leaves N in place, so a citation
+    into the older chunking still resolves. There is deliberately no
+    ``delete_for_version`` anywhere in this subsystem -- immutable historical
+    knowledge content is not deletable through P3-A.
+    """
+
+    __tablename__ = "knowledge_content_chunk"
+    __table_args__ = (
+        # Short names on purpose. The naming convention prefixes ``ck_<table>_``,
+        # and PostgreSQL truncates an identifier at 63 bytes -- so repeating the
+        # table name inside the constraint name silently produced a DIFFERENT
+        # constraint than the metadata declared, and ``alembic check`` reported
+        # permanent drift. The prefix already says which table these belong to.
+        CheckConstraint("ordinal >= 0", name="ordinal_valid"),
+        CheckConstraint("generation >= 1", name="generation_valid"),
+        CheckConstraint("length(content) > 0", name="content_non_empty"),
+        CheckConstraint("content_hash ~ '^[0-9a-f]{64}$'", name="content_hash_valid"),
+        CheckConstraint("token_count >= 0", name="token_count_valid"),
+        CheckConstraint("length(chunker_version) > 0", name="chunker_version_valid"),
+        # Ordinal is TOTAL inside one generation, which is what lets the stable
+        # semantic ranking key be a total order (brief section 5.1).
+        Index(
+            "uq_knowledge_content_chunk_generation_ordinal",
+            "document_version_id",
+            "generation",
+            "ordinal",
+            unique=True,
+        ),
+        # Full-text search over the chunk's own text. The vector is COMPUTED, so
+        # the lexical projection can never drift from the content it describes --
+        # there is no code path that can forget to update it.
+        Index(
+            "ix_knowledge_content_chunk_lexical",
+            "lexical_document",
+            postgresql_using="gin",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    document_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "knowledge_document.id",
+            ondelete="RESTRICT",
+            name="fk_knowledge_content_chunk_document",
+        ),
+        nullable=False,
+        index=True,
+    )
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "knowledge_document_version.id",
+            ondelete="RESTRICT",
+            name="fk_knowledge_content_chunk_document_version",
+        ),
+        nullable=False,
+        index=True,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    heading_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    language: Mapped[str] = mapped_column(String(16), nullable=False)
+    # Which chunker produced this generation. Persisted so ingestion can tell
+    # whether the CURRENT generation matches the frozen chunker configuration
+    # instead of silently serving a projection built by different code (section 22).
+    chunker_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    lexical_document: Mapped[str] = mapped_column(
+        TSVECTOR,
+        Computed(
+            "to_tsvector('simple', coalesce(heading_path, '') || ' ' || content)",
+            persisted=True,
+        ),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
+class KnowledgeChunkEmbeddingRow(CopilotBase):
+    """The REBUILDABLE embedding projection of one content chunk.
+
+    Holds no content, so it is safe to drop and recreate: a new embedding
+    profile, a re-index, or a full vector rebuild replaces rows here and breaks no
+    citation, because a citation names a ``knowledge_content_chunk`` id.
+
+    ``UNIQUE(content_chunk_id, embedding_profile_id)`` makes re-embedding
+    idempotent: the same chunk in the same space has exactly one vector.
+    """
+
+    __tablename__ = "knowledge_chunk_embedding"
+    __table_args__ = (
+        Index(
+            "uq_knowledge_chunk_embedding_content_profile",
+            "content_chunk_id",
+            "embedding_profile_id",
+            unique=True,
+        ),
+        Index("ix_knowledge_chunk_embedding_profile", "embedding_profile_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    content_chunk_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "knowledge_content_chunk.id",
+            ondelete="RESTRICT",
+            name="fk_knowledge_chunk_embedding_content_chunk",
+        ),
+        nullable=False,
+    )
+    embedding_profile_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "embedding_profile.id",
+            ondelete="RESTRICT",
+            name="fk_knowledge_chunk_embedding_embedding_profile",
+        ),
+        nullable=False,
+    )
+    # UNTYPED ``vector``: no fixed dimension is baked into the schema, so a second
+    # embedding model of a different size does not need a migration. The
+    # dimension contract is enforced by the embedding profile plus exact
+    # comparison inside one ACTIVE profile (brief section 16).
+    embedding: Mapped[list[float]] = mapped_column(VECTOR(), nullable=False)
+    indexed_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
+class AttackReleaseRow(CopilotBase):
+    """One imported ATT&CK release and its authority state.
+
+    Authority lives at RELEASE granularity because "which release is
+    authoritative for this framework" is one fact about one release. The
+    per-framework PARTIAL unique index below makes "at most one authoritative
+    release" a database fact rather than an application convention -- the bug it
+    replaces was exactly a model in which two releases could both claim to be
+    current (brief section 2.1).
+
+    ``content_fingerprint`` makes a pinned release IMMUTABLE: re-importing the
+    same release with different content is refused rather than absorbed. It is
+    NULL only for a release adopted by the migration from rows that predate this
+    table; such a release is verified against what is stored and pinned on the
+    next import of the same bytes, and a NULL fingerprint never counts as a match
+    (brief section 2.2).
+    """
+
+    __tablename__ = "attack_release"
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ({_RELEASE_STATUSES})", name="attack_release_status_valid"
+        ),
+        CheckConstraint(
+            "content_fingerprint IS NULL OR content_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="attack_release_fingerprint_valid",
+        ),
+        CheckConstraint(
+            "technique_count >= 0", name="attack_release_technique_count_valid"
+        ),
+        Index(
+            "uq_attack_release_framework_source_release",
+            "framework",
+            "source_release",
+            unique=True,
+        ),
+        # THE rule of brief section 2.1, expressed as a constraint: a second
+        # ACTIVE release for a framework fails at COMMIT instead of silently
+        # producing two authoritative releases.
+        Index(
+            "uq_attack_release_single_active",
+            "framework",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    framework: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_release: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    technique_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+    activated_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
 class AttackTechniqueRow(CopilotBase):
     """One canonical ATT&CK technique for a pinned source release.
 
     This is the canonical technique fact. A MITRE KnowledgeDocument generated for
     the same technique is RELATED but is not the same authority: the document is
     retrieval content, this row is the technique record.
+
+    ``active`` MIRRORS the owning release's authority and never decides for
+    itself whether it is authoritative; the foreign key makes a technique row
+    with no registered release unrepresentable, so a technique can never be the
+    place where "which release is current" is answered (brief section 2.3).
     """
 
     __tablename__ = "attack_technique"
@@ -342,6 +564,12 @@ class AttackTechniqueRow(CopilotBase):
             "technique_id",
             "source_release",
             unique=True,
+        ),
+        ForeignKeyConstraint(
+            ["framework", "source_release"],
+            ["attack_release.framework", "attack_release.source_release"],
+            ondelete="RESTRICT",
+            name="fk_attack_technique_attack_release_release",
         ),
     )
 

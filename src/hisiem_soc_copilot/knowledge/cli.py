@@ -116,7 +116,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--allow-embedding-profile-switch",
         action="store_true",
-        help="explicitly permit retiring the ACTIVE embedding profile",
+        help=(
+            "LEGACY AND ALWAYS REFUSED: switching the ACTIVE embedding space is a "
+            "whole-corpus reindex, not an ingest, so passing this fails with "
+            "EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX (brief section 4). "
+            "The flag is kept only so an existing caller gets that diagnosis "
+            "instead of an unrecognised-argument error"
+        ),
     )
 
     attack = sub.add_parser("import-attack", help="import a LOCAL MITRE ATT&CK STIX bundle")
@@ -161,12 +167,24 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--allow-embedding-profile-switch",
         action="store_true",
-        help="explicitly permit retiring the ACTIVE embedding profile",
+        help=(
+            "LEGACY AND ALWAYS REFUSED: see the ingest-file flag of the same name"
+        ),
     )
     evaluate.add_argument(
         "--skip-ingest",
         action="store_true",
         help="score an already-ingested corpus instead of ingesting it again",
+    )
+    evaluate.add_argument(
+        "--allow-ambient-corpus",
+        action="store_true",
+        help=(
+            "DEFAULT OFF, and turning it on changes what the run MEANS: skip the "
+            "sealed-corpus precondition and score whatever the database currently "
+            "holds. The result is marked OPEN_CORPUS / NON_SEALED, the artifact "
+            "name carries -open-corpus, and no hybrid gate verdict is produced"
+        ),
     )
     return parser
 
@@ -469,6 +487,7 @@ async def _cmd_evaluate(container: Container, args: argparse.Namespace) -> int:
         overwrite=args.overwrite,
         skip_ingest=args.skip_ingest,
         allow_embedding_profile_switch=args.allow_embedding_profile_switch,
+        allow_ambient_corpus=args.allow_ambient_corpus,
     )
 
 
