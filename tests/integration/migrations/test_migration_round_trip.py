@@ -363,8 +363,15 @@ def test_no_earlier_migration_was_edited_in_place() -> None:
 
     Compared against the reviewed BASELINE rather than against HEAD, because a
     commit that edited ``ed6af82d9b13`` and committed it would look clean against
-    its own parent. The new revision is untracked while the closure is in review,
-    so it does not appear in the diff -- any name at all here is a rewrite.
+    its own parent.
+
+    The filter is what makes this test true in BOTH review states. While the
+    closure is uncommitted its new revision is untracked, and ``git diff`` does
+    not report untracked files at all; once it is committed the same file appears
+    as an addition. Asserting "the diff is empty" therefore passes for the wrong
+    reason in the first state and fails for the wrong reason in the second. What
+    is actually forbidden is a MODIFICATION, DELETION, or RENAME of an existing
+    revision, so that is what is filtered for -- additions are the whole point.
     """
     if shutil.which("git") is None:
         pytest.skip("git is not available")
@@ -392,18 +399,64 @@ def test_no_earlier_migration_was_edited_in_place() -> None:
         pytest.skip(f"baseline commit {_BASELINE_COMMIT} is not present locally")
 
     completed = subprocess.run(
-        ["git", "diff", "--name-only", _BASELINE_COMMIT, "--", "alembic/versions"],
+        [
+            "git",
+            "diff",
+            "--name-status",
+            "--diff-filter=MDRT",
+            _BASELINE_COMMIT,
+            "--",
+            "alembic/versions",
+        ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    changed = [line for line in completed.stdout.splitlines() if line.strip()]
-    assert changed == [], (
+    rewritten = [line for line in completed.stdout.splitlines() if line.strip()]
+    assert rewritten == [], (
         "every migration up to ed6af82d9b13 is frozen; the closure may only ADD "
-        f"revisions. Rewritten: {changed}"
+        f"revisions. Rewritten: {rewritten}"
     )
+
+    # The filter above only sees TRACKED files. An earlier revision that was
+    # deleted from disk without being committed would be invisible to it, so
+    # assert the baseline's own files are still present and unmodified by
+    # comparing each blob against the working tree directly.
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", _BASELINE_COMMIT, "--", "alembic/versions"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tree.returncode == 0, tree.stderr
+    baseline_versions = [line for line in tree.stdout.splitlines() if line.strip()]
+    assert baseline_versions, "the baseline should contain the pre-closure revisions"
+
+    for path in baseline_versions:
+        blob = subprocess.run(
+            ["git", "rev-parse", f"{_BASELINE_COMMIT}:{path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert blob.returncode == 0, blob.stderr
+        current = subprocess.run(
+            ["git", "hash-object", "--", path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert current.returncode == 0, (
+            f"{path} exists at the baseline but is no longer in the working tree"
+        )
+        assert current.stdout.strip() == blob.stdout.strip(), (
+            f"{path} was rewritten; every revision up to ed6af82d9b13 is frozen"
+        )
 
 
 @requires_postgres
