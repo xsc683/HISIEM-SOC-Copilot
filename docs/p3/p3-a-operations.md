@@ -162,7 +162,7 @@ Two databases are relevant here, and they are **not** interchangeable.
 
 | Database | State | Use |
 |---|---|---|
-| `127.0.0.1:5433` | The operator's Copilot database. PostgreSQL 16.15. Revision `979070495d4f` (P2) — **two** revisions behind P3-A head (`ed6af82d9b13`, `c41f7b2e9d08`). `pg_available_extensions` lists neither `vector` nor any pgvector package, so `CREATE EXTENSION vector` **cannot** succeed on this server as packaged. | **READ-ONLY.** Safe for `doctor`, which only reads. Never run `alembic upgrade`/`downgrade` or any DDL against it until its server image carries pgvector (§2.5). |
+| `127.0.0.1:5433` | The operator's Copilot database. PostgreSQL 16.15. Revision `979070495d4f` (P2) — **three** revisions behind P3-A head (`ed6af82d9b13`, `c41f7b2e9d08`, `a5e93c07fd21`). `pg_available_extensions` lists neither `vector` nor any pgvector package, so `CREATE EXTENSION vector` **cannot** succeed on this server as packaged. | **READ-ONLY.** Safe for `doctor`, which only reads. Never run `alembic upgrade`/`downgrade` or any DDL against it until its server image carries pgvector (§2.5). |
 | `127.0.0.1:5434` | The pgvector-capable test database used by the P3-A integration suite. | Migrated, exercised, and cycled by tests. |
 
 That is why the P3-A integration tests hardcode `127.0.0.1:5434` rather than
@@ -187,9 +187,10 @@ knowledge doctor: NOT_READY
   [WARN] embedding_provider: no embedding provider configured (EMBEDDING_PROVIDER=unconfigured): lexical retrieval only
 ```
 
-`attack_release_authority` and `legacy_chunk_table` are absent from that listing
-rather than reported as failures: both query tables the missing schema would not
-have, and the report says why a check did not run instead of repeating the cause.
+`attack_release_authority`, `attack_release_projection` and `legacy_chunk_table`
+are absent from that listing rather than reported as failures: they query tables
+the missing schema would not have, and the report says why a check did not run
+instead of repeating the cause.
 
 ## 3. Migrating
 
@@ -200,8 +201,11 @@ have, and the report says why a check did not run instead of repeating the cause
 ```
 
 The P3-A chain is `979070495d4f` (the P2 response lifecycle migration) →
-`ed6af82d9b13` (the original P3-A schema) → **`c41f7b2e9d08`** (head; the closure
-revision: immutable content chunks and the ATT&CK release model).
+`ed6af82d9b13` (the original P3-A schema) → `c41f7b2e9d08` (the closure revision:
+immutable content chunks and the ATT&CK release model) → **`a5e93c07fd21`** (head;
+the release → knowledge projection binding, which is what lets an import stage a
+release without changing what retrieval serves, plus the fail-closed downgrade
+guard).
 
 `ed6af82d9b13` is released and **strictly unmodifiable**, so the closure's schema
 changes arrive as new revisions stacked on top of it. The upgrade is additive and
@@ -219,9 +223,13 @@ because that table is the rebuildable projection.
 .venv/Scripts/python.exe -m alembic check
 ```
 
-`downgrade -1` undoes **only what `c41f7b2e9d08` created**:
-`knowledge_content_chunk`, `knowledge_chunk_embedding`, `attack_release`, and the
-foreign key it added to `attack_technique`. Every pre-P3-A object —
+At the current head, `downgrade -1` steps back to `c41f7b2e9d08` and undoes **only
+what `a5e93c07fd21` created** — the `attack_release_projection` table — after
+running the downgrade guard (see **Downgrade safety** below). One more step
+(`downgrade -2`, or `downgrade ed6af82d9b13` explicitly) is the one that undoes
+what `c41f7b2e9d08` created: `knowledge_content_chunk`,
+`knowledge_chunk_embedding`, `attack_release`, and the foreign key it added to
+`attack_technique`. Every pre-P3-A object —
 `investigation`, `domain_event`, `outbox_message`, `command_receipt`,
 `orchestration_binding`, `tool_invocation`, `response_proposal`, and the LangGraph
 checkpoint schema — is untouched, and so is `knowledge_chunk`, which
@@ -240,6 +248,48 @@ information.
 `alembic check` must report no drift both after the upgrade and after the
 downgrade/upgrade cycle.
 
+### Downgrade safety
+
+`a5e93c07fd21` puts a **fail-closed guard** in front of `downgrade`. Its
+predecessor `c41f7b2e9d08` dropped `knowledge_content_chunk`,
+`knowledge_chunk_embedding` and `attack_release` unconditionally on the way down,
+and stopped updating the legacy `knowledge_chunk` table on the way up — so once
+this deployment had written through the new tables, downgrading past it destroyed
+that work silently. A migration must be lossless, or it must refuse.
+
+The guard runs **before the first `op.drop_*`**, so a refusal means nothing was
+changed by that run. It raises `P3A_DOWNGRADE_UNSAFE` and names each category with
+its row count — never any content:
+
+| Category | What it counts |
+|---|---|
+| `NEW_CONTENT_CHUNKS` | Content chunks with no pre-closure `knowledge_chunk` row; the old schema has nowhere to put them |
+| `MULTIPLE_CHUNK_GENERATIONS` | Chunks in a generation the old schema has no column for, so its stale generation-1 rows would be re-presented as current |
+| `PROJECTION_CHANGED` | Embedding rows the old single-vector row cannot represent; restoring the stale vector as current would be wrong, not merely lossy |
+| `MUTATED_CONTENT` | Pre-closure chunks whose stored content no longer matches; the old schema would serve stale bytes as current |
+| `PINNED_ATTACK_RELEASE` | A release carrying a content fingerprint, for which the old schema has no column |
+| `ATTACK_PROJECTION_BINDING` | Any release → projection binding at all; the old schema cannot express which version a release staged |
+
+Every predicate is chosen to be **zero** on a database that was upgraded and then
+not written to, so the immediate round trip still passes:
+
+```bash
+# from a pre-closure database: upgrade, then one step back
+.venv/Scripts/python.exe -m alembic upgrade head
+.venv/Scripts/python.exe -m alembic downgrade -1
+```
+
+A guard that blocked *that* would be the bug, not the guard.
+
+**The residual, stated plainly.** The guard has to live in the new revision,
+because `c41f7b2e9d08` is frozen and must not be edited. It therefore intercepts
+any downgrade that **starts at this head** — `downgrade -1` and
+`downgrade <older-revision>` both run it first — but a database left sitting at
+`c41f7b2e9d08` from before this revision existed is **not** covered by it, because
+no function of this revision runs at all. If `alembic current` reports
+`c41f7b2e9d08`, run `alembic upgrade head` first (free — the upgrade is additive)
+and only then downgrade.
+
 ## 4. Schema created
 
 | Table | Purpose |
@@ -251,6 +301,7 @@ downgrade/upgrade cycle.
 | `embedding_profile` | The vector space the chunks were indexed in. At most one ACTIVE. |
 | `attack_release` | The pinned ATT&CK release and its authority. At most one ACTIVE per framework. |
 | `attack_technique` | The pinned technique snapshot belonging to a release. |
+| `attack_release_projection` | The binding of one release's technique to the immutable document version that release **staged**. Provenance, not authority. |
 | `knowledge_chunk` | **Superseded, retained.** `ed6af82d9b13`'s table. P3-A never reads or writes it; it is kept only so `downgrade` can restore it byte for byte. `doctor` reports it rather than dropping it. |
 
 Properties worth checking after a migration:
@@ -279,6 +330,14 @@ Properties worth checking after a migration:
   framework" is therefore a database fact, not a convention: two concurrent
   activations cannot both commit. `uq_attack_release_framework_source_release`
   makes a release name registrable once.
+- `uq_attack_release_projection_release_technique` is unique on
+  `(framework, source_release, technique_id)` — the conflict target that makes a
+  retried stage converge instead of duplicating — and
+  `uq_attack_release_projection_release_document` is unique on
+  `(framework, source_release, document_id)`, so a release cannot claim two
+  different projections of one document. A crash between staging and the cutover
+  therefore re-runs into the same rows rather than into a duplicate or a false
+  conflict.
 
 ## 5. Embedding configuration
 
@@ -384,11 +443,12 @@ knowledge doctor: DEGRADED
   [OK] knowledge_schema: 7 knowledge tables present
   [WARN] active_embedding_profile: no ACTIVE embedding profile: lexical retrieval works, vector and hybrid retrieval are unavailable until a document is ingested
   [WARN] attack_release_authority: no ACTIVE ATT&CK release: every canonical technique row is non-authoritative. ...
+  [WARN] attack_release_projection: no ACTIVE ATT&CK release to check; there is no authoritative projection to compare retrieval against
   [OK] legacy_chunk_table: knowledge_chunk present with 0 superseded row(s): kept only so a downgrade can restore them byte for byte, never read or written by P3-A
   [WARN] embedding_provider: no embedding provider configured (EMBEDDING_PROVIDER=unconfigured): lexical retrieval only
 ```
 
-Seven checks, all read-only:
+Eight checks, all read-only:
 
 | Check | FAIL when | WARN when |
 |---|---|---|
@@ -397,6 +457,7 @@ Seven checks, all read-only:
 | `knowledge_schema` | Any of the **seven** `KNOWLEDGE_TABLES` is missing (the message tells you to run `alembic upgrade head`) | — |
 | `active_embedding_profile` | — | No ACTIVE profile |
 | `attack_release_authority` | More than one ACTIVE release for one framework — `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | No ACTIVE release at all |
+| `attack_release_projection` | An authoritative release has no staged projection for some technique, or its bound documents serve another version — `ATTACK_RELEASE_PROJECTION_DIVERGED` | No ACTIVE release to compare retrieval against |
 | `legacy_chunk_table` | Never | — (reports `absent`, or the retained row count) |
 | `embedding_provider` | — | Not configured |
 
@@ -408,6 +469,14 @@ with the index missing — and then the rows are the only witness left. It is al
 where the ambiguity the upgrade deliberately refused to resolve becomes visible;
 see §8.
 
+`attack_release_projection` is its companion, and it is the one check that compares
+the two facts this closure made move together: the release's authority, and the
+version each of its bound documents actually serves. It is read-only and silent
+about content — technique ids and external keys only — and it is the only place
+`ATTACK_RELEASE_PROJECTION_DIVERGED` is ever reported, because the cutover refuses
+before it can create that state; a dump restore, or revisions applied out of order,
+is how a database reaches it. Re-importing the release cuts it back over (§8).
+
 Verdict: `NOT_READY` on any failure, `DEGRADED` on any warning, else `READY`.
 Exit code is `1` for `NOT_READY`, `0` otherwise.
 
@@ -415,17 +484,17 @@ Exit code is `1` for `NOT_READY`, `0` otherwise.
 channel is not": lexical retrieval works. Collapsing that into either `READY` or
 `NOT_READY` would either overstate what works or hide a working path.
 
-When the database is unreachable, the five dependent checks are reported as
-`FAIL — not checked: the database is unreachable` rather than piling on with five
+When the database is unreachable, the six dependent checks are reported as
+`FAIL — not checked: the database is unreachable` rather than piling on with six
 echoes of the same cause. `embedding_provider` still runs: it reads configuration,
 not the database, so it has an answer even when nothing else does.
 
 When the schema is missing, only `active_embedding_profile` is appended as
 `not checked: the knowledge schema is missing (run: alembic upgrade head)`, and
-`attack_release_authority`, `legacy_chunk_table`, and the profile check are simply
-absent. That is the one case where the check count is short of seven, and it is
-deliberate: three more lines saying "no such table" would bury the one line that
-tells the operator what to do.
+`attack_release_authority`, `attack_release_projection`, `legacy_chunk_table`, and
+the profile check are simply absent. That is the one case where the check count is
+short of eight, and it is deliberate: four more lines saying "no such table" would
+bury the one line that tells the operator what to do.
 
 ## 7. Ingesting a document
 
@@ -502,11 +571,21 @@ versions_ingested=214 unchanged=0 skipped=0
 ```
 
 - Enterprise only. An unsupported framework is refused.
-- `--activate` is the **explicit** release switch. Without it, this release's rows
-  are created **inactive** and the framework's current authority is untouched. With
-  it, this release's rows become active and every other release *of the same
-  framework* becomes inactive, in one transaction. A **new release adds new rows**;
+- `--activate` is the **explicit authority switch**, and it is now the only thing
+  that can change what retrieval serves. Registration and staging happen either
+  way: the release's canonical rows are written, and every technique is ingested as
+  an immutable version with its chunks and embeddings. `--activate` adds the
+  **cutover** on top — one transaction that validates the staged projection, flips
+  this release's authority, sets every other release *of the same framework*
+  inactive, and moves each bound document's pointer to the version **this release
+  staged**. Without `--activate` the release is registered and **fully staged but
+  INACTIVE**: its versions, chunks and embeddings all exist, and ordinary retrieval
+  keeps serving exactly what it served before. A **new release adds new rows**;
   old releases are never deleted and stay readable by their own `source_release`.
+- Re-importing a release that is **already** authoritative cuts over again even
+  without `--activate`, because the import has authority intent whenever the stored
+  release is ACTIVE. That is the repair path for a projection that has drifted: it
+  re-validates and re-points, or refuses with nothing written.
 - A release is registered in `attack_release` with a **content fingerprint** — a
   SHA-256 over its canonical technique collection, sorted by
   `(technique_id, source_stix_id)`, with `tactics`/`platforms` sorted and deduped.
@@ -525,8 +604,44 @@ versions_ingested=214 unchanged=0 skipped=0
 
 The canonical `attack_technique` row and the knowledge document are **related but
 not the same authority**: the row is the canonical projection, the document is a
-**retrieval projection** of it, and both derive from the same canonical function so
-they cannot drift.
+**retrieval projection** of it, and the canonical row hash and the document
+version's content hash come from the same canonical function, so a projected
+document cannot describe content its canonical row does not.
+
+What that does **not** say is that retrieval is automatically serving the
+authoritative release. A document carries one `active_version_id`, and "the
+projection is of the same content" is not the same claim as "this is the version
+retrieval returns". `attack_release_projection` is what closes that gap: it records
+the exact version a release staged, and the cutover moves the pointers to it.
+
+### Registration, staging, cutover
+
+An import is three acts, and only the third can change what anyone can read.
+
+1. **Registration.** The bundle is parsed, fingerprinted, and verified against the
+   pinned release; the `attack_release` row and its `attack_technique` rows are
+   then written **INACTIVE**, in one short transaction. A bundle that conflicts
+   with the pinned fingerprint is refused here, before anything is written.
+2. **Staging.** Every technique is ingested through the ordinary
+   version/chunk/embedding path with `activate_version=False`: the immutable
+   version, its chunks and its embeddings are all created, and **no document
+   pointer moves**. One `attack_release_projection` binding is recorded per
+   technique, all of them in a single short transaction of their own (one per
+   release, not one per technique), so a retry after a crash converges instead of
+   duplicating.
+3. **Cutover**, only when the import has authority intent. One transaction takes
+   the framework's advisory lock, validates the projection **before mutating
+   anything**, flips the release's authority and the `attack_technique.active`
+   mirror, then points every bound document at the version this release staged.
+   Because it is one transaction, a refusal — whether it is caught before the
+   first write or while resolving a binding — leaves the release's authority and
+   every document pointer exactly where they were.
+
+The consequence to hold on to: a release that is registered and staged but never
+cut over is **fully projected and completely invisible to retrieval**. Before this
+closure, staging went through the generic ingest path, which activated each new
+version unconditionally — so importing a release for backfill silently changed what
+normal retrieval returned.
 
 ### A pinned release is immutable
 
@@ -815,6 +930,10 @@ P2 response/durability tests, and the ToolRegistry selectable-name set
 | `InvalidSchemaName: no schema has been selected to create in` on the first migration | Existing volume: `docker-entrypoint-initdb.d` never ran | `CREATE SCHEMA IF NOT EXISTS copilot;` (§2.3) |
 | `doctor` → `NOT_READY`, `attack_release_authority` FAIL, `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | More than one ACTIVE release for one framework | Import the intended release with `--activate`; leave the others inactive (§8) |
 | `import-attack` → `ATTACK_RELEASE_CONTENT_CONFLICT` | The same release name was imported with a different technique collection | Re-import the pinned bundle, or use a new release name (§8) |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_INCOMPLETE` | The staged projection is not complete: a crash mid-staging, or a bound document was retired underneath the release | Re-run the same import to finish staging; the message names the missing techniques. Nothing was changed (§8) |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` | A binding does not resolve, or its content hash no longer matches its canonical row | The staged projection is not of this release's content. Re-run the import; if it persists, the database was restored out of band (§8) |
+| `doctor` → `NOT_READY`, `attack_release_projection` FAIL, `ATTACK_RELEASE_PROJECTION_DIVERGED` | The authoritative release and what normal retrieval serves disagree | Re-import that release. It is already ACTIVE, so the import cuts over even without `--activate` (§8) |
+| `alembic downgrade` → `P3A_DOWNGRADE_UNSAFE` | The database holds rows the pre-closure schema cannot represent | Nothing was changed. Take a physical backup and remove the listed rows deliberately, or stay at head. If `alembic current` is `c41f7b2e9d08`, run `alembic upgrade head` first (§3, **Downgrade safety**) |
 | `ingest-file` → `EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX` | The configured provider differs from the ACTIVE profile | Switching the embedding space is a whole-corpus reindex, not an ingest; restore the original provider configuration, or reindex the corpus (§5) |
 | `evaluate` → `CORPUS_PRECONDITION_FAILED` | The database does not hold exactly the sealed fixture in the expected scopes | Use a dedicated database, or run with `--allow-ambient-corpus` and read the result as `OPEN_CORPUS`, not as the baseline (§11) |
 | `doctor` → `DEGRADED`, `active_embedding_profile` WARN | No document ingested yet | Ingest one; or configure the embedding provider and re-ingest |

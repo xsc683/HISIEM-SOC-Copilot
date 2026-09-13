@@ -736,3 +736,177 @@ def test_no_per_document_embedding_profile_switch_path_is_executable() -> None:
         asyncio.run(handler.ingest(command))
 
     assert opened == [], "the refusal must happen before the handler reads anything"
+
+# ---------------------------------------------------------------------------
+# section 5 (continued) -- the ATT&CK staging/cutover split
+#
+# The closure's central claim is that an import can no longer make the
+# authoritative release and the served content disagree. That claim rests on three
+# structural facts about the code, and each is asserted here where it could be
+# undone by a later edit:
+#
+#   * staging ingests WITHOUT moving the pointer;
+#   * registration never touches release authority;
+#   * the only thing that moves a pointer for a release is the cutover, and the
+#     only thing that gates it is the shared ``activate_version`` flag, whose
+#     default keeps every ordinary ingest behaving exactly as before.
+# ---------------------------------------------------------------------------
+
+_ATTACK_IMPORT = "application/handlers/attack_import.py"
+_INGESTION_HANDLER = "application/handlers/knowledge.py"
+
+
+def _module_tree(relative: str) -> ast.Module:
+    """Parse one production module. Raises if the file moved, never skips."""
+    path = PKG / relative
+    assert path.is_file(), f"{relative} should exist; the guard is scanning nothing"
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found; the guard is asserting about nothing")
+
+
+def _called_names(node: ast.AST) -> list[str]:
+    """Every ``f(...)`` and ``x.y(...)`` call name appearing under ``node``."""
+    found: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            if isinstance(func, ast.Name):
+                found.append(func.id)
+            elif isinstance(func, ast.Attribute):
+                found.append(func.attr)
+    return found
+
+
+def test_attack_staging_ingests_without_moving_the_active_pointer() -> None:
+    """Staging must be inert: it projects knowledge, it does not publish it.
+
+    ``activate_version=False`` is the whole mechanism. Without it an
+    ``activate=False`` import would still move ``active_version_id``, which is
+    precisely the defect this closure fixes -- an inactive release changing what
+    normal retrieval serves (brief sections 2.4/2.5).
+    """
+    tree = _module_tree(_ATTACK_IMPORT)
+    staging = _function(tree, "_stage_documents")
+
+    ingests = [
+        node
+        for node in ast.walk(staging)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "IngestKnowledgeDocument"
+    ]
+    assert ingests, "_stage_documents should build an IngestKnowledgeDocument"
+
+    for call in ingests:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert "activate_version" in keywords, (
+            "the ATT&CK staging path must state activate_version explicitly; "
+            "defaulting to True is the defect"
+        )
+        value = keywords["activate_version"]
+        assert isinstance(value, ast.Constant) and value.value is False, (
+            "ATT&CK staging must ingest with activate_version=False, so a staged "
+            "release cannot become what retrieval serves"
+        )
+
+
+def test_attack_registration_never_touches_release_authority() -> None:
+    """Registration writes canonical rows; authority changes only at the cutover.
+
+    Registering a release and making it authoritative are different acts. If
+    registration flipped authority, a crash between registration and projection
+    would leave a release authoritative whose content retrieval does not serve --
+    the divergence, reintroduced through the back door (brief section 2.7).
+    """
+    tree = _module_tree(_ATTACK_IMPORT)
+    registration = _function(tree, "_persist_release")
+    names = _called_names(registration)
+
+    assert "activate" not in names, (
+        "registering a release must not activate it; that belongs to _cutover"
+    )
+    assert "set_active_for_release" not in names, (
+        "the technique mirror is owned by the cutover, not by registration"
+    )
+
+
+def test_activation_goes_through_the_cutover_transaction() -> None:
+    """The one path that makes a release authoritative, and it is atomic.
+
+    ``import_release`` must call ``_cutover``, and ``_cutover`` must do the
+    authority flip, the mirror and the pointer move under ONE ``commit`` -- so a
+    reader can never observe authority switched while retrieval still serves the
+    previous release (brief sections 2.7/2.8).
+    """
+    tree = _module_tree(_ATTACK_IMPORT)
+    entry = _called_names(_function(tree, "import_release"))
+    assert "_cutover" in entry, (
+        "import_release must run the cutover; otherwise nothing activates a release"
+    )
+
+    cutover = _function(tree, "_cutover")
+    names = _called_names(cutover)
+    for required in ("activate", "set_active_for_release", "activate_version"):
+        assert required in names, (
+            f"_cutover should perform {required}; the authority flip and the "
+            "pointer move must be one transition"
+        )
+    commits = [
+        node
+        for node in ast.walk(cutover)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "commit"
+    ]
+    assert len(commits) == 1, (
+        f"_cutover must commit exactly once, found {len(commits)}: the authority "
+        "flip and the pointer move have to land together"
+    )
+
+
+def test_only_the_activate_version_flag_gates_the_pointer_move() -> None:
+    """The ordinary "re-ingesting old content is not a rollback" rule survives.
+
+    ``KnowledgeIngestionHandler`` must call ``document.activate_version`` exactly
+    once, and only inside ``if command.activate_version:``. That is what lets the
+    ATT&CK staging path be inert WITHOUT weakening the generic rule for runbooks
+    and curated guidance (brief section 2.4).
+    """
+    tree = _module_tree(_INGESTION_HANDLER)
+    handler = _function(tree, "_persist")
+
+    moves: list[ast.Call] = []
+    guards: list[ast.If] = []
+    for node in ast.walk(handler):
+        if isinstance(node, ast.If):
+            guards.append(node)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "activate_version"
+        ):
+            moves.append(node)
+
+    assert len(moves) == 1, (
+        f"expected exactly one activate_version call in _persist, found {len(moves)}"
+    )
+    guarded = [
+        node
+        for node in guards
+        if any(call is move for call in ast.walk(node) for move in moves)
+    ]
+    assert guarded, (
+        "the pointer move must sit inside a conditional; unconditional activation "
+        "is the defect"
+    )
+    test = guarded[0].test
+    assert isinstance(test, ast.Attribute) and test.attr == "activate_version", (
+        "the pointer move must be gated on command.activate_version specifically, "
+        "not on some other condition that merely happens to hold today"
+    )

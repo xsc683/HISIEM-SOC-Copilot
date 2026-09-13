@@ -21,6 +21,7 @@ from ...application.ports.durable import (
     ToolInvocationStore,
 )
 from ...application.ports.knowledge import (
+    AttackReleaseProjectionRepository,
     AttackReleaseRepository,
     AttackTechniqueRepository,
     EmbeddingProfileRepository,
@@ -58,6 +59,7 @@ from .repositories.durable import (
 )
 from .repositories.investigation import SqlAlchemyInvestigationRepository
 from .repositories.knowledge import (
+    SqlAlchemyAttackReleaseProjectionRepository,
     SqlAlchemyAttackReleaseRepository,
     SqlAlchemyAttackTechniqueRepository,
     SqlAlchemyEmbeddingProfileRepository,
@@ -178,6 +180,9 @@ class SqlAlchemyUnitOfWork:
         )
         self.attack_releases: AttackReleaseRepository = (
             SqlAlchemyAttackReleaseRepository(self._session)
+        )
+        self.attack_release_projections: AttackReleaseProjectionRepository = (
+            SqlAlchemyAttackReleaseProjectionRepository(self._session)
         )
         self.attack_techniques: AttackTechniqueRepository = (
             SqlAlchemyAttackTechniqueRepository(self._session)

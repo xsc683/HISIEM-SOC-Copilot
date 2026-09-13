@@ -415,6 +415,38 @@ class AttackTechniqueRecord:
 
 
 @dataclass(frozen=True)
+class AttackReleaseProjectionRecord:
+    """One technique's staged knowledge projection for ONE release.
+
+    Release identity and knowledge content identity are DIFFERENT facts. Two
+    releases may carry byte-identical technique content, in which case they share
+    one immutable ``KnowledgeDocumentVersion`` -- reuse is correct, because the
+    content is the same. What must not be shared is the CLAIM that a given release
+    projected a given version.
+
+    ``source_version`` on the version cannot carry that claim: it records which
+    release happened to CREATE the row, so on a shared version it names one
+    release and silently misattributes the other. Re-deriving the binding from
+    content hashes is likewise insufficient -- it yields the set of releases whose
+    content matches, not which projection a release actually staged, and the row
+    ids are random so no derivation can reconstruct the one a caller observed.
+
+    This row is therefore the binding of record. Because it names the exact
+    ``document_version_id`` at stage time, re-activating an older release restores
+    the version it staged instead of re-deriving one (brief section 2.6).
+    """
+
+    id: UUID
+    framework: str
+    source_release: str
+    technique_id: str
+    document_id: UUID
+    document_version_id: UUID
+    content_hash: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class AttackImportOutcome:
     """What a release import actually changed (idempotent by construction)."""
 
@@ -440,7 +472,9 @@ class KnowledgeDocumentRepository(Protocol):
     variant, so an Agent path cannot accidentally query the global corpus.
     """
 
-    async def get(self, *, tenant_id: str, document_id: UUID) -> KnowledgeDocument | None: ...
+    async def get(
+        self, *, tenant_id: str | None, document_id: UUID
+    ) -> KnowledgeDocument | None: ...
 
     async def find_by_external_key(
         self,
@@ -471,7 +505,7 @@ class KnowledgeDocumentRepository(Protocol):
     ) -> KnowledgeDocumentVersion | None: ...
 
     async def get_version(
-        self, *, tenant_id: str, document_version_id: UUID
+        self, *, tenant_id: str | None, document_version_id: UUID
     ) -> KnowledgeDocumentVersion | None: ...
 
     async def list_versions(
@@ -669,6 +703,86 @@ class AttackTechniqueRepository(Protocol):
         tool would read, but the flag is a MIRROR of the release's authority --
         never an independent source of it (brief section 2.3). Rows are never
         deleted, so an older release stays readable by its own ``source_release``.
+        """
+        ...
+
+
+class AttackReleaseProjectionRepository(Protocol):
+    """The release -> knowledge projection binding, and the atomic cutover.
+
+    Staging and activation are separate acts. Staging only appends bindings and
+    never touches a document pointer; activation is one transaction that validates
+    completeness and then moves the whole framework's pointers at once. Splitting
+    them is what makes "an inactive release cannot change what retrieval serves"
+    true by construction rather than by ordering discipline (brief sections
+    2.5/2.7).
+    """
+
+    async def record_many(
+        self, *, projections: Sequence[AttackReleaseProjectionRecord]
+    ) -> None:
+        """Stage bindings idempotently.
+
+        Conflicting on ``(framework, source_release, technique_id)`` and doing
+        nothing, so a retry after a crash mid-projection converges instead of
+        producing a duplicate or a false conflict (brief section 2.8).
+        """
+        ...
+
+    async def list_for_release(
+        self, *, framework: str, source_release: str
+    ) -> tuple[AttackReleaseProjectionRecord, ...]:
+        """Read a release's bindings in a total deterministic order."""
+        ...
+
+    async def count_for_release(self, *, framework: str, source_release: str) -> int:
+        """How many techniques of this release have a staged projection."""
+        ...
+
+    async def missing_techniques(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Canonical techniques of this release that have NO staged projection.
+
+        The completeness precondition for activation. Returns technique ids
+        rather than a count, so a refusal can name what is missing without
+        dumping any content.
+        """
+        ...
+
+    async def lock_framework(self, *, framework: str) -> None:
+        """Serialize cutovers for one framework for the rest of the transaction.
+
+        A transaction-scoped advisory lock rather than ``SELECT ... FOR UPDATE``:
+        the FIRST activation of a framework has no ACTIVE row to lock, so a row
+        lock would leave exactly the case that matters unserialized. Released
+        automatically at COMMIT or ROLLBACK (brief section 2.9).
+        """
+        ...
+
+    async def diverged_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Bound documents whose live pointer is NOT this release's projection.
+
+        The diagnostic that makes the failure this closure fixes VISIBLE. An
+        authoritative release whose documents serve some other version means
+        canonical authority and retrieval disagree -- a state no write path can
+        produce any more, and exactly the state an operator restoring a dump or
+        applying revisions out of order can still reach. Returns external keys so
+        the report names the documents without dumping content.
+        """
+        ...
+
+    async def unusable_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Bound documents of this release that normal retrieval cannot serve.
+
+        A RETIRED document is terminal and excluded from normal search, so cutting
+        a release over to it would leave the framework authoritative for content
+        retrieval cannot return. Checked as part of the same precondition as
+        completeness, before any mutation (brief section 2.7).
         """
         ...
 

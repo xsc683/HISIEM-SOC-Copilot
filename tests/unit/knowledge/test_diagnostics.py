@@ -140,6 +140,7 @@ class _SpyUnitOfWork:
         self._releases = tuple(releases)
         self.embedding_profiles = self
         self.attack_releases = self
+        self.attack_release_projections = self
 
     async def __aenter__(self) -> _SpyUnitOfWork:
         return self
@@ -154,6 +155,23 @@ class _SpyUnitOfWork:
     async def list_active(self) -> tuple[AttackReleaseRecord, ...]:
         self._calls.append("attack_releases.list_active")
         return self._releases
+
+    async def missing_techniques(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """The spy has no bindings to be missing.
+
+        It models the CHECK's queries, not the cutover: an empty projection set
+        means "nothing diverged", which is the state a healthy deployment is in.
+        """
+        self._calls.append("attack_release_projections.missing_techniques")
+        return ()
+
+    async def diverged_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        self._calls.append("attack_release_projections.diverged_documents")
+        return ()
 
 
 def _release(framework: str, source_release: str) -> AttackReleaseRecord:
@@ -234,7 +252,15 @@ async def test_the_profile_check_still_runs_once_the_schema_exists() -> None:
         embedding_configured=True,
         embedding_detail="configured",
     )
-    assert calls == ["embedding_profiles.get_active", "attack_releases.list_active"]
+    # ``attack_releases.list_active`` twice: the authority check reads the
+    # release rows, and the projection check reads the same rows to compare each
+    # authoritative release against what retrieval actually serves. The point of
+    # the assertion is unchanged -- the profile check still runs.
+    assert calls == [
+        "embedding_profiles.get_active",
+        "attack_releases.list_active",
+        "attack_releases.list_active",
+    ]
     by_name = {check.name: check for check in report.checks}
     assert by_name["active_embedding_profile"].status == WARN
     assert report.overall == DEGRADED

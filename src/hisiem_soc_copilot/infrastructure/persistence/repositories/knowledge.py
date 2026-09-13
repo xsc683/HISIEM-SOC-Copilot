@@ -46,18 +46,22 @@ from sqlalchemy import (
     insert,
     or_,
     select,
+    text,
     update,
 )
 
 # Aliased: ``typing.cast`` (used for the rowcount result) and SQLAlchemy's SQL
 # ``cast`` expression are different functions with the same name.
 from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, aliased
 
 from ....application.ports.knowledge import (
     ATTACK_RELEASE_STATUS_ACTIVE,
     ATTACK_RELEASE_STATUS_INACTIVE,
+    AttackReleaseProjectionRecord,
+    AttackReleaseProjectionRepository,
     AttackReleaseRecord,
     AttackReleaseRepository,
     AttackTechniqueRecord,
@@ -88,10 +92,12 @@ from ..mappers.knowledge import (
     document_to_row,
     embedding_to_row,
     profile_to_row,
+    projection_values,
     release_to_row,
     row_to_content_chunk,
     row_to_document,
     row_to_profile,
+    row_to_projection,
     row_to_release,
     row_to_technique,
     row_to_version,
@@ -99,6 +105,7 @@ from ..mappers.knowledge import (
     version_to_row,
 )
 from ..orm.knowledge import (
+    AttackReleaseProjectionRow,
     AttackReleaseRow,
     AttackTechniqueRow,
     EmbeddingProfileRow,
@@ -145,7 +152,7 @@ _ChunkViewSelect = Select[
 ]
 
 
-def _scope_predicate(tenant_id: str) -> ColumnElement[bool]:
+def _scope_predicate(tenant_id: str | None) -> ColumnElement[bool]:
     """The one scope rule: GLOBAL rows plus this tenant's own TENANT rows.
 
     This mirrors :meth:`KnowledgeDocument.is_visible_to` exactly. It is a SCOPE,
@@ -390,7 +397,7 @@ class SqlAlchemyKnowledgeDocumentRepository(KnowledgeDocumentRepository):
         self._session = session
 
     async def get(
-        self, *, tenant_id: str, document_id: UUID
+        self, *, tenant_id: str | None, document_id: UUID
     ) -> KnowledgeDocument | None:
         """Load one document the tenant may read (GLOBAL, or its own TENANT row)."""
         result = await self._session.execute(
@@ -510,7 +517,7 @@ class SqlAlchemyKnowledgeDocumentRepository(KnowledgeDocumentRepository):
         return row_to_version(row) if row is not None else None
 
     async def get_version(
-        self, *, tenant_id: str, document_version_id: UUID
+        self, *, tenant_id: str | None, document_version_id: UUID
     ) -> KnowledgeDocumentVersion | None:
         """Load one immutable version by joining to its document for scope.
 
@@ -1193,3 +1200,151 @@ class SqlAlchemyAttackTechniqueRepository(AttackTechniqueRepository):
             ),
         )
         return int(result.rowcount)
+
+class SqlAlchemyAttackReleaseProjectionRepository(AttackReleaseProjectionRepository):
+    """The release -> knowledge projection binding, and its completeness checks.
+
+    Staging appends bindings only; it never touches a document pointer. The
+    cutover that DOES move pointers lives in the import handler, on the aggregate
+    path, so the domain event recording "this document now serves version N" is
+    emitted exactly as it is for an ordinary ingest. The split is what makes "an
+    inactive release cannot change what retrieval serves" true by construction
+    rather than by ordering discipline (brief sections 2.5/2.7).
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def record_many(
+        self, *, projections: Sequence[AttackReleaseProjectionRecord]
+    ) -> None:
+        """Stage bindings idempotently.
+
+        ``ON CONFLICT DO NOTHING`` on the natural key is what makes a retry after
+        a crash mid-projection converge: rows already staged stay, missing ones
+        are appended, and no duplicate or false conflict is produced (brief
+        section 2.8).
+        """
+        if not projections:
+            return
+        await self._session.execute(
+            pg_insert(AttackReleaseProjectionRow)
+            .values([projection_values(item) for item in projections])
+            .on_conflict_do_nothing(
+                index_elements=["framework", "source_release", "technique_id"]
+            )
+        )
+
+    async def list_for_release(
+        self, *, framework: str, source_release: str
+    ) -> tuple[AttackReleaseProjectionRecord, ...]:
+        """Read a release's bindings ordered by ``technique_id`` (``COLLATE "C"``).
+
+        A total deterministic order, so a cutover iterates the same sequence on
+        every run and on every database built from the same corpus.
+        """
+        result = await self._session.execute(
+            select(AttackReleaseProjectionRow)
+            .where(
+                AttackReleaseProjectionRow.framework == framework,
+                AttackReleaseProjectionRow.source_release == source_release,
+            )
+            .order_by(AttackReleaseProjectionRow.technique_id.collate("C"))
+        )
+        return tuple(row_to_projection(row) for row in result.scalars().all())
+
+    async def count_for_release(self, *, framework: str, source_release: str) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(AttackReleaseProjectionRow)
+            .where(
+                AttackReleaseProjectionRow.framework == framework,
+                AttackReleaseProjectionRow.source_release == source_release,
+            )
+        )
+        return int(result.scalar_one())
+
+    async def missing_techniques(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Canonical techniques of this release with NO staged projection.
+
+        Driven by the CANONICAL rows rather than by the binding table, so a
+        binding naming a technique the release does not have cannot be mistaken
+        for completeness. Ordered for a reproducible refusal message.
+        """
+        bound = select(AttackReleaseProjectionRow.technique_id).where(
+            AttackReleaseProjectionRow.framework == framework,
+            AttackReleaseProjectionRow.source_release == source_release,
+        )
+        result = await self._session.execute(
+            select(AttackTechniqueRow.technique_id)
+            .where(
+                AttackTechniqueRow.framework == framework,
+                AttackTechniqueRow.source_release == source_release,
+                AttackTechniqueRow.technique_id.not_in(bound),
+            )
+            .order_by(AttackTechniqueRow.technique_id.collate("C"))
+        )
+        return tuple(result.scalars().all())
+
+    async def diverged_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Bound documents whose live pointer is not this release's projection.
+
+        ``IS DISTINCT FROM`` rather than ``<>`` for the same reason the ranking
+        key uses it: a NULL ``active_version_id`` (a document whose only version
+        was staged, never activated) is a divergence, and ``<>`` would drop it.
+        """
+        result = await self._session.execute(
+            select(KnowledgeDocumentRow.external_key)
+            .join(
+                AttackReleaseProjectionRow,
+                AttackReleaseProjectionRow.document_id == KnowledgeDocumentRow.id,
+            )
+            .where(
+                AttackReleaseProjectionRow.framework == framework,
+                AttackReleaseProjectionRow.source_release == source_release,
+                KnowledgeDocumentRow.active_version_id.is_distinct_from(
+                    AttackReleaseProjectionRow.document_version_id
+                ),
+            )
+            .order_by(KnowledgeDocumentRow.external_key.collate("C"))
+        )
+        return tuple(result.scalars().all())
+
+    async def unusable_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Bound documents of this release that normal retrieval cannot serve."""
+        result = await self._session.execute(
+            select(KnowledgeDocumentRow.external_key)
+            .join(
+                AttackReleaseProjectionRow,
+                AttackReleaseProjectionRow.document_id == KnowledgeDocumentRow.id,
+            )
+            .where(
+                AttackReleaseProjectionRow.framework == framework,
+                AttackReleaseProjectionRow.source_release == source_release,
+                KnowledgeDocumentRow.status != DocumentStatus.ACTIVE.value,
+            )
+            .order_by(KnowledgeDocumentRow.external_key.collate("C"))
+        )
+        return tuple(result.scalars().all())
+
+    async def lock_framework(self, *, framework: str) -> None:
+        """Serialize cutovers for one framework for the rest of the transaction.
+
+        A transaction-scoped ADVISORY lock, not ``SELECT ... FOR UPDATE``: the
+        first activation of a framework has no ACTIVE release row to lock, so a
+        row lock would leave exactly the case that most needs serializing
+        unprotected. The lock is keyed on the framework name, taken before the
+        reads a cutover decision depends on, and released automatically at COMMIT
+        or ROLLBACK (brief section 2.9).
+        """
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:framework, 0))"),
+            {"framework": framework},
+        )
+

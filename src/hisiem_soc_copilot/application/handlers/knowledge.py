@@ -318,12 +318,20 @@ class KnowledgeIngestionHandler:
                 content_chunks=content_chunks, batch=batch, profile=profile
             )
         )
-        document.activate_version(
-            version_id=version.id,
-            version=version.version,
-            content_hash=version.content_hash,
-            title=version.title,
-        )
+        if command.activate_version:
+            # The ONLY writer of ``active_version_id`` on this path. A staged
+            # ingest (``activate_version=False``) persists the same immutable
+            # version, chunks and embeddings and then stops: the document row is
+            # saved unchanged, because nothing about which version retrieval
+            # serves has changed. That is what keeps a staged ATT&CK release
+            # invisible to normal retrieval while still being fully projected
+            # (brief sections 2.4/2.5).
+            document.activate_version(
+                version_id=version.id,
+                version=version.version,
+                content_hash=version.content_hash,
+                title=version.title,
+            )
         await uow.knowledge_documents.save(document=document)
         await self._flush_events(uow, document)
         await uow.commit()

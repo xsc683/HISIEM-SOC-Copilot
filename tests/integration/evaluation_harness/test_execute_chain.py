@@ -1,7 +1,8 @@
 """E1-C1 execute chain over real Postgres (E1-C1 §9/§22 live proof, scripted HISIEM).
 
 Drives one sealed GP-01 manifest through the REAL production pipeline: real
-Copilot PostgreSQL (5433), real LangGraph Postgres checkpoint, real
+Copilot PostgreSQL (the session scratch database on the pgvector test server),
+real LangGraph Postgres checkpoint, real
 domain/outbox/runner code, real graph — with an injected FakeHisiem (alert
 hydration) and the explicit deterministic ScriptedModelProvider. Asserts the
 sealed manifest -> verify -> launch projection ONLY -> StartAlertInvestigation ->
@@ -47,6 +48,7 @@ from hisiem_soc_copilot.evaluation_harness.record import (
 )
 from hisiem_soc_copilot.infrastructure.checkpoint.postgres import PostgresCheckpointer
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 from tests.unit.evaluation_harness._seal_helpers import seal_dataset
 
 _DATASET_RUN_ID = "e1c1-chain-run"
@@ -74,34 +76,10 @@ _TRUNCATE = (
 
 def _settings(tmp_path: Path) -> Settings:
     s = Settings()
-    s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
-    s.langgraph.database_url = s.database.database_url
+    apply_settings(s)
     s.evaluation.runs_dir = str(tmp_path / "runs")
     s.evaluation.executions_dir = str(tmp_path / "executions")
     return s
-
-
-async def _db_reachable(settings: Settings) -> bool:
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(settings.database.database_url)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True
-    except Exception:
-        return False
 
 
 async def _truncate(factory: async_sessionmaker[AsyncSession]) -> None:
@@ -133,8 +111,8 @@ async def _open_env(
 ) -> AsyncIterator[tuple[Settings, Any, Any, Container]]:
     """Open a real-Postgres environment (truncated) and yield it for one test."""
     settings = _settings(tmp_path)
-    if not await _db_reachable(settings):
-        pytest.skip("PostgreSQL not reachable — skipping E1-C1 integration test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     seal_dataset(
         runs_dir=Path(settings.evaluation.runs_dir),
         dataset_run_id=_DATASET_RUN_ID,

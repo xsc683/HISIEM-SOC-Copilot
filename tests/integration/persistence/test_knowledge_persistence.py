@@ -106,6 +106,7 @@ from hisiem_soc_copilot.infrastructure.persistence.repositories.knowledge import
     SqlAlchemyKnowledgeChunkRepository,
     SqlAlchemyKnowledgeDocumentRepository,
 )
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 
 #: Every table this module writes. The legacy ``knowledge_chunk`` is included
 #: because the upgrade leaves it in place and a leak from a previous run would
@@ -121,8 +122,6 @@ _TRUNCATE = (
     "attack_technique",
     "attack_release",
 )
-
-_DATABASE_URL = "postgresql+psycopg://copilot:copilot@127.0.0.1:5434/copilot"
 
 # Naive UTC instants: the knowledge columns are ``timestamp without time zone``, so
 # a naive value round-trips byte-identically and equality assertions stay honest.
@@ -193,44 +192,24 @@ _V_BOTH: tuple[float, ...] = (0.5, 0.5, 0.0, 0.0)
 
 def _settings() -> Settings:
     settings = Settings()
-    settings.database.database_url = _DATABASE_URL
+    apply_settings(settings)
     return settings
 
 
-def _db_reachable() -> bool:
-    """Sync reachability probe so the module-level skipif can decide at import."""
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(_DATABASE_URL)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
 pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="pgvector PostgreSQL not reachable on 127.0.0.1:5434",
+    not server_reachable(),
+    reason=SKIP_REASON,
 )
 
 
 @pytest_asyncio.fixture
-async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(_DATABASE_URL)
+async def session_factory(
+    scratch_db_url: str,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    engine = create_async_engine(scratch_db_url)
 
     async def _clean() -> None:
-        """Clear ONLY the five knowledge tables (never anything else)."""
+        """Clear ONLY the eight knowledge tables (never anything else)."""
         targets = ", ".join(f"copilot.{table}" for table in _TRUNCATE)
         async with engine.begin() as conn:
             await conn.execute(text(f"TRUNCATE {targets} RESTART IDENTITY CASCADE"))

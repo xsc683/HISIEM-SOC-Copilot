@@ -26,6 +26,7 @@ from hisiem_soc_copilot.api.app import create_app
 from hisiem_soc_copilot.config import Settings
 from tests.fixtures.hisiem_fake import FakeHisiem
 from tests.fixtures.ssh_models import GroundedSshModel
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 
 _TRUNCATE = (
     "tool_invocation",
@@ -49,40 +50,16 @@ _TRUNCATE = (
 
 def _settings() -> Settings:
     s = Settings()
-    s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
-    s.langgraph.database_url = s.database.database_url
+    apply_settings(s)
     s.auth.trusted_context_provider = "header"
     return s
-
-
-async def _db_reachable(settings: Settings) -> bool:
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(settings.database.database_url)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True
-    except Exception:
-        return False
 
 
 @pytest_asyncio.fixture
 async def chain_client() -> AsyncIterator[tuple[httpx.AsyncClient, Any]]:
     settings = _settings()
-    if not await _db_reachable(settings):
-        pytest.skip("PostgreSQL not reachable — skipping durable API chain test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
 
     async def _truncate(session_factory: Any) -> None:
         async with session_factory() as session:

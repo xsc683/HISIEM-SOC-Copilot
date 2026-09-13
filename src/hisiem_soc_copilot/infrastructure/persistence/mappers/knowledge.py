@@ -24,6 +24,7 @@ business fact — replaying it would duplicate the audit ledger.
 from __future__ import annotations
 
 from ....application.ports.knowledge import (
+    AttackReleaseProjectionRecord,
     AttackReleaseRecord,
     AttackTechniqueRecord,
     ChunkEmbeddingRecord,
@@ -37,6 +38,7 @@ from ....domain.knowledge.entities import (
 )
 from ....domain.knowledge.enums import DocumentStatus, SourceKind, Visibility
 from ..orm.knowledge import (
+    AttackReleaseProjectionRow,
     AttackReleaseRow,
     AttackTechniqueRow,
     EmbeddingProfileRow,
@@ -311,3 +313,38 @@ def row_to_technique(row: AttackTechniqueRow) -> AttackTechniqueRecord:
         active=row.active,
         created_at=row.created_at,
     )
+
+def row_to_projection(row: AttackReleaseProjectionRow) -> AttackReleaseProjectionRecord:
+    """Rebuild a release-projection binding from its row.
+
+    A pure translation: the binding is authoritative in the database and is never
+    re-derived from content, which is what keeps re-activating an older release
+    restoring the version that release staged (brief section 2.6).
+    """
+    return AttackReleaseProjectionRecord(
+        id=row.id,
+        framework=row.framework,
+        source_release=row.source_release,
+        technique_id=row.technique_id,
+        document_id=row.document_id,
+        document_version_id=row.document_version_id,
+        content_hash=row.content_hash,
+        created_at=row.created_at,
+    )
+
+
+def projection_values(
+    projection: AttackReleaseProjectionRecord,
+) -> dict[str, object]:
+    """Translate a projection record into INSERT values."""
+    return {
+        "id": projection.id,
+        "framework": projection.framework,
+        "source_release": projection.source_release,
+        "technique_id": projection.technique_id,
+        "document_id": projection.document_id,
+        "document_version_id": projection.document_version_id,
+        "content_hash": projection.content_hash,
+        "created_at": projection.created_at,
+    }
+

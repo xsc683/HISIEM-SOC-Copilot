@@ -44,6 +44,19 @@ class IngestKnowledgeDocument:
     #: profile means a corpus-wide reindex, never a side effect of one document's
     #: ingest (brief section 4.1). No value of this flag switches anything.
     allow_embedding_profile_switch: bool = False
+    #: Whether this ingest may move the document's ACTIVE version pointer.
+    #:
+    #: ``True`` -- the default, and the behaviour of every ordinary caller -- is
+    #: "record this version and make it the one retrieval serves". ``False``
+    #: records the immutable version, its chunks and its embeddings WITHOUT
+    #: touching ``active_version_id``, which is what lets a staged ATT&CK release
+    #: be fully projected while the framework's current authority keeps serving
+    #: its own content (brief sections 2.4/2.5).
+    #:
+    #: This is deliberately NOT the generic rollback the ingestion handler
+    #: refuses: a staged ingest never moves the pointer, in either direction. The
+    #: ordinary "re-ingesting old content is not a rollback" rule is untouched.
+    activate_version: bool = True
     command_id: UUID = field(default_factory=uuid4)
 
 

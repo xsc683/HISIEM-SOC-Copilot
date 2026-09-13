@@ -36,17 +36,18 @@ import os
 import shutil
 import subprocess
 import sys
-import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from sqlalchemy.engine import make_url
 
 from hisiem_soc_copilot.domain.knowledge.value_objects import (
     compute_content_hash,
     normalize_knowledge_content,
 )
+from tests.support.db_runtime import scratch_database_url
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 COMPOSE_FILE = REPO_ROOT / "infra" / "docker-compose.yml"
@@ -59,12 +60,22 @@ _PASSWORD = "copilot"
 
 #: The revision the closure branches from. Every migration up to and including it
 #: is frozen; the closure's new migration must revise exactly this one.
+#: The revision the PREVIOUS closure branched from.
 _PREVIOUS_REVISION = "ed6af82d9b13"
-_HEAD_REVISION = "c41f7b2e9d08"
+#: The previous closure's revision -- now the revision BELOW head, and the one
+#: that actually drops the closure's tables when it is downgraded through.
+_CLOSURE_REVISION = "c41f7b2e9d08"
+_HEAD_REVISION = "a5e93c07fd21"
 
 #: The reviewed P3-A baseline. Pinned so the "frozen migrations were not edited"
 #: check compares against the commit a reviewer read rather than against HEAD.
 _BASELINE_COMMIT = "4724720653b64afac5928965b41c7c1fc3721825"
+
+#: The remote head the PREVIOUS closure was reviewed at. Every revision present
+#: THERE is frozen too, which is what protects the previous closure's own
+#: migration: it is an ADDITION relative to _BASELINE_COMMIT, so a
+#: modification filter against that baseline cannot see an edit to it.
+_REVIEWED_COMMIT = "94e779523019698f92a267c20dfa893bba6ca355"
 
 _AMBIGUOUS_CODE = "ATTACK_RELEASE_AUTHORITY_AMBIGUOUS"
 
@@ -169,20 +180,14 @@ def _alembic_ok(*args: str, database_url: str) -> str:
 
 @pytest.fixture
 def scratch_database() -> Iterator[str]:
-    """A throwaway database on the pgvector server, dropped afterwards.
+    """A throwaway database on the pgvector test server, dropped afterwards.
 
-    The schema is created by hand, mirroring what the operations doc tells an
-    operator to do for an EXISTING volume: the container's init script only runs
-    for an empty data directory, so an already-initialised cluster gets the
-    namespace from the operator, not from the entrypoint.
+    Delegates to the suite-wide helper so there is ONE place that decides which
+    server destructive tests may use. The name is random per test, so two runs
+    never share a database.
     """
-    name = f"copilot_p3a_rt_{uuid.uuid4().hex[:12]}"
-    _execute(f'CREATE DATABASE "{name}"')
-    try:
-        _execute("CREATE SCHEMA IF NOT EXISTS copilot", database=name)
-        yield name
-    finally:
-        _execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    with scratch_database_url(prefix="copilot_p3a_rt_") as url:
+        yield make_url(url).database or ""
 
 
 def _seed_legacy_rows(database: str) -> None:
@@ -652,6 +657,14 @@ def test_downgrade_and_upgrade_round_trip_converges(scratch_database: str) -> No
     url = _database_url(scratch_database)
     _prepare_legacy_database(scratch_database)
 
+    # TWO steps now. Head carries the projection binding and the downgrade
+    # guard; only the SECOND step crosses the revision that drops the closure's
+    # tables. Both are allowed here because this database has had no application
+    # write since the upgrade, which is exactly the precondition the guard
+    # checks -- a refusal on this path would be the bug, not the fix (brief
+    # section 3.4).
+    _alembic_ok("downgrade", "-1", database_url=url)
+    assert _alembic_ok("current", database_url=url).split()[0] == _CLOSURE_REVISION
     _alembic_ok("downgrade", "-1", database_url=url)
 
     current = _alembic_ok("current", database_url=url)
@@ -704,3 +717,77 @@ def test_downgrade_and_upgrade_round_trip_converges(scratch_database: str) -> No
     )
     assert authorities == [(_FRAMEWORK_UNANIMOUS, 1)], authorities
     assert "No new upgrade operations detected." in _alembic_ok("check", database_url=url)
+
+
+
+def _commit_exists(commit: str) -> bool:
+    """Whether ``commit`` is present locally, so the guard can skip rather than fail."""
+    completed = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def test_every_revision_up_to_the_previous_reviewed_head_is_frozen() -> None:
+    """The previous closure's own migration must be as unmodifiable as the rest.
+
+    ``test_no_earlier_migration_was_edited_in_place`` filters for
+    MODIFICATION/DELETION/RENAME against ``_BASELINE_COMMIT``. That baseline
+    PREDATES the previous closure, so its new revision appears there as an
+    ADDITION -- and additions are deliberately allowed. An in-place edit to it
+    would therefore have passed that check silently, which is a real gap and not
+    a theoretical one: this closure's whole migration story depends on that
+    revision being exactly what a reviewer read.
+
+    Pinned by CONTENT rather than by a diff, so the only thing that can satisfy it
+    is the same bytes.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git is not available")
+    if not _commit_exists(_REVIEWED_COMMIT):
+        pytest.skip(f"commit {_REVIEWED_COMMIT} is not present locally")
+
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", _REVIEWED_COMMIT, "--", "alembic/versions"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert listed.returncode == 0, listed.stderr
+    frozen = [line for line in listed.stdout.splitlines() if line.strip()]
+    assert frozen, "the reviewed head should contain the migrations up to it"
+
+    for path in frozen:
+        expected = subprocess.run(
+            ["git", "rev-parse", f"{_REVIEWED_COMMIT}:{path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert expected.returncode == 0, expected.stderr
+        actual = subprocess.run(
+            ["git", "hash-object", "--", path],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert actual.returncode == 0, (
+            f"{path} was reviewed at {_REVIEWED_COMMIT} but is no longer in the "
+            "working tree"
+        )
+        assert actual.stdout.strip() == expected.stdout.strip(), (
+            f"{path} was rewritten after review; every revision up to "
+            f"{_CLOSURE_REVISION} is frozen"
+        )
+
+    # ...and this closure's own migration is an ADDITION, never an edit of one.
+    assert _HEAD_REVISION not in " ".join(frozen), (
+        "this closure must ADD a revision, not rewrite one that was reviewed"
+    )

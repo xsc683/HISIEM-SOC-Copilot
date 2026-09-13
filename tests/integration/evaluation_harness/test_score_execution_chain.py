@@ -1,7 +1,7 @@
 """E1-C4 scorer + result→finding integrity over real Postgres (§4, §16, §22).
 
 Drives the SAME ``score_execution`` the operator CLI calls against a REAL Copilot
-Postgres (schema ``copilot`` on :5433):
+Postgres (the session scratch database on the pgvector test server):
 
 - the golden E1-C3 chain (a grounded provider over the real durable pipeline) is
   scored end to end: the persisted ``InvestigationResult`` verdict matches the sealed
@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -88,12 +89,12 @@ from tests.integration.evaluation_harness.test_execute_tool_evidence_chain impor
     _DATASET_RUN_ID,
     _SSH_SCRIPT,
     _TENANT,
-    _db_reachable,
     _RecordingScripted,
     _SealedS1Hisiem,
     _settings,
     _truncate,
 )
+from tests.support.db_runtime import SKIP_REASON, server_reachable
 from tests.unit.evaluation_harness._seal_helpers import seal_dataset
 
 
@@ -104,10 +105,8 @@ def _grounded_provider() -> _RecordingScripted:
 @pytest_asyncio.fixture
 async def real_settings(tmp_path: Path) -> AsyncIterator[tuple[Settings, object]]:
     settings = _settings(tmp_path)
-    if not await _db_reachable(settings):
-        import pytest
-
-        pytest.skip("PostgreSQL not reachable — skipping E1-C4 integration test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     seal_dataset(
         runs_dir=Path(settings.evaluation.runs_dir), dataset_run_id=_DATASET_RUN_ID
     )

@@ -585,3 +585,94 @@ class AttackTechniqueRow(CopilotBase):
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
+class AttackReleaseProjectionRow(CopilotBase):
+    """The binding of one release's technique to the version it staged.
+
+    The table exists because two facts that look like one are genuinely two.
+    "Release v15.1 carries this technique's content" and "the immutable version
+    row this release projects is V" are different claims: v14.1 and v15.1 may
+    carry byte-identical content and therefore share V, in which case a single
+    version row cannot record which release staged it. ``source_version`` on the
+    version records only which release CREATED it, which misattributes the other.
+
+    The binding is written at STAGE time and never re-derived, so re-activating an
+    older release restores the exact version that release staged rather than a
+    version reconstructed from whatever currently matches (brief section 2.6).
+
+    Nothing here confers authority. Which release is authoritative is
+    ``attack_release.status``; this row says only which version a release's
+    projection IS, which is what the atomic cutover moves the document pointers
+    to (brief section 2.10).
+    """
+
+    __tablename__ = "attack_release_projection"
+    __table_args__ = (
+        CheckConstraint(
+            "content_hash ~ '^[0-9a-f]{64}$'",
+            name="content_hash_valid",
+        ),
+        # One projection per (release, technique): the natural key, and the
+        # conflict target that makes a retried stage converge (brief section 2.8).
+        Index(
+            "uq_attack_release_projection_release_technique",
+            "framework",
+            "source_release",
+            "technique_id",
+            unique=True,
+        ),
+        # A release may not claim two different projections of one document.
+        Index(
+            "uq_attack_release_projection_release_document",
+            "framework",
+            "source_release",
+            "document_id",
+            unique=True,
+        ),
+        Index(
+            "ix_attack_release_projection_document",
+            "document_id",
+        ),
+        ForeignKeyConstraint(
+            ["framework", "source_release"],
+            ["attack_release.framework", "attack_release.source_release"],
+            ondelete="RESTRICT",
+            name="fk_attack_release_projection_release",
+        ),
+        ForeignKeyConstraint(
+            ["framework", "technique_id", "source_release"],
+            [
+                "attack_technique.framework",
+                "attack_technique.technique_id",
+                "attack_technique.source_release",
+            ],
+            ondelete="RESTRICT",
+            name="fk_attack_release_projection_technique",
+        ),
+        # RESTRICT, not CASCADE: a projection that silently vanished with its
+        # version would leave a release authoritative for content retrieval can
+        # no longer return.
+        ForeignKeyConstraint(
+            ["document_id"],
+            ["knowledge_document.id"],
+            ondelete="RESTRICT",
+            name="fk_attack_release_projection_document",
+        ),
+        ForeignKeyConstraint(
+            ["document_version_id"],
+            ["knowledge_document_version.id"],
+            ondelete="RESTRICT",
+            name="fk_attack_release_projection_version",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True)
+    framework: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_release: Mapped[str] = mapped_column(String(32), nullable=False)
+    technique_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(nullable=False)
+    document_version_id: Mapped[UUID] = mapped_column(nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(nullable=False)
+

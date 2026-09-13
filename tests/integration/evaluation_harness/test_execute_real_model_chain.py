@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -53,6 +54,7 @@ from hisiem_soc_copilot.evaluation_harness.telemetry import (
 )
 from hisiem_soc_copilot.infrastructure.llm.scripted import ScriptedModelProvider
 from tests.fixtures.hisiem_fake import FakeHisiem
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 from tests.unit.evaluation_harness._seal_helpers import seal_dataset
 
 _DATASET_RUN_ID = "e1c2-chain-run"
@@ -86,37 +88,13 @@ _SCRIPTED_VERDICT: dict[str, object] = {
 
 def _settings(tmp_path: Path) -> Settings:
     s = Settings()
-    s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
-    s.langgraph.database_url = s.database.database_url
+    apply_settings(s)
     s.evaluation.runs_dir = str(tmp_path / "runs")
     s.evaluation.executions_dir = str(tmp_path / "executions")
     # E1_C2_REAL_MODEL profile gate requires the openai_compatible provider label;
     # the REAL provider is never built because a double is always injected below.
     s.llm.provider = "openai_compatible"
     return s
-
-
-async def _db_reachable(settings: Settings) -> bool:
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(settings.database.database_url)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True
-    except Exception:
-        return False
 
 
 async def _truncate(factory: async_sessionmaker[AsyncSession]) -> None:
@@ -162,10 +140,8 @@ async def real_env(
     tmp_path: Path,
 ) -> AsyncIterator[tuple[Settings, Any, Container]]:
     settings = _settings(tmp_path)
-    if not await _db_reachable(settings):
-        import pytest
-
-        pytest.skip("PostgreSQL not reachable — skipping E1-C2 integration test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     seal_dataset(
         runs_dir=Path(settings.evaluation.runs_dir), dataset_run_id=_DATASET_RUN_ID
     )
@@ -413,10 +389,8 @@ async def real_settings(tmp_path: Path) -> AsyncIterator[tuple[Settings, Any]]:
     post-run DB assertions.
     """
     settings = _settings(tmp_path)
-    if not await _db_reachable(settings):
-        import pytest
-
-        pytest.skip("PostgreSQL not reachable — skipping E1-C2 integration test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     seal_dataset(
         runs_dir=Path(settings.evaluation.runs_dir), dataset_run_id=_DATASET_RUN_ID
     )

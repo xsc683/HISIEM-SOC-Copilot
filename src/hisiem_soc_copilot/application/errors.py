@@ -142,6 +142,35 @@ class AttackReleaseAuthorityAmbiguousError(ApplicationError):
     code = "ATTACK_RELEASE_AUTHORITY_AMBIGUOUS"
 
 
+class AttackReleaseProjectionIncompleteError(ApplicationError):
+    """A release cannot be made authoritative until its projection is complete.
+
+    Authority is a claim about what retrieval serves. Switching the release while
+    some of its techniques have no staged projection would make the framework
+    authoritative for content retrieval cannot return -- the exact divergence
+    between canonical authority and the retrieval projection this closure exists
+    to close (brief sections 2.5/2.7).
+
+    Detected BEFORE any mutation, inside the cutover transaction, so a refused
+    activation leaves the authoritative release and every document pointer
+    exactly as they were.
+    """
+
+    code = "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+
+
+class AttackReleaseProjectionMissingVersionError(ApplicationError):
+    """A staged projection names a document version that does not resolve.
+
+    Defensive: the projection's foreign key makes this state unreachable, and the
+    check exists so that "unreachable" is verified at cutover time rather than
+    assumed. Cutting over to a version that cannot be read would serve nothing
+    while claiming authority (brief section 2.7).
+    """
+
+    code = "ATTACK_RELEASE_PROJECTION_MISSING_VERSION"
+
+
 class KnowledgeCorpusPreconditionError(ApplicationError):
     """The corpus under evaluation is not the corpus the baseline expects.
 

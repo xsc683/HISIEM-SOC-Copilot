@@ -158,7 +158,65 @@ modelling it per technique is what previously allowed two releases to be
 authoritative at once. `attack_technique` remains the pinned technique *snapshot*
 — one row per technique — and each row references its release by
 `(framework, source_release)`. See [security-boundary.md](security-boundary.md)
-§11 for the immutability rule and its fingerprint.
+§10 for the immutability rule and its fingerprint.
+
+An import is three acts, and keeping them apart is what makes the authority claim
+true rather than merely intended:
+
+1. **Registration.** The bundle is parsed, fingerprinted, and verified against the
+   pinned immutability rule; the release and its canonical technique rows are then
+   written **INACTIVE**, in one short transaction. `activate=True` does not
+   activate anything at this point — it records that the import has authority
+   *intent*.
+2. **Staging.** Each technique is ingested through the ordinary knowledge path
+   with `activate_version=False`, so its immutable version, its chunks and its
+   embeddings are all created — but `active_version_id` is **not** moved. One
+   binding row per technique is then recorded in `attack_release_projection`.
+   A staged release is therefore fully projected and completely invisible to
+   retrieval.
+3. **Cutover**, only when the import has authority intent. It is ONE transaction:
+   take the framework's advisory lock, **validate before any mutation**, flip the
+   release's authority, mirror `attack_technique.active`, then move each bound
+   document's pointer through `activate_version()`. Authority and retrieval
+   therefore switch together or not at all.
+
+### `AttackReleaseProjection` — the release → version binding
+
+| Field | Notes |
+|---|---|
+| `id`, `framework`, `source_release`, `technique_id` | Unique on `(framework, source_release, technique_id)` — the natural key, and the conflict target a retried stage converges on |
+| `document_id`, `document_version_id` | The exact immutable version this release staged |
+| `content_hash` | The staged version's hash, checked against its canonical row's at cutover |
+| `created_at` | |
+
+The row exists because two facts that look like one are genuinely two: *this
+release carries this technique's content*, and *the immutable version row this
+release projects is V*. Two releases may carry byte-identical technique content
+and therefore share a single `KnowledgeDocumentVersion` — reuse is correct, the
+content is the same — and then the version row alone cannot record which release
+staged it.
+
+`source_version` on the version cannot serve as the binding. It records which
+release happened to **create** the row, so on a shared version it names one release
+and silently misattributes the other. Re-deriving the binding from content hashes
+fails for the same reason — it yields the set of releases whose content matches,
+not which projection a release actually staged — and the row ids are random, so no
+derivation can reconstruct the one a caller observed. The binding is written once,
+at stage time, and never re-derived; that is what makes re-activating an older
+release restore the exact version it staged.
+
+The binding is **provenance, not authority**. Which release is authoritative is
+`attack_release.status`; this row says only which version a release's projection
+*is*, which is what the cutover moves the document pointers to.
+
+### Why the cutover did not weaken `activate_version`
+
+`KnowledgeDocument.activate_version()` keeps its forward-only contract for
+ordinary knowledge. Re-ingesting historical content still never rolls a document's
+active pointer backwards — that rule lives in `_converge_on_existing`, unchanged —
+and a staged ingest never moves the pointer in either direction. The cutover is a
+different act with its own explicit semantics, which is why the generic rule was
+left alone rather than relaxed to accommodate it.
 
 ## 3. Normalization and hashing
 
@@ -216,6 +274,11 @@ There is deliberately **no** `PUBLIC`/`PRIVATE`/`ORG`/`GROUP`/`USER`/
   RETIRED document. Re-activating the already-active version is a legal no-op for
   idempotent replay — but it still emits the audit event, so the ledger records
   that the version was re-confirmed.
+- "Forward only" is a rule of the ordinary ingestion path, not a property of the
+  aggregate method. The one deliberate exception is the ATT&CK **cutover**, which
+  points a bound document at the version its release staged even when that version
+  is older than the one currently served — restoring an earlier release means
+  restoring its projection, and §2 gives that act its own explicit semantics.
 - The activation is always written in the **same transaction** that persists the
   version and its chunks, so a pointer can never reference a version whose
   retrieval projection is missing.
@@ -310,10 +373,14 @@ Restating the invariant because it is the thing most likely to erode:
 - An `AttackRelease` is the **authoritative pinned snapshot** of an external
   corpus, and its authority extends no further than "this is the release the
   canonical rows came from".
+- An `AttackReleaseProjection` is a **release → version binding** — provenance,
+  not authority. It records which immutable version a release staged and confers
+  nothing: it cannot activate, approve, or be read as a claim about which release
+  is authoritative.
 - A retrieval score is a **ranking signal**.
 - A citation is a **validated reference**.
 
-None of the five is business authority. Knowledge cannot authorize, approve,
+None of these is business authority. Knowledge cannot authorize, approve,
 execute, change a tenant, change a policy, create a Verdict, or call SOAR.
 `is_visible_to()` decides whose *retrieval* may read a row; it grants nothing
 else.

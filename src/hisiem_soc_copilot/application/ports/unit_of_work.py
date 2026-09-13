@@ -17,6 +17,7 @@ from .durable import (
     ToolInvocationStore,
 )
 from .knowledge import (
+    AttackReleaseProjectionRepository,
     AttackReleaseRepository,
     AttackTechniqueRepository,
     EmbeddingProfileRepository,
@@ -69,6 +70,7 @@ class UnitOfWork(Protocol):
     embedding_profiles: EmbeddingProfileRepository
     attack_techniques: AttackTechniqueRepository
     attack_releases: AttackReleaseRepository
+    attack_release_projections: AttackReleaseProjectionRepository
 
     async def commit(self) -> None: ...
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -34,6 +35,7 @@ from hisiem_soc_copilot.domain.investigation.value_objects import (
     ExternalResourceRef,
 )
 from hisiem_soc_copilot.infrastructure.persistence.unit_of_work import SqlAlchemyUnitOfWork
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 
 # Tables the durable tests insert into, in FK-safe truncation order.
 _TRUNCATE = (
@@ -58,34 +60,8 @@ _TRUNCATE = (
 
 def _settings() -> Settings:
     s = Settings()
-    s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
-    s.langgraph.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
+    apply_settings(s)
     return s
-
-
-async def _db_reachable() -> bool:
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(_settings().database.database_url)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        conn.execute("SELECT 1")
-        conn.close()
-        return True
-    except Exception:
-        return False
 
 
 async def _clean(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -98,10 +74,8 @@ async def _clean(session_factory: async_sessionmaker[AsyncSession]) -> None:
 
 @pytest_asyncio.fixture
 async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    if not await _db_reachable():
-        import pytest
-
-        pytest.skip("PostgreSQL not reachable — skipping durable runtime integration")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     settings = _settings()
     engine = create_async_engine(settings.database.database_url)
     factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)

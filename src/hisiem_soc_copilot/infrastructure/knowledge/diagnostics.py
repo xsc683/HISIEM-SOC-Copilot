@@ -45,6 +45,12 @@ KNOWLEDGE_TABLES: tuple[str, ...] = (
     "knowledge_chunk_embedding",
     "attack_release",
     "attack_technique",
+    # The release -> knowledge projection binding. Listed here because the
+    # schema check is what STOPS the dependent checks from running: a database
+    # at the previous revision has every other table and not this one, and
+    # without it the projection check would query a missing table and take the
+    # whole command down with a traceback instead of reporting FAIL.
+    "attack_release_projection",
 )
 
 #: The pre-closure chunk table. Superseded by ``knowledge_content_chunk`` plus
@@ -169,6 +175,9 @@ async def collect_diagnostics(
         else:
             checks.append(await _check_active_profile(unit_of_work_factory))
             checks.append(await _check_attack_release_authority(unit_of_work_factory))
+            checks.append(
+                await _check_attack_release_projection(unit_of_work_factory)
+            )
             checks.append(await _check_legacy_chunk_table(engine))
     else:
         # Do not pile on: every later check would fail for the same reason and
@@ -178,6 +187,7 @@ async def collect_diagnostics(
             "knowledge_schema",
             "active_embedding_profile",
             "attack_release_authority",
+            "attack_release_projection",
             "legacy_chunk_table",
         ):
             checks.append(
@@ -271,6 +281,68 @@ async def _check_active_profile(
         OK,
         f"{profile.provider}/{profile.model_id} dim={profile.dimension} "
         f"{profile.distance_metric}",
+    )
+
+
+async def _check_attack_release_projection(
+    unit_of_work_factory: Callable[[], UnitOfWork],
+) -> DiagnosticCheck:
+    """Assert retrieval serves each authoritative release's own projection.
+
+    The canonical release authority and the Knowledge ``active_version_id``
+    pointer are two facts, and this closure made them change together -- but the
+    only way to know a given database actually HAS them together is to compare
+    them. An authoritative release whose techniques have no staged projection, or
+    whose documents serve a different version, is the exact divergence the
+    closure exists to prevent, and without this check it is invisible: retrieval
+    answers confidently while ``attack_release`` claims something else.
+
+    Reported as ``ATTACK_RELEASE_PROJECTION_DIVERGED``. Read-only, and silent
+    about content -- technique ids and external keys only.
+    """
+    async with unit_of_work_factory() as uow:
+        active = await uow.attack_releases.list_active()
+        diverged: list[str] = []
+        for release in active:
+            missing = await uow.attack_release_projections.missing_techniques(
+                framework=release.framework, source_release=release.source_release
+            )
+            if missing:
+                diverged.append(
+                    f"{release.framework}/{release.source_release}: no projection "
+                    f"for {', '.join(missing)}"
+                )
+                continue
+            stale = await uow.attack_release_projections.diverged_documents(
+                framework=release.framework, source_release=release.source_release
+            )
+            if stale:
+                diverged.append(
+                    f"{release.framework}/{release.source_release}: serving another "
+                    f"version for {', '.join(stale)}"
+                )
+
+    if diverged:
+        return DiagnosticCheck(
+            "attack_release_projection",
+            FAIL,
+            "ATTACK_RELEASE_PROJECTION_DIVERGED - the authoritative release and "
+            "normal retrieval disagree: "
+            + "; ".join(diverged)
+            + ". Re-import the release with --activate to stage and cut over "
+            "atomically (see docs/p3/p3-a-operations.md)",
+        )
+    if not active:
+        return DiagnosticCheck(
+            "attack_release_projection",
+            WARN,
+            "no ACTIVE ATT&CK release to check; there is no authoritative "
+            "projection to compare retrieval against",
+        )
+    return DiagnosticCheck(
+        "attack_release_projection",
+        OK,
+        "every authoritative release serves its own staged projection",
     )
 
 

@@ -24,6 +24,7 @@ from .evidence import (
 )
 from .investigation import InvestigationRow
 from .knowledge import (
+    AttackReleaseProjectionRow,
     AttackReleaseRow,
     AttackTechniqueRow,
     EmbeddingProfileRow,
@@ -77,6 +78,7 @@ __all__ = [
     "KnowledgeChunkRow",
     "KnowledgeContentChunkRow",
     "KnowledgeChunkEmbeddingRow",
+    "AttackReleaseProjectionRow",
     "AttackReleaseRow",
     "AttackTechniqueRow",
 ]

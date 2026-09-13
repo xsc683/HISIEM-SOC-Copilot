@@ -44,15 +44,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
+from ...domain.knowledge.entities import (
+    KnowledgeDocument,
+    KnowledgeDocumentVersion,
+)
 from ...domain.knowledge.enums import SourceKind, Visibility
 from ...domain.knowledge.value_objects import normalize_and_hash
 from ..commands.knowledge import ImportAttackRelease, IngestKnowledgeDocument
-from ..errors import ApplicationError, AttackReleaseContentConflictError
+from ..errors import (
+    ApplicationError,
+    AttackReleaseContentConflictError,
+    AttackReleaseProjectionIncompleteError,
+    AttackReleaseProjectionMissingVersionError,
+)
 from ..ports.attack import FRAMEWORK, AttackBundle, AttackBundleParser, AttackTechnique
 from ..ports.clock import ClockPort
 from ..ports.knowledge import (
     ATTACK_RELEASE_STATUS_INACTIVE,
     AttackImportOutcome,
+    AttackReleaseProjectionRecord,
     AttackReleaseRecord,
     AttackTechniqueRecord,
 )
@@ -124,9 +134,16 @@ class AttackImportHandler:
         bundle = self._parser.parse(command.payload)
 
         outcome = await self._persist_release(command, bundle)
-        documents_created, versions_ingested, unchanged = await self._ingest_documents(
+        documents_created, versions_ingested, unchanged = await self._stage_documents(
             command, bundle
         )
+        if outcome.wants_authority:
+            # The ONLY transition that makes a release authoritative, and the only
+            # thing that moves a document pointer. It runs after the projection is
+            # complete and does both in ONE transaction, so canonical authority and
+            # what retrieval serves switch together or not at all -- there is no
+            # window in which they disagree (brief section 2.7).
+            await self._cutover(command)
 
         return AttackImportOutcome(
             release=command.release,
@@ -136,7 +153,7 @@ class AttackImportHandler:
             versions_ingested=versions_ingested,
             unchanged=unchanged,
             skipped=bundle.skipped_ids,
-            release_active=outcome.release_active,
+            release_active=outcome.wants_authority,
             content_fingerprint=outcome.content_fingerprint,
             release_created=outcome.release_created,
         )
@@ -171,24 +188,25 @@ class AttackImportHandler:
             existing = await uow.attack_releases.find(
                 framework=framework, source_release=release
             )
-            others = tuple(
-                item
-                for item in await uow.attack_releases.list_for_framework(
-                    framework=framework
-                )
-                if item.source_release != release
-            )
-
-            active = command.activate or (
+            # "This import HAS the authority intent" -- it does not itself make
+            # the release authoritative. Activation is a separate, atomic
+            # transition that runs only once the projection is complete (brief
+            # sections 2.5/2.7).
+            wants_authority = command.activate or (
                 existing is not None and existing.is_active
             )
+            # The mirror records the release's CURRENT STORED authority, never the
+            # import's intent: a release under registration is INACTIVE until the
+            # cutover makes it otherwise, so its rows must not claim authority
+            # early (brief section 2.3).
+            stored_authority = existing is not None and existing.is_active
             # The canonical rows are built BEFORE the fingerprint, because the
             # fingerprint is defined over exactly these rows. One function computes
             # each row's content hash and one function fingerprints the collection,
             # so the release fingerprint and the document projected from those rows
             # cannot describe different content (brief section 2.3).
             records = tuple(
-                _record_of(technique, release, framework, now, active=active)
+                _record_of(technique, release, framework, now, active=stored_authority)
                 for technique in bundle.techniques
             )
             fingerprint = fingerprint_from_records(
@@ -225,10 +243,6 @@ class AttackImportHandler:
             # Only a real transition is written: re-importing an already-active
             # release must not restamp its activation time, or "when did this
             # become authoritative" would drift on every idempotent re-run.
-            transitions_to_active = active and (
-                existing is None or not existing.is_active
-            )
-
             created = 0
             if existing is None or (
                 await uow.attack_techniques.count_for_release(
@@ -240,36 +254,18 @@ class AttackImportHandler:
                 await uow.attack_techniques.add_many(techniques=records)
                 created = len(records)
 
-            # The technique rows' flag is a MIRROR of release authority, so it is
-            # re-asserted on every path rather than left to depend on how the rows
-            # happened to be written.
-            #
-            # Only an import that LEAVES this release authoritative may clear the
-            # framework's others. Staging a release (``activate=False``) is not the
-            # same act as promoting it, and deposing the current release as a side
-            # effect of importing a bundle an operator has not adopted would be a
-            # silent authority change (brief section 2.1).
-            if active:
-                for other in others:
-                    await uow.attack_techniques.set_active_for_release(
-                        framework=framework,
-                        source_release=other.source_release,
-                        active=False,
-                    )
-            await uow.attack_techniques.set_active_for_release(
-                framework=framework, source_release=release, active=active
-            )
-            if transitions_to_active:
-                await uow.attack_releases.activate(
-                    framework=framework, source_release=release, now=now
-                )
+            # The mirror and the authority flip are deliberately NOT written here.
+            # They belong to the cutover, which is the only act that changes what
+            # retrieval serves; doing either here would let an import that never
+            # reaches the cutover leave the framework claiming an authority whose
+            # content retrieval does not return (brief sections 2.3/2.7).
 
             await uow.commit()
 
         return _ReleaseOutcome(
             created=created,
             release_created=release_created,
-            release_active=active,
+            wants_authority=wants_authority,
             content_fingerprint=fingerprint,
         )
 
@@ -315,16 +311,27 @@ class AttackImportHandler:
     # ------------------------------------------------------------------
     # knowledge documents
     # ------------------------------------------------------------------
-    async def _ingest_documents(
+    async def _stage_documents(
         self, command: ImportAttackRelease, bundle: AttackBundle
     ) -> tuple[int, int, int]:
-        """Ingest one GLOBAL document per technique through the ordinary path."""
+        """Project each technique into knowledge WITHOUT changing retrieval.
+
+        Every version, chunk and embedding is created by the ordinary ingestion
+        path -- there is no second ingestion path to keep honest -- but with
+        ``activate_version=False``, so none of it becomes the version retrieval
+        serves. The binding rows written at the end record which version THIS
+        release staged, which is what the cutover later moves the pointers to and
+        what makes re-activating an older release restore its own projection
+        rather than a re-derived one (brief sections 2.5/2.6).
+        """
         documents_created = 0
         versions_ingested = 0
         unchanged = 0
+        projections: list[AttackReleaseProjectionRecord] = []
         for technique in bundle.techniques:
             outcome = await self._ingestion.ingest(
                 IngestKnowledgeDocument(
+                    activate_version=False,
                     source_kind=SourceKind.MITRE_ATTACK,
                     external_key=technique_external_key(technique),
                     visibility=Visibility.GLOBAL,
@@ -347,7 +354,186 @@ class AttackImportHandler:
             versions_ingested += int(outcome.version_created)
             if not outcome.version_created:
                 unchanged += 1
+            projections.append(
+                AttackReleaseProjectionRecord(
+                    id=uuid4(),
+                    framework=command.framework,
+                    source_release=command.release,
+                    technique_id=technique.technique_id,
+                    document_id=outcome.document.id,
+                    document_version_id=outcome.version.id,
+                    content_hash=outcome.version.content_hash,
+                    created_at=self._clock.utc_now(),
+                )
+            )
+
+        # One short transaction for the whole release's bindings. Recording them
+        # idempotently means a retry after a crash between here and the cutover
+        # converges: the documents already staged stay, the bindings are
+        # re-derived from the same content hashes, and nothing is duplicated
+        # (brief section 2.8). Doing this AFTER the loop rather than per technique
+        # keeps a 214-technique import to one extra transaction, and the cutover's
+        # completeness check fails closed if it never ran.
+        if projections:
+            async with self._uow_factory() as uow:
+                await uow.attack_release_projections.record_many(
+                    projections=projections
+                )
+                await uow.commit()
+
         return documents_created, versions_ingested, unchanged
+
+    # ------------------------------------------------------------------
+    # the atomic cutover
+    # ------------------------------------------------------------------
+    async def _cutover(self, command: ImportAttackRelease) -> None:
+        """Make a release authoritative AND point retrieval at its projection.
+
+        ONE transaction, in this order, because the order is the guarantee:
+
+        1. take the framework's cutover lock, so two activations of the same
+           framework serialize instead of interleaving their pointer writes;
+        2. VALIDATE before mutating anything -- every canonical technique has a
+           binding, the binding count matches the release's declared technique
+           count, every bound document is still ACTIVE, and every binding's
+           content hash still equals its canonical row's. A failure here raises
+           with nothing written, so authority and retrieval are both untouched;
+        3. flip the release authority and mirror it onto the technique rows;
+        4. move each document's pointer through the domain aggregate, so the
+           version-ingested audit event is emitted exactly as for an ordinary
+           ingest.
+
+        Because (3) and (4) commit together, no reader can observe the release
+        authoritative while retrieval still serves the previous release -- the
+        divergence this closure exists to close (brief sections 2.7/2.8).
+        """
+        framework = command.framework
+        release = command.release
+        now = self._clock.utc_now()
+
+        async with self._uow_factory() as uow:
+            await uow.attack_release_projections.lock_framework(framework=framework)
+
+            stored = await uow.attack_releases.find(
+                framework=framework, source_release=release
+            )
+            if stored is None:
+                raise ApplicationError(
+                    f"ATT&CK release {release!r} was not registered; refusing to "
+                    "activate a release with no canonical rows"
+                )
+
+            missing = await uow.attack_release_projections.missing_techniques(
+                framework=framework, source_release=release
+            )
+            staged = await uow.attack_release_projections.count_for_release(
+                framework=framework, source_release=release
+            )
+            unusable = await uow.attack_release_projections.unusable_documents(
+                framework=framework, source_release=release
+            )
+            if missing or staged != stored.technique_count or unusable:
+                raise AttackReleaseProjectionIncompleteError(
+                    _incomplete_message(
+                        release=release,
+                        stored=stored.technique_count,
+                        staged=staged,
+                        missing=missing,
+                        unusable=unusable,
+                    )
+                )
+
+            # The canonical hash and the version's hash are computed by the same
+            # domain function over the same body, so a disagreement means the
+            # projection is not of this release's content. Checked here rather
+            # than trusted, and before any mutation.
+            canonical = {
+                row.technique_id: row.content_hash
+                for row in await uow.attack_techniques.list_for_release(
+                    framework=framework, source_release=release
+                )
+            }
+            bindings = await uow.attack_release_projections.list_for_release(
+                framework=framework, source_release=release
+            )
+            for binding in bindings:
+                if canonical.get(binding.technique_id) != binding.content_hash:
+                    raise AttackReleaseProjectionMissingVersionError(
+                        f"ATT&CK release {release!r} has a staged projection for "
+                        f"{binding.technique_id} whose content hash does not match "
+                        "its canonical row; refusing to activate a release whose "
+                        "projection is not of its own content"
+                    )
+
+            # Resolve EVERY binding to its live version and document BEFORE the
+            # first mutation. The resolution can fail -- a binding whose foreign
+            # key was somehow bypassed, a document that no longer resolves -- and a
+            # refusal must leave the framework's authority untouched. Relying on
+            # the transaction to roll a flipped release back would make that
+            # guarantee a property of the caller's UnitOfWork rather than of this
+            # method, which is not a guarantee at all.
+            resolved: list[tuple[KnowledgeDocument, KnowledgeDocumentVersion]] = []
+            for binding in bindings:
+                version = await uow.knowledge_documents.get_version(
+                    tenant_id=None, document_version_id=binding.document_version_id
+                )
+                if version is None:
+                    raise AttackReleaseProjectionMissingVersionError(
+                        f"ATT&CK release {release!r} binds {binding.technique_id} to "
+                        "a document version that does not resolve"
+                    )
+                document = await uow.knowledge_documents.get(
+                    tenant_id=None, document_id=binding.document_id
+                )
+                if document is None:
+                    raise AttackReleaseProjectionMissingVersionError(
+                        f"ATT&CK release {release!r} binds {binding.technique_id} to "
+                        "a document that does not resolve"
+                    )
+                resolved.append((document, version))
+
+            releases = await uow.attack_releases.list_for_framework(
+                framework=framework
+            )
+            for other in releases:
+                if other.source_release != release:
+                    await uow.attack_techniques.set_active_for_release(
+                        framework=framework,
+                        source_release=other.source_release,
+                        active=False,
+                    )
+            await uow.attack_techniques.set_active_for_release(
+                framework=framework, source_release=release, active=True
+            )
+            # Only a REAL transition is written. Re-importing an already
+            # authoritative release converges -- it re-asserts the mirror, moves
+            # no pointer that already matches -- but restamping ``activated_at``
+            # would make "when did this become authoritative" drift on every
+            # idempotent re-run.
+            if not stored.is_active:
+                await uow.attack_releases.activate(
+                    framework=framework, source_release=release, now=now
+                )
+
+            for document, version in resolved:
+                if document.active_version_id == version.id:
+                    # Already serving this release's projection: an idempotent
+                    # re-run of an activation converges without a second write.
+                    continue
+                document.activate_version(
+                    version_id=version.id,
+                    version=version.version,
+                    content_hash=version.content_hash,
+                    title=version.title,
+                )
+                await uow.knowledge_documents.save(document=document)
+                for event in document.pending_events:
+                    await uow.events.append(
+                        event, aggregate_revision=document.revision
+                    )
+                document.clear_events()
+
+            await uow.commit()
 
 
 @dataclass(frozen=True)
@@ -356,8 +542,43 @@ class _ReleaseOutcome:
 
     created: int
     release_created: bool
-    release_active: bool
+    #: Whether this import has the AUTHORITY INTENT. It is not the release's
+    #: status at this point -- the release is still INACTIVE until the cutover.
+    wants_authority: bool
     content_fingerprint: str
+
+
+def _incomplete_message(
+    *,
+    release: str,
+    stored: int,
+    staged: int,
+    missing: tuple[str, ...],
+    unusable: tuple[str, ...],
+) -> str:
+    """Refusal text naming what is missing, without dumping any content.
+
+    Technique ids and external keys are identifiers, not knowledge, so they are
+    safe to print and are the only way an operator can tell "the projection never
+    finished" from "a document was retired underneath this release".
+    """
+    parts = [
+        f"ATT&CK release {release!r} cannot be made authoritative because its "
+        f"knowledge projection is not complete: {staged} of {stored} canonical "
+        "techniques are staged"
+    ]
+    if missing:
+        parts.append(f"missing projection for {', '.join(missing)}")
+    if unusable:
+        parts.append(
+            "bound documents that can no longer serve retrieval: "
+            + ", ".join(unusable)
+        )
+    parts.append(
+        "nothing was changed; re-run the import to finish staging, or retire the "
+        "release explicitly"
+    )
+    return "; ".join(parts)
 
 
 def _conflict_message(existing: AttackReleaseRecord, fingerprint: str) -> str:

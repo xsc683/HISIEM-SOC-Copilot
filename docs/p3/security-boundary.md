@@ -255,9 +255,12 @@ JSON — so it can never be quoted as a semantic quality claim.
 
 ## 10. ATT&CK release integrity
 
-ATT&CK knowledge is imported from local, operator-supplied STIX 2.1 JSON. Two
+ATT&CK knowledge is imported from local, operator-supplied STIX 2.1 JSON. Four
 rules make the imported corpus an *authority* rather than whatever the last import
-happened to write.
+happened to write: a released name is immutable (§10.1); at most one release per
+framework is authoritative (§10.2); the bundle is never fetched over the network
+(§10.3); and an import becomes authoritative only through an atomic cutover that
+validates the staged projection before it mutates anything (§10.4).
 
 ### 10.1 A pinned release is immutable
 
@@ -299,7 +302,14 @@ was changed" is true rather than reconstructed afterwards.
 The knowledge document produced by an import is a **retrieval projection of the
 canonical release**, not an independent source of truth: the canonical row hash
 and the projected document version content come from the same canonical function,
-so they cannot drift.
+so a projected document cannot describe content its canonical row does not.
+
+That is a statement about **content identity**, and it is not a statement about
+which version a document currently serves. A document carries a single
+`active_version_id`, so "the projection is of the same content" never implied
+"retrieval serves this release" — and while that gap was open, an import that
+merely *staged* a release could move what retrieval returned. §10.4 and §10.5 are
+how it is closed.
 
 ### 10.2 Exactly one release is authoritative per framework
 
@@ -313,7 +323,9 @@ concurrent activations, and a database constraint can.
 Activating a release flips this release's rows to `active = true` and every other
 release **of the same framework** to `active = false`, in one transaction. A
 release that is never activated creates only `INACTIVE` rows; it never displaces
-the current authority.
+the current authority. That transition is the **cutover**, and §10.4 is what makes
+"in one transaction" mean the canonical authority and the document pointers move
+together rather than one after the other.
 
 When the pre-existing data is genuinely ambiguous — more than one release of a
 framework already claiming authority — the migration and `knowledge doctor`
@@ -327,6 +339,111 @@ The import port reads a **local file path** and has no URL or network capability
 There is no runtime fetch of any ATT&CK bundle, so the corpus cannot change under
 an evaluation, and an air-gapped deployment is the supported configuration rather
 than a degraded one.
+
+### 10.4 Staging is inert; the cutover is atomic
+
+An import is three acts, and only the last one can change what anyone reads:
+
+1. **Registration** writes the release and its canonical `attack_technique` rows
+   **INACTIVE**, in one short transaction. `--activate` activates nothing here — it
+   records that the import has authority *intent*.
+2. **Staging** ingests every technique through the ordinary knowledge path with
+   `activate_version=False`. The immutable version, its chunks and its embeddings
+   are all created; `active_version_id` is **not** moved. One binding row per
+   technique is then written to `attack_release_projection`.
+
+   This is why **an inactive or staged release cannot change what normal retrieval
+   serves**. It is not a matter of two writers being ordered correctly: the staged
+   path contains no statement that writes a document pointer at all.
+3. **Cutover**, only when the import has authority intent (`--activate`, or a
+   release that is already `ACTIVE`). It is ONE transaction: take the framework's
+   advisory lock, **validate before mutating anything**, flip the release's
+   authority, mirror `attack_technique.active`, then move each bound document's
+   pointer through `activate_version()`. Authority and retrieval therefore switch
+   together or not at all — there is no window in which `attack_release` claims an
+   authority whose content retrieval does not return.
+
+The cutover is fail-closed, and the checks that can be answered from the release's
+own rows run **before the first mutation**. The remaining bindings are resolved as
+the pointers move, in the same transaction, so a refusal at any point rolls the
+whole cutover back and leaves the canonical authority and every document pointer
+exactly as they were:
+
+| Condition | When it is checked | Code |
+|---|---|---|
+| Every canonical technique must have a staged binding, the binding count must equal the release's declared technique count, and every bound document must still be `ACTIVE` | before the first mutation | `ATTACK_RELEASE_PROJECTION_INCOMPLETE` |
+| Every binding's content hash must still equal its canonical row's | before the first mutation | `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` |
+| Every binding must resolve to a version and a document that still exist | while the pointers move, in the same transaction | `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` |
+| An authoritative release has no staged projection for some technique, or its bound documents serve some other version | `knowledge doctor` only | `ATTACK_RELEASE_PROJECTION_DIVERGED` |
+
+`ATTACK_RELEASE_CONTENT_CONFLICT` is unchanged: it is still the immutability
+refusal of §10.1, still detected before any mutation.
+
+The cutover does **not** weaken `KnowledgeDocument.activate_version()`. Ordinary
+knowledge keeps the forward-only rule — re-ingesting historical content still never
+rolls a document's active pointer backwards — and a staged ingest never moves the
+pointer in either direction. The cutover is a different act with its own explicit
+semantics, which is why the generic rule was left alone instead of being relaxed
+to accommodate it.
+
+### 10.5 The projection binding is provenance, not authorization
+
+`attack_release_projection` records which immutable `KnowledgeDocumentVersion` a
+release staged, at stage time, and it is never re-derived. It exists because two
+facts that look like one are genuinely two:
+
+- *release v15.1 carries this technique's content*, and
+- *the immutable version row v15.1 projects is V*.
+
+Two releases may carry byte-identical technique content and therefore share one
+version row — reuse is correct, because the content is the same — and then the
+version row alone cannot say which release staged it. `source_version` on the
+version cannot carry the claim either: it records which release **created** the
+row, so on a shared version it names one release and silently misattributes the
+other. Because the binding names the exact version at stage time, re-activating an
+older release restores the version it staged instead of re-deriving one from
+whatever currently matches.
+
+The binding **confers nothing**. Which release is authoritative is
+`attack_release.status`; the binding says only which version a release's projection
+*is*. Nothing in it can approve, execute, change a tenant, or reach a tool — it is
+a provenance row, and the cutover is the only thing that reads it, and only to
+move a document pointer.
+
+### 10.6 A downgrade that would destroy state fails closed
+
+`a5e93c07fd21` adds a fail-closed guard to its `downgrade`. Its predecessor
+`c41f7b2e9d08` dropped `knowledge_content_chunk`, `knowledge_chunk_embedding` and
+`attack_release` unconditionally on the way down, and stopped updating the legacy
+`knowledge_chunk` table on the way up — so once the application had written through
+the new tables, downgrading past it destroyed that work **silently**. A migration
+must be lossless or it must refuse.
+
+The guard runs before the first `op.drop_*` and refuses with
+`P3A_DOWNGRADE_UNSAFE`, naming each category and its row count and never any
+content:
+
+| Category | What it means |
+|---|---|
+| `NEW_CONTENT_CHUNKS` | Content chunks with no pre-closure `knowledge_chunk` row; the old schema has nowhere to put them |
+| `MULTIPLE_CHUNK_GENERATIONS` | Chunks in a generation the old schema has no column for, so its stale generation-1 rows would be re-presented as current |
+| `PROJECTION_CHANGED` | Embedding rows the old single-vector row cannot represent; restoring the stale vector as current would be wrong, not merely lossy |
+| `MUTATED_CONTENT` | Pre-closure chunks whose stored content no longer matches; the old schema would serve stale bytes as current |
+| `PINNED_ATTACK_RELEASE` | A release carrying a content fingerprint, for which the old schema has no column |
+| `ATTACK_PROJECTION_BINDING` | Any release to projection binding at all; the old schema cannot express which version a release staged |
+
+Every predicate is chosen to be **zero** on a database that was upgraded and then
+not written to, so the immediate round trip
+`ed6af82d9b13 → upgrade head → downgrade -1` still succeeds. A guard that blocked
+that would itself be the bug.
+
+**The honest residual.** The guard lives in the NEW revision because
+`c41f7b2e9d08` is frozen and must not be edited. It therefore intercepts any
+downgrade that STARTS at this head — `downgrade -1` and `downgrade <older-rev>`
+both run it first — but a database left sitting at `c41f7b2e9d08` from before this
+revision existed is **not** covered. An operator in that position must run
+`alembic upgrade head` first (free: the upgrade is additive) and only then
+downgrade.
 
 ## 11. Where each claim is tested
 
@@ -348,6 +465,9 @@ the sentence stopped being true.
 | Section 10.1 — a pinned release is immutable; a conflicting re-import fails closed | `tests/unit/knowledge/test_attack_import.py` |
 | Section 10.2 — exactly one authoritative release per framework | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
 | Section 10.3 — the import port has no network capability | `tests/architecture/test_knowledge_boundary.py` |
+| Section 10.4 — a staged release leaves normal retrieval untouched; the cutover validates before mutating and switches authority and retrieval in one transaction | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
+| Section 10.5 — the binding is provenance, not authority, and re-activating an older release restores the version it staged | `tests/unit/knowledge/test_attack_import.py`, `tests/unit/knowledge/test_attack_projection.py` |
+| Section 10.6 — a downgrade that would destroy state refuses before any DDL (`P3A_DOWNGRADE_UNSAFE`), and the untouched round trip still succeeds | `tests/integration/migrations/` |
 | Section 8 — secrets never reach the surface | `tests/unit/knowledge/test_knowledge_cli.py`, `tests/unit/knowledge/test_diagnostics.py` |
 | Section 9 — no LLM judge; the artifact is recomputable and labelled | `tests/unit/evaluation/knowledge/test_evaluation_knowledge.py` |
 | Scope rules, normalization, hashing, lifecycle | `tests/unit/knowledge/test_domain_knowledge.py` |

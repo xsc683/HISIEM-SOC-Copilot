@@ -26,6 +26,7 @@ from hisiem_soc_copilot.application.commands.knowledge import ImportAttackReleas
 from hisiem_soc_copilot.application.errors import (
     ApplicationError,
     AttackReleaseContentConflictError,
+    AttackReleaseProjectionIncompleteError,
 )
 from hisiem_soc_copilot.application.handlers.attack_import import (
     DEFAULT_MAX_BUNDLE_BYTES,
@@ -43,6 +44,7 @@ from hisiem_soc_copilot.application.ports.knowledge import (
     ATTACK_RELEASE_STATUS_ACTIVE,
     ATTACK_RELEASE_STATUS_INACTIVE,
     AttackImportOutcome,
+    AttackReleaseProjectionRecord,
     AttackReleaseRecord,
     AttackTechniqueRecord,
     ChunkEmbeddingRecord,
@@ -65,7 +67,11 @@ from hisiem_soc_copilot.domain.knowledge.entities import (
     KnowledgeDocument,
     KnowledgeDocumentVersion,
 )
-from hisiem_soc_copilot.domain.knowledge.enums import SourceKind, Visibility
+from hisiem_soc_copilot.domain.knowledge.enums import (
+    DocumentStatus,
+    SourceKind,
+    Visibility,
+)
 from hisiem_soc_copilot.domain.knowledge.errors import InvalidMitreBundleError
 from hisiem_soc_copilot.domain.knowledge.value_objects import (
     CHUNK_GENERATION_INITIAL,
@@ -804,6 +810,159 @@ class FakeAttackTechniqueRepository:
         return matched
 
 
+class FakeAttackReleaseProjectionRepository:
+    """In-memory ``attack_release_projection`` store for the staged bindings.
+
+    It models the REAL semantics, because two of the closure's guarantees are
+    statements about this table rather than about the handler:
+
+    * ``record_many`` DEDUPES on ``(framework, source_release, technique_id)``
+      and leaves an already-staged row alone. The binding names the version this
+      release actually staged, so a retry that re-derived a different version
+      must not replace it -- that would make re-activating an older release
+      re-derive a projection instead of restoring the one it staged (brief
+      section 2.6), and would silently move a pointer during staging.
+    * ``missing_techniques`` is derived from the CANONICAL rows, not from the
+      bindings. An empty binding table therefore reads as "every technique is
+      missing" rather than as "nothing to check" -- which is exactly what makes
+      a release whose staging never ran un-activatable.
+
+    Unlike the database, this double does not model ROLLBACK (see the module's
+    ``FakeUnitOfWork``): ``fail_after`` simulates a crash BETWEEN the ingest
+    loop and the bindings transaction, which is a state a real crash genuinely
+    leaves behind in the database. It deliberately does NOT simulate a crash in
+    the middle of the bindings transaction, because the real one is a single
+    transaction that either commits every binding or none.
+    """
+
+    def __init__(
+        self,
+        attack_techniques: FakeAttackTechniqueRepository,
+        documents: FakeKnowledgeDocumentRepository,
+    ) -> None:
+        #: The two stores this projection derives its answers FROM: the canonical
+        #: rows (for "which techniques are unbound") and the documents (for
+        #: "which bound documents retrieval cannot serve"). It holds the real
+        #: stores rather than copies, so a retired document reads as retired here
+        #: immediately.
+        self._techniques = attack_techniques
+        self._documents = documents
+        self.bindings: list[AttackReleaseProjectionRecord] = []
+        #: Recorded so a test can assert the cutover took its per-framework lock
+        #: before it validated anything (brief section 2.9).
+        self.locked: list[str] = []
+        #: Test switch: raise DURING the ingest loop for this release, leaving
+        #: no bindings behind -- a crash before the staging transaction.
+        self.fail_after: str | None = None
+
+    # -- test-side helpers -------------------------------------------------
+
+    def for_release(
+        self, source_release: str, *, framework: str = FRAMEWORK
+    ) -> tuple[AttackReleaseProjectionRecord, ...]:
+        return tuple(
+            sorted(
+                (
+                    binding
+                    for binding in self.bindings
+                    if binding.framework == framework
+                    and binding.source_release == source_release
+                ),
+                key=lambda binding: binding.technique_id,
+            )
+        )
+
+    def for_technique(
+        self,
+        source_release: str,
+        technique_id: str,
+        *,
+        framework: str = FRAMEWORK,
+    ) -> AttackReleaseProjectionRecord | None:
+        for binding in self.bindings:
+            if (
+                binding.framework == framework
+                and binding.source_release == source_release
+                and binding.technique_id == technique_id
+            ):
+                return binding
+        return None
+
+
+    def inject_binding(self, binding: AttackReleaseProjectionRecord) -> None:
+        """Add a binding row no ``record_many`` call would ever write.
+
+        Test-only, and the one route to a projection that is broken in a way
+        STAGING cannot repair: ``record_many`` re-derives a MISSING binding on the
+        next import, but it never deletes or rewrites a row, so a stale extra row
+        survives. That is what makes the cutover's preconditions observable.
+        """
+        self.bindings.append(binding)
+
+    # -- AttackReleaseProjectionRepository ---------------------------------
+
+    async def record_many(
+        self, *, projections: Sequence[AttackReleaseProjectionRecord]
+    ) -> None:
+        if projections and projections[0].source_release == self.fail_after:
+            raise RuntimeError("died mid-projection")
+        for projection in projections:
+            if (
+                projection.framework,
+                projection.source_release,
+                projection.technique_id,
+            ) in self._keys():
+                # ``ON CONFLICT DO NOTHING``: the existing binding stands, so a
+                # retry can never replace which version a release staged.
+                continue
+            self.bindings.append(projection)
+
+    async def list_for_release(
+        self, *, framework: str, source_release: str
+    ) -> tuple[AttackReleaseProjectionRecord, ...]:
+        return self.for_release(source_release, framework=framework)
+
+    async def count_for_release(self, *, framework: str, source_release: str) -> int:
+        return len(self.for_release(source_release, framework=framework))
+
+    async def missing_techniques(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Driven by the CANONICAL rows: a technique the release does not have."""
+        bound = {binding.technique_id for binding in self.for_release(source_release)}
+        canonical = {
+            row.technique_id
+            for row in self._techniques.rows
+            if row.framework == framework and row.source_release == source_release
+        }
+        return tuple(sorted(canonical - bound))
+
+    async def unusable_documents(
+        self, *, framework: str, source_release: str
+    ) -> tuple[str, ...]:
+        """Bound documents normal retrieval cannot serve, by their external key."""
+        unusable: list[str] = []
+        for binding in self.for_release(source_release, framework=framework):
+            document = self._documents.documents.get(binding.document_id)
+            if document is None or document.status is not DocumentStatus.ACTIVE:
+                unusable.append(
+                    document.external_key if document is not None else str(binding.document_id)
+                )
+        return tuple(sorted(unusable))
+
+    async def lock_framework(self, *, framework: str) -> None:
+        """Record the call; the serialization itself is a database fact."""
+        self.locked.append(framework)
+
+    # -- internals ---------------------------------------------------------
+
+    def _keys(self) -> set[tuple[str, str, str]]:
+        return {
+            (binding.framework, binding.source_release, binding.technique_id)
+            for binding in self.bindings
+        }
+
+
 class FakeRuntime:
     """Every store the importer touches, plus the transaction counters."""
 
@@ -811,6 +970,11 @@ class FakeRuntime:
         self.attack_techniques = FakeAttackTechniqueRepository()
         self.attack_releases = FakeAttackReleaseRepository()
         self.documents = FakeKnowledgeDocumentRepository()
+        # The projection store derives its answers from the canonical rows and
+        # the documents, so it reads the SAME two stores rather than copies.
+        self.attack_release_projections = FakeAttackReleaseProjectionRepository(
+            self.attack_techniques, self.documents
+        )
         self.chunks = FakeKnowledgeChunkRepository()
         self.profiles = FakeEmbeddingProfileRepository()
         self.events = FakeEventLedger()
@@ -838,6 +1002,7 @@ class FakeUnitOfWork:
         self.embedding_profiles = runtime.profiles
         self.attack_techniques = runtime.attack_techniques
         self.attack_releases = runtime.attack_releases
+        self.attack_release_projections = runtime.attack_release_projections
         self.events = runtime.events
 
     async def __aenter__(self) -> FakeUnitOfWork:
@@ -928,9 +1093,75 @@ def _technique_of(technique_id: str) -> AttackTechnique:
 
 
 def _version_of(runtime: FakeRuntime, document: KnowledgeDocument) -> KnowledgeDocumentVersion:
+    """The version RETRIEVAL serves: whatever ``active_version_id`` points at.
+
+    There is no retrieval service in these unit tests, so this pointer IS the
+    retrieval answer: a real search joins the document, keeps it only while its
+    ``active_version_id`` points at the version, and reads that version's
+    ``normalized_content``. Every "retrieval serves X" claim below is therefore
+    asserted as ``_version_of(...).normalized_content == X``.
+    """
     assert document.active_version_id is not None
     version = runtime.documents.versions[document.active_version_id]
     return version
+
+
+def _staged_version_of(
+    runtime: FakeRuntime, source_release: str, technique_id: str
+) -> KnowledgeDocumentVersion:
+    """The version a release STAGED for one technique, read from its binding.
+
+    Staging and serving are different facts: an INACTIVE release has a binding
+    (and therefore a fully projected immutable version) while retrieval still
+    serves the older release's version. The binding is the only way to observe
+    what a staged release will serve once it is activated.
+    """
+    binding = _binding_of(runtime, source_release, technique_id)
+    version = runtime.documents.versions[binding.document_version_id]
+    assert version.content_hash == binding.content_hash
+    return version
+
+
+def _binding_of(
+    runtime: FakeRuntime, source_release: str, technique_id: str
+) -> AttackReleaseProjectionRecord:
+    binding = runtime.attack_release_projections.for_technique(
+        source_release, technique_id
+    )
+    assert binding is not None, f"no binding for {source_release}/{technique_id}"
+    return binding
+
+
+def _active_version_id_of(runtime: FakeRuntime, technique_id: str) -> UUID | None:
+    """The live pointer for one technique document, read synchronously.
+
+    A pointer is a plain field of an in-memory aggregate, so reading it does not
+    need a transaction -- which matters because the invariant assertions collect
+    the pointers before asserting on them.
+    """
+    return _document_sync(runtime, technique_id).active_version_id
+
+
+def _document_sync(runtime: FakeRuntime, technique_id: str) -> KnowledgeDocument:
+    for document in runtime.documents.documents.values():
+        if document.external_key == technique_external_key(_technique_of(technique_id)):
+            return document
+    raise AssertionError(f"no document for {technique_id}")
+
+
+def _revised_bundle() -> bytes:
+    """v14.1's bundle with T1110's upstream content REVISED; T1059 is identical."""
+    return _bundle(
+        _attack_pattern(
+            stix_id=T1110_STIX_ID,
+            technique_id="T1110",
+            name="Brute Force",
+            description="Revised upstream description.",
+            tactics=("credential-access",),
+            platforms=("Linux", "Windows"),
+        ),
+        _command_shell_object(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1013,7 +1244,14 @@ async def test_each_technique_becomes_a_global_mitre_attack_document() -> None:
         assert document.external_key == f"mitre-attack:{technique.technique_id}"
         assert document.title == technique_document_title(technique)
 
-        version = _version_of(runtime, document)
+        # The importance of the assertion below is that it is about a STAGED
+        # release: the import did not activate, so ``active_version_id``/the live
+        # pointer is still None. Nothing is serving this release yet; what exists
+        # is its immutable, fully projected version, reachable through its binding.
+        assert document.active_version_id is None
+        # (``activate=True`` is exercised by scenario 1 below, which asserts the
+        # pointer DOES move.)
+        version = _staged_version_of(runtime, RELEASE, technique.technique_id)
         assert version.source_version == RELEASE
         assert version.language == "en"
         assert version.title == technique_document_title(technique)
@@ -1048,8 +1286,7 @@ async def test_the_canonical_hash_is_the_domain_hash_of_the_document_body() -> N
     assert row is not None
     assert row.content_hash == domain_hash
 
-    document = await _document_for(runtime, technique.technique_id)
-    version = _version_of(runtime, document)
+    version = _staged_version_of(runtime, RELEASE, technique.technique_id)
     assert version.content_hash == domain_hash
     assert row.content_hash == version.content_hash
 
@@ -1140,37 +1377,57 @@ async def test_reimporting_a_changed_bundle_conflicts_and_mutates_nothing() -> N
     assert runtime.commits == commits_before
 
 
-async def test_changed_content_under_a_new_release_is_a_new_document_version() -> None:
-    """A DIFFERENT release may legitimately carry different technique content.
+async def test_changed_content_under_a_staged_release_is_a_new_version_but_not_the_active_one() -> None:  # noqa: E501
+    """A STAGED release projects its content without moving what retrieval serves.
 
-    Immutability is per release name, not per technique: v15.1's revised T1110 is
-    a new document version while every one of v14.1's canonical rows stays put.
+    This test used to assert that ``_version_of(document)`` -- which reads
+    ``active_version_id`` -- equalled the REVISED content, i.e. that importing a
+    release with the default ``activate=False`` had ALREADY changed the live
+    retrieval answer. That is the defect this closure exists to close: v15.1 was
+    neither authoritative nor activated, yet retrieval served its content.
+
+    Staging and serving are now separate facts, so this asserts both halves: the
+    new version IS created and IS bound to v15.1, while the live pointer still
+    points at v14.1's version -- retrieval keeps serving v14.1's content until a
+    cutover makes v15.1 authoritative (brief sections 2.4-2.7).
     """
     runtime = FakeRuntime()
     handler = _importer(runtime=runtime)
     await handler.import_release(_command(release="v14.1", activate=True))
     rows_before = runtime.attack_techniques.for_release("v14.1")
+    document = await _document_for(runtime, "T1110")
+    original_version_id = document.active_version_id
+    assert original_version_id is not None
+    assert "Revised upstream description." not in _version_of(
+        runtime, document
+    ).normalized_content
 
-    edited = _bundle(
-        _attack_pattern(
-            stix_id=T1110_STIX_ID,
-            technique_id="T1110",
-            name="Brute Force",
-            description="Revised upstream description.",
-            tactics=("credential-access",),
-            platforms=("Linux", "Windows"),
-        ),
-        _command_shell_object(),
+    outcome = await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle())
     )
-    outcome = await handler.import_release(_command(release="v15.1", payload=edited))
 
     assert outcome.techniques_created == 2
     assert outcome.versions_ingested == 1
     assert outcome.unchanged == 1
-    document = await _document_for(runtime, "T1110")
-    version = _version_of(runtime, document)
-    assert version.version == 2
-    assert "Revised upstream description." in version.normalized_content
+
+    # The new version exists, is fully projected, and v15.1's binding names it.
+    staged = _staged_version_of(runtime, "v15.1", "T1110")
+    assert staged.version == 2
+    assert "Revised upstream description." in staged.normalized_content
+    assert staged.id != original_version_id
+
+    # ...and retrieval does NOT serve it. ``active_version_id`` IS the retrieval
+    # answer here (there is no retrieval service in these unit tests): the live
+    # pointer is untouched, so v14.1's content is still what a search would read.
+    assert document.active_version_id == original_version_id
+    assert _version_of(runtime, document).normalized_content == technique_document_body(
+        _brute_force_technique()
+    )
+    staged_release = runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release="v15.1"
+    )
+    assert staged_release is not None
+    assert staged_release.is_active is False
     # The older release is untouched: rows are never rewritten by a later import.
     assert runtime.attack_techniques.for_release("v14.1") == rows_before
 
@@ -1268,12 +1525,35 @@ async def test_importing_without_activate_leaves_the_authoritative_release_alone
 
     assert all(row.active for row in runtime.attack_techniques.for_release("v14.1"))
     assert all(not row.active for row in runtime.attack_techniques.for_release("v15.1"))
-    # The staging import re-asserted v14.1's authority and wrote v15.1 inactive by
-    # construction; it never reached for the switch at all.
-    assert runtime.attack_techniques.active_calls == [
-        (FRAMEWORK, "v14.1", True),
-        (FRAMEWORK, "v15.1", False),
-    ]
+    # Authority is now written ONLY by the cutover, so v15.1 -- which never
+    # reached one -- contributes no mirror call at all: its rows were written
+    # ``active=False`` by ``add_many`` in the first place, and the registration
+    # half deliberately no longer writes the mirror (brief section 2.3).
+    assert runtime.attack_techniques.active_calls == [(FRAMEWORK, "v14.1", True)]
+    assert runtime.attack_releases.activations == [(FRAMEWORK, "v14.1")]
+
+    # The assertion this test conspicuously lacked: an INACTIVE release must not
+    # change what RETRIEVAL serves. T1059 is byte-identical under both releases,
+    # so its version is REUSED -- which is precisely why the live pointer is the
+    # thing that has to be asserted, and why the old test could not see the bug.
+    live = _active_version_id_of(runtime, "T1110")
+    assert _version_of(runtime, await _document_for(runtime, "T1110")).normalized_content == (
+        technique_document_body(_brute_force_technique())
+    )
+    # The staged release DOES have a complete projection: it just is not live.
+    # The binding names the very version that is serving, because the content is
+    # identical -- so the pointer being unchanged is the ONLY observable
+    # difference between "staged" and "authoritative".
+    assert _binding_of(runtime, "v15.1", "T1110").document_version_id == live
+
+    # A re-run of the same backfill import converges: already registered, already
+    # projected, so no version is written and retrieval is still untouched.
+    versions_before = dict(runtime.documents.versions)
+    rerun = await handler.import_release(_command(release="v15.1"))
+    assert rerun.release_created is False
+    assert rerun.versions_ingested == 0
+    assert rerun.unchanged == 2
+    assert runtime.documents.versions == versions_before
     assert runtime.attack_releases.activations == [(FRAMEWORK, "v14.1")]
 
 
@@ -1413,8 +1693,9 @@ async def test_a_crash_between_the_canonical_rows_and_the_documents_converges_on
     with pytest.raises(RuntimeError, match="died mid-projection"):
         await handler.import_release(_command(activate=True))
 
-    # The release IS authoritative and its canonical rows ARE complete: that half
-    # is committed before the first document is projected.
+    # The canonical half IS committed -- and the release is NOT authoritative,
+    # because the cutover never ran. That is the SAFE state: a release whose
+    # projection is partial must not be claiming authority over retrieval.
     assert (
         await runtime.attack_techniques.count_for_release(
             framework=FRAMEWORK, source_release=RELEASE
@@ -1423,7 +1704,8 @@ async def test_a_crash_between_the_canonical_rows_and_the_documents_converges_on
     )
     release = runtime.attack_releases.get(framework=FRAMEWORK, source_release=RELEASE)
     assert release is not None
-    assert release.is_active is True
+    assert release.is_active is False
+    assert release.activated_at is None
     assert release.content_fingerprint is not None
     # ...and the projection is genuinely partial.
     assert len(runtime.documents.documents) == 1
@@ -1433,9 +1715,17 @@ async def test_a_crash_between_the_canonical_rows_and_the_documents_converges_on
 
     assert outcome.techniques_created == 0
     assert outcome.documents_created == 1
+    # One document was already staged AND committed before the crash, so the
+    # retry converges on it; only T1110 contributes a new version.
     assert outcome.versions_ingested == 1
     assert outcome.unchanged == 1
+    assert outcome.release_active is True
     assert len(runtime.documents.documents) == 2
+    converged_release = runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release=RELEASE
+    )
+    assert converged_release is not None
+    assert converged_release.is_active is True
     assert (
         await runtime.attack_techniques.count_for_release(
             framework=FRAMEWORK, source_release=RELEASE
@@ -1446,6 +1736,444 @@ async def test_a_crash_between_the_canonical_rows_and_the_documents_converges_on
     assert len(runtime.attack_techniques.add_many_calls) == 1
     assert len(runtime.attack_releases.releases) == 1
     assert runtime.attack_releases.pinned == []
+
+
+# ---------------------------------------------------------------------------
+# release authority AND the retrieval projection, together (closure-2)
+#
+# Authority and "what retrieval serves" are two facts, and every test here
+# asserts BOTH. Asserting only the release row is what let an inactive release
+# move the live pointer unnoticed; asserting only the pointer cannot tell which
+# release is authoritative.
+# ---------------------------------------------------------------------------
+
+
+def _authority_state(runtime: FakeRuntime) -> tuple[str, ...]:
+    """Every ACTIVE release of the framework, as a tuple of release names."""
+    return tuple(
+        release.source_release for release in runtime.attack_releases.active_for(FRAMEWORK)
+    )
+
+
+async def test_scenario_1_an_activated_release_is_authoritative_and_serves_its_own_content() -> None:  # noqa: E501
+    """Scenario 1: v14.1 imported with ``activate=True``.
+
+    Both halves move together: v14.1 is the framework's ACTIVE release AND the
+    live pointer resolves to the version v14.1 staged.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+
+    outcome = await handler.import_release(_command(release="v14.1", activate=True))
+
+    assert outcome.release_active is True
+    assert _authority_state(runtime) == ("v14.1",)
+    release = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v14.1")
+    assert release is not None
+    assert release.is_active is True
+    assert release.activated_at == T0
+    binding = _binding_of(runtime, "v14.1", "T1110")
+    document = await _document_for(runtime, "T1110")
+    assert document.active_version_id == binding.document_version_id
+    assert _version_of(runtime, document).normalized_content == technique_document_body(
+        _brute_force_technique()
+    )
+
+
+async def test_scenario_2_staging_a_changed_release_moves_neither_half() -> None:
+    """Scenario 2: v15.1 staged with changed content while v14.1 stays live.
+
+    v15.1's canonical rows are written, its new document version is created and
+    bound -- and NOTHING retrieval can observe changes.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    live_before = _active_version_id_of(runtime, "T1110")
+
+    outcome = await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle())
+    )
+
+    # Half one: canonical authority -- v14.1 stays ACTIVE, v15.1 is INACTIVE.
+    assert outcome.release_active is False
+    assert _authority_state(runtime) == ("v14.1",)
+    staged = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v15.1")
+    assert staged is not None
+    assert staged.is_active is False
+    assert staged.activated_at is None
+    # Half two: retrieval -- the live pointer is byte-identical to before.
+    assert _active_version_id_of(runtime, "T1110") == live_before
+    live_document = await _document_for(runtime, "T1110")
+    assert _version_of(runtime, live_document).normalized_content == technique_document_body(
+        _brute_force_technique()
+    )
+    # The binding exists and names the NEW version -- which is simply not what
+    # retrieval is serving yet.
+    binding = _binding_of(runtime, "v15.1", "T1110")
+    assert binding.document_version_id != live_before
+    assert "Revised upstream description." in _staged_version_of(
+        runtime, "v15.1", "T1110"
+    ).normalized_content
+
+
+async def test_scenario_3_activating_the_staged_release_moves_both_halves() -> None:
+    """Scenario 3: activating v15.1 flips authority AND the affected pointers.
+
+    This is the cutover. Every document the release bound now serves the version
+    v15.1 staged, in the same transaction as the authority flip.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    await handler.import_release(_command(release="v15.1", payload=_revised_bundle()))
+
+    activated = await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle(), activate=True)
+    )
+
+    assert activated.release_active is True
+    assert _authority_state(runtime) == ("v15.1",)
+    previous = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v14.1")
+    assert previous is not None
+    assert previous.is_active is False
+    # Retrieval now serves v15.1's projection, for the CHANGED technique...
+    assert (
+        _active_version_id_of(runtime, "T1110")
+        == _binding_of(runtime, "v15.1", "T1110").document_version_id
+    )
+    changed = await _document_for(runtime, "T1110")
+    assert "Revised upstream description." in _version_of(runtime, changed).normalized_content
+    # ...and for the UNCHANGED one, whose version is reused.
+    assert (
+        _active_version_id_of(runtime, "T1059")
+        == _binding_of(runtime, "v15.1", "T1059").document_version_id
+    )
+    # The cutover takes the per-framework lock before validating anything. This
+    # scenario drives two of them (the import and the re-run), so the assertion
+    # is on the property rather than on a total the setup would have to mirror.
+    assert runtime.attack_release_projections.locked
+    assert set(runtime.attack_release_projections.locked) == {FRAMEWORK}
+
+
+async def test_scenario_4_reactivating_the_older_release_restores_its_own_version() -> None:
+    """Scenario 4: re-activating v14.1 restores the version v14.1 STAGED.
+
+    This is why the binding table exists. v14.1's T1110 version is now a
+    HISTORICAL version (v15.1 staged a newer one), and re-deriving "what v14.1
+    should serve" from content hashes could not distinguish the two. The binding
+    names the exact version, so the pointer is restored to that exact id --
+    asserted as an id, not merely as content.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    t1110_version = _binding_of(runtime, "v14.1", "T1110").document_version_id
+    t1059_version = _binding_of(runtime, "v14.1", "T1059").document_version_id
+
+    await handler.import_release(_command(release="v15.1", payload=_revised_bundle()))
+    await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle(), activate=True)
+    )
+    assert _active_version_id_of(runtime, "T1110") != t1110_version
+
+    restored = await handler.import_release(_command(release="v14.1", activate=True))
+
+    assert restored.release_active is True
+    assert _authority_state(runtime) == ("v14.1",)
+    replaced = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v15.1")
+    assert replaced is not None
+    assert replaced.is_active is False
+    assert _active_version_id_of(runtime, "T1110") == t1110_version
+    assert _active_version_id_of(runtime, "T1059") == t1059_version
+    document = await _document_for(runtime, "T1110")
+    assert _version_of(runtime, document).id == t1110_version
+    assert _version_of(runtime, document).version == 1
+    assert "Revised upstream description." not in _version_of(
+        runtime, document
+    ).normalized_content
+
+
+async def test_scenario_5_identical_content_is_reused_but_every_release_keeps_its_binding() -> None:
+    """Scenario 5: two releases carrying byte-identical content.
+
+    The IMMUTABLE version is shared -- reuse is correct, the content is the same
+    -- but the CLAIM "this release projected this version" is per release. So
+    there are two binding rows naming one version, and after activating v15.1 the
+    binding that names the live pointer is v15.1's. That provenance fact cannot
+    live on the version's own ``source_version``, which records only which
+    release happened to CREATE the row.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    version_id = _binding_of(runtime, "v14.1", "T1110").document_version_id
+
+    outcome = await handler.import_release(_command(release="v15.1"))
+
+    assert outcome.versions_ingested == 0
+    assert outcome.unchanged == 2
+    assert _active_version_id_of(runtime, "T1110") == version_id
+    v141 = _binding_of(runtime, "v14.1", "T1110")
+    v151 = _binding_of(runtime, "v15.1", "T1110")
+    assert v141.document_version_id == v151.document_version_id == version_id
+    assert (v141.framework, v141.source_release) == (FRAMEWORK, "v14.1")
+    assert (v151.framework, v151.source_release) == (FRAMEWORK, "v15.1")
+    assert v141.id != v151.id
+    # ONE immutable version row for T1110 (T1059 reuses its own too), TWO binding
+    # rows per release naming it.
+    assert len(runtime.attack_release_projections.for_release("v14.1")) == 2
+    assert len(runtime.attack_release_projections.for_release("v15.1")) == 2
+    assert (
+        sum(
+            1
+            for version in runtime.documents.versions.values()
+            if version.normalized_content == technique_document_body(_brute_force_technique())
+        )
+        == 1
+    )
+
+    await handler.import_release(_command(release="v15.1", activate=True))
+
+    assert _authority_state(runtime) == ("v15.1",)
+    live = _active_version_id_of(runtime, "T1110")
+    assert live == version_id
+    assert _binding_of(runtime, "v15.1", "T1110").document_version_id == live
+
+
+async def test_scenario_6_a_crash_mid_staging_leaves_the_live_release_untouched_then_converges() -> None:  # noqa: E501
+    """Scenario 6: the projection transaction never happened.
+
+    ``fail_after`` halts the staging before the bindings are recorded, which is
+    the state a crash genuinely leaves behind (the bindings transaction commits
+    all of them or none). Nothing about v14.1 moves: it is still the ACTIVE
+    release and still serving its own version. Re-running the import converges to
+    v15.1 ACTIVE with a complete projection.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    live = _active_version_id_of(runtime, "T1110")
+    previous_release = runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release="v14.1"
+    )
+    runtime.attack_release_projections.fail_after = "v15.1"
+
+    with pytest.raises(RuntimeError, match="died mid-projection"):
+        await handler.import_release(_command(release="v15.1", payload=_revised_bundle()))
+
+    # The bindings transaction is atomic: the crash left NONE of v15.1's.
+    assert runtime.attack_release_projections.for_release("v15.1") == ()
+    assert len(runtime.attack_release_projections.for_release("v14.1")) == 2
+    # The release RECORD is committed before staging begins, so v15.1 exists;
+    # what the crash prevented is its bindings AND its authority. v14.1 is
+    # exactly the release it was.
+    assert runtime.attack_releases.get(
+        framework=FRAMEWORK, source_release="v14.1"
+    ) == previous_release
+    assert _authority_state(runtime) == ("v14.1",)
+    incomplete = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v15.1")
+    assert incomplete is not None
+    assert incomplete.is_active is False
+    assert _active_version_id_of(runtime, "T1110") == live
+    untouched = await _document_for(runtime, "T1110")
+    # The live version is still exactly v14.1's, with exactly v14.1's content:
+    # the staging wrote nothing retrieval can observe and moved no pointer.
+    assert _version_of(runtime, untouched).content_hash == _binding_of(
+        runtime, "v14.1", "T1110"
+    ).content_hash
+    assert "Revised upstream description." not in _version_of(
+        runtime, untouched
+    ).normalized_content
+    # Staging ran before the crash, so the immutable version rows it wrote are
+    # committed: the crash lost only the bindings transaction and the cutover.
+    assert len(runtime.documents.versions) >= len(runtime.documents.documents)
+
+    runtime.attack_release_projections.fail_after = None
+    converged = await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle(), activate=True)
+    )
+
+    assert converged.release_active is True
+    assert _authority_state(runtime) == ("v15.1",)
+    assert (
+        await runtime.attack_release_projections.count_for_release(
+            framework=FRAMEWORK, source_release="v15.1"
+        )
+        == 2
+    )
+    assert (
+        await runtime.attack_release_projections.missing_techniques(
+            framework=FRAMEWORK, source_release="v15.1"
+        )
+        == ()
+    )
+    assert (
+        _active_version_id_of(runtime, "T1110")
+        == _binding_of(runtime, "v15.1", "T1110").document_version_id
+    )
+    recovered = await _document_for(runtime, "T1110")
+    assert "Revised upstream description." in _version_of(runtime, recovered).normalized_content
+
+
+async def test_scenario_7_a_failure_inside_the_cutover_leaves_both_halves_unchanged() -> None:
+    """Scenario 7: validation fails, so nothing is mutated at all.
+
+    v15.1's projection is not complete, so the release cannot be made
+    authoritative. The refusal is raised by the cutover's PRE-MUTATION
+    precondition, so the release authority, the mirror and every live pointer are
+    exactly as they were.
+
+    The database half of this guarantee is the rollback at ``__aexit__``; this
+    double writes immediately and does NOT model rollback, so what is asserted
+    here is the ordering half -- nothing at all is written before the refusal.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    live = _binding_of(runtime, "v14.1", "T1110").document_version_id
+    live_t1059 = _binding_of(runtime, "v14.1", "T1059").document_version_id
+    await handler.import_release(_command(release="v15.1"))
+    assert _active_version_id_of(runtime, "T1110") == live
+
+    # Break v15.1's projection so that it is genuinely INCOMPLETE -- an extra row
+    # bound to a technique the release does not have, which staging can never
+    # repair because ``record_many`` only ever appends missing rows. The cutover
+    # checks this FIRST, before any mutation, which is what makes "nothing was
+    # written" observable in a double that does not model ROLLBACK.
+    solid = _binding_of(runtime, "v15.1", "T1110")
+    runtime.attack_release_projections.inject_binding(
+        replace(solid, technique_id="T9999")
+    )
+    # Every canonical technique IS bound, so ``missing_techniques`` is empty: the
+    # defect is the staged COUNT disagreeing with the release's own declaration.
+    assert await runtime.attack_release_projections.missing_techniques(
+        framework=FRAMEWORK, source_release="v15.1"
+    ) == ()
+    assert (
+        await runtime.attack_release_projections.count_for_release(
+            framework=FRAMEWORK, source_release="v15.1"
+        )
+        == 3
+    )
+
+    releases_before = list(runtime.attack_releases.releases)
+    rows_before = list(runtime.attack_techniques.rows)
+    bindings_before = list(runtime.attack_release_projections.bindings)
+    add_many_before = len(runtime.attack_techniques.add_many_calls)
+    uows_before = runtime.uows_opened
+    active_calls_before = list(runtime.attack_techniques.active_calls)
+    activations_before = list(runtime.attack_releases.activations)
+
+    with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:
+        await handler.import_release(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+    assert "3 of 2 canonical techniques are staged" in str(excinfo.value)
+    # Authority: untouched. No release changed status, no mirror row was rewritten
+    # and no activation was recorded -- the refusal happened before any of them.
+    assert runtime.attack_releases.releases == releases_before
+    assert _authority_state(runtime) == ("v14.1",)
+    assert runtime.attack_releases.activations == activations_before
+    assert runtime.attack_techniques.rows == rows_before
+    assert len(runtime.attack_techniques.add_many_calls) == add_many_before
+    assert runtime.attack_techniques.active_calls == active_calls_before
+    # Retrieval: untouched -- both live pointers still name v14.1's versions and
+    # the projection is byte-for-byte the one that was there before the attempt.
+    assert _active_version_id_of(runtime, "T1110") == live
+    assert _active_version_id_of(runtime, "T1059") == live_t1059
+    assert runtime.attack_release_projections.bindings == bindings_before
+    # The cutover transaction WAS opened -- the validation ran inside it, and only
+    # then was the refusal raised -- and it committed nothing.
+    assert runtime.uows_opened > uows_before
+
+
+async def test_scenario_8_every_pointer_follows_whichever_release_ends_up_authoritative() -> None:
+    """Scenario 8: two activations, exactly one winner, no mixed state.
+
+    ``lock_framework`` is a no-op here, so this does not MODEL database
+    concurrency -- it asserts the INVARIANT the lock exists to preserve, on the
+    final state of two back-to-back cutovers: exactly one ACTIVE release per
+    framework, and EVERY live pointer of the framework matching the winner's own
+    binding rather than a leftover of the loser's.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(_command(release="v14.1", activate=True))
+    await handler.import_release(_command(release="v15.1", payload=_revised_bundle()))
+
+    await handler.import_release(_command(release="v14.1", activate=True))
+    await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle(), activate=True)
+    )
+
+    # Exactly one ACTIVE release, and the loser stays readable by its own name.
+    active = runtime.attack_releases.active_for(FRAMEWORK)
+    assert len(active) == 1
+    assert active[0].source_release == "v15.1"
+    assert active[0].is_active is True
+    loser = runtime.attack_releases.get(framework=FRAMEWORK, source_release="v14.1")
+    assert loser is not None
+    assert loser.is_active is False
+
+    # Every live pointer belongs to the WINNER's binding: no mixed state.
+    winner = _authority_state(runtime)[0]
+    assert winner == "v15.1"
+    cutovers = 3  # every import above that carried authority intent
+    for technique_id in ("T1059", "T1110"):
+        assert (
+            _active_version_id_of(runtime, technique_id)
+            == _binding_of(runtime, winner, technique_id).document_version_id
+        )
+    # ...and the two releases genuinely staged different versions for the
+    # technique whose content changed, so this is not a vacuous equality.
+    assert (
+        _binding_of(runtime, "v15.1", "T1110").document_version_id
+        != _binding_of(runtime, "v14.1", "T1110").document_version_id
+    )
+
+    # The mirror agrees with the release for every canonical row of the framework.
+    for row in runtime.attack_techniques.rows:
+        assert row.active is (row.source_release == winner)
+    # Every cutover took the framework's lock. The double does not serialize them,
+    # and it does not have to -- the invariant above is what the lock protects.
+    assert runtime.attack_release_projections.locked == [FRAMEWORK] * cutovers
+
+
+async def test_scenario_9_the_same_release_with_different_content_conflicts_and_mutates_nothing() -> None:  # noqa: E501
+    """Scenario 9: the pinned-release immutability rule, unchanged by the closure.
+
+    Re-importing a release NAME with different content is refused with
+    ``ATTACK_RELEASE_CONTENT_CONFLICT`` -- and because the check runs before the
+    first write, the canonical rows, the knowledge documents, the bindings and
+    the release authority are all exactly as they were.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await handler.import_release(
+        _command(release="v15.1", payload=_revised_bundle(), activate=True)
+    )
+
+    rows_before = list(runtime.attack_techniques.rows)
+    releases_before = list(runtime.attack_releases.releases)
+    documents_before = dict(runtime.documents.documents)
+    versions_before = dict(runtime.documents.versions)
+    bindings_before = list(runtime.attack_release_projections.bindings)
+    live = _active_version_id_of(runtime, "T1110")
+    commits_before = runtime.commits
+
+    with pytest.raises(AttackReleaseContentConflictError) as excinfo:
+        await handler.import_release(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_CONTENT_CONFLICT"
+    assert runtime.attack_techniques.rows == rows_before
+    assert runtime.attack_releases.releases == releases_before
+    assert runtime.documents.documents == documents_before
+    assert runtime.documents.versions == versions_before
+    assert runtime.attack_release_projections.bindings == bindings_before
+    assert _active_version_id_of(runtime, "T1110") == live
+    assert runtime.commits == commits_before
+
 
 
 # ---------------------------------------------------------------------------

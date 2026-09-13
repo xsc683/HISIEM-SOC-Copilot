@@ -1,8 +1,8 @@
 """API tests — health endpoint and (when Postgres is up) start-investigation.
 
-Runs FastAPI over httpx ASGITransport with the real container wired to a running
-PostgreSQL (copilot schema migrated). Skipped when COPILOT_DATABASE_URL is not
-reachable, so the suite stays green on dev machines without Docker.
+Runs FastAPI over httpx ASGITransport with the real container wired to the
+session scratch database on the pgvector test server. Skipped when that server is
+not running, so the suite stays green on dev machines without Docker.
 """
 
 from __future__ import annotations
@@ -17,13 +17,12 @@ from asgi_lifespan import LifespanManager
 from hisiem_soc_copilot.api.app import create_app
 from hisiem_soc_copilot.application.ports.trust import ServiceAuthenticationError
 from hisiem_soc_copilot.config import Settings
+from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 
 
 def _settings() -> Settings:
     s = Settings()
-    s.database.database_url = (
-        "postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot"
-    )
+    apply_settings(s)
     s.hisiem.base_url = "http://hisiem.test.invalid"
     # API integration tests exercise the header (dev/test) trusted-context
     # provider; production must not select it (config default is ``none``).
@@ -31,35 +30,11 @@ def _settings() -> Settings:
     return s
 
 
-async def _db_reachable(settings: Settings) -> bool:
-    """Probe the DB synchronously — psycopg async cannot run on Windows' default
-    ProactorEventLoop, so this fixture avoids async engines entirely."""
-    try:
-        import psycopg
-        from sqlalchemy.engine import make_url
-
-        url = make_url(settings.database.database_url)
-        conn = psycopg.connect(
-            host=url.host,
-            port=url.port,
-            user=url.username,
-            password=url.password,
-            dbname=url.database,
-            connect_timeout=2,
-        )
-        cur = conn.execute("SELECT 1")
-        cur.fetchone()
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
 @pytest_asyncio.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
     settings = _settings()
-    if not await _db_reachable(settings):
-        pytest.skip("PostgreSQL not reachable — skipping API integration test")
+    if not server_reachable():
+        pytest.skip(SKIP_REASON)
     app = create_app(settings)
     async with LifespanManager(app):
         transport = httpx.ASGITransport(app=app)
