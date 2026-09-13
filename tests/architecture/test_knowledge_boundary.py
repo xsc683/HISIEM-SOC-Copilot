@@ -910,3 +910,176 @@ def test_only_the_activate_version_flag_gates_the_pointer_move() -> None:
         "the pointer move must be gated on command.activate_version specifically, "
         "not on some other condition that merely happens to hold today"
     )
+
+# ---------------------------------------------------------------------------
+# system-owned MITRE_ATTACK (closure-3 section 4)
+#
+# The authoritative ATT&CK projection has exactly one writer. These guards pin
+# the three structural facts that make it true, each asserted where a later
+# edit could undo it:
+#
+#   * the ordinary handler's default capability excludes MITRE_ATTACK;
+#   * the importer is wired to the dedicated MITRE-capable factory;
+#   * the CLI's ingest-file choices exclude MITRE_ATTACK.
+#
+# None of them depends on a caller boolean, command metadata, tenant, actor or
+# CLI flag -- capability comes from wiring, which is what makes self-asserted
+# authority unrepresentable rather than merely refused.
+# ---------------------------------------------------------------------------
+
+_HANDLER_MODULE = "application/handlers/knowledge.py"
+_CONTAINER_MODULE = "bootstrap/container.py"
+_CLI_MODULE = "knowledge/cli.py"
+
+
+def test_the_ordinary_handler_defaults_to_non_mitre_sources() -> None:
+    """The default capability must not include MITRE_ATTACK.
+
+    ``allowed_source_kinds=None`` falls back to ``ORDINARY_WRITABLE_SOURCES``,
+    so every caller that forgot to think about capability gets the ordinary
+    one. If MITRE_ATTACK ever appears in that default, the single-writer
+    invariant is gone for every handler the container builds.
+    """
+    tree = _module_tree(_HANDLER_MODULE)
+
+    for node in ast.walk(tree):
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target, node.value
+        else:
+            continue
+        if target.id == "ORDINARY_WRITABLE_SOURCES" and value is not None:
+                    assert isinstance(value, ast.Call), (
+                        "ORDINARY_WRITABLE_SOURCES should stay a frozenset literal"
+                    )
+                    func = value.func
+                    assert isinstance(func, ast.Name) and func.id == "frozenset", (
+                        "ORDINARY_WRITABLE_SOURCES should stay a frozenset literal"
+                    )
+                    args = value.args
+                    assert len(args) == 1 and isinstance(args[0], ast.Set), (
+                        "ORDINARY_WRITABLE_SOURCES should stay a set literal"
+                    )
+                    members = {
+                        element.attr
+                        for element in args[0].elts
+                        if isinstance(element, ast.Attribute)
+                    }
+                    assert "MITRE_ATTACK" not in members, (
+                        "the ordinary capability must never include MITRE_ATTACK; "
+                        "that source is written only through the ATT&CK importer"
+                    )
+                    assert members == {"CURATED_GUIDANCE", "TENANT_RUNBOOK"}, (
+                        f"unexpected ordinary capability members: {sorted(members)}"
+                    )
+                    return
+    raise AssertionError(
+        "ORDINARY_WRITABLE_SOURCES not found; the guard is asserting about nothing"
+    )
+
+
+def test_the_attack_importer_uses_the_dedicated_mitre_capability() -> None:
+    """The importer must be wired to the factory that may write MITRE_ATTACK.
+
+    ``attack_import_handler`` builds its ingestion through
+    ``attack_projection_ingestion_handler``, never through the ordinary factory
+    and never by constructing a handler inline with a caller-chosen allowlist.
+    """
+    tree = _module_tree(_CONTAINER_MODULE)
+    factory = _function(tree, "attack_import_handler")
+    names = _called_names(factory)
+
+    assert "attack_projection_ingestion_handler" in names, (
+        "the importer must stage through the dedicated MITRE capability"
+    )
+    assert "knowledge_ingestion_handler" not in names, (
+        "the importer must not share the ordinary factory; sharing it would "
+        "make the two capabilities one refactor away from each other"
+    )
+
+    for node in ast.walk(factory):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id != "KnowledgeIngestionHandler", (
+                "capability is decided by the container's factories, not by an "
+                "inline construction inside the importer"
+            )
+
+
+def test_no_caller_boolean_can_grant_mitre_write_authority() -> None:
+    """No command field may act as a MITRE bypass flag.
+
+    The forbidden shapes are a boolean like ``allow_system_source``/``trusted``/
+    ``internal`` on ``IngestKnowledgeDocument``, and metadata-based inference.
+    Capability comes from the handler's construction, full stop.
+    """
+    tree = _module_tree("application/commands/knowledge.py")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "IngestKnowledgeDocument":
+            fields = {
+                target.id
+                for statement in node.body
+                for target in getattr(statement, "targets", [])
+                if isinstance(target, ast.Name)
+            }
+            forbidden = {
+                "allow_system_source",
+                "trusted",
+                "internal",
+                "allow_mitre",
+                "system_source",
+            }
+            assert not (fields & forbidden), (
+                f"a caller-controlled bypass flag would re-create self-asserted "
+                f"authority: {sorted(fields & forbidden)}"
+            )
+            return
+    raise AssertionError(
+        "IngestKnowledgeDocument not found; the guard is asserting about nothing"
+    )
+
+
+def test_the_cli_does_not_offer_mitre_attack_as_an_ingest_choice() -> None:
+    """The UX guard: ``ingest-file --source-kind`` must not list MITRE_ATTACK.
+
+    The boundary itself lives in the application handler; this pins the CLI
+    surface so an operator is refused by the parser before anything is hashed,
+    embedded or written.
+    """
+    cli_tree = _module_tree(_CLI_MODULE)
+    for node in ast.walk(cli_tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            continue
+        args = [
+            arg.value for arg in node.args
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+        ]
+        if "--source-kind" not in args:
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        choices = keywords.get("choices")
+        assert choices is not None, (
+            "ingest-file --source-kind must declare an explicit choices list; "
+            "an open string would accept MITRE_ATTACK"
+        )
+        source = ast.unparse(choices)
+        assert "MITRE_ATTACK" not in source, (
+            "the CLI must not offer MITRE_ATTACK as an ingest-file source kind; "
+            "MITRE content enters only through `import-attack`"
+        )
+        assert "SourceKind" not in source or "ORDINARY_WRITABLE" in source, (
+            "the choices must come from the ordinary writable set, not from the "
+            "whole SourceKind enum"
+        )
+        return
+    raise AssertionError(
+        "no --source-kind add_argument found; the guard is asserting about nothing"
+    )

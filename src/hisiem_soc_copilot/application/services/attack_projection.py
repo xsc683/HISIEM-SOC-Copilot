@@ -22,9 +22,19 @@ from ..ports.attack import AttackTechnique
 EXTERNAL_KEY_PREFIX = "mitre-attack:"
 
 
+def technique_external_key_for_id(technique_id: str) -> str:
+    """Return the knowledge ``external_key`` for one technique id.
+
+    The ONE canonical formatting site: ``technique_external_key`` delegates to
+    it, and the cutover validates bindings against it, so no second
+    implementation of ``mitre-attack:<id>`` can drift (closure-3 section 15).
+    """
+    return f"{EXTERNAL_KEY_PREFIX}{technique_id}"
+
+
 def technique_external_key(technique: AttackTechnique) -> str:
     """Return the knowledge ``external_key`` for ``technique``."""
-    return f"{EXTERNAL_KEY_PREFIX}{technique.technique_id}"
+    return technique_external_key_for_id(technique.technique_id)
 
 
 def technique_document_title(technique: AttackTechnique) -> str:

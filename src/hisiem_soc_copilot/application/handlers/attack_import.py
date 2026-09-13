@@ -48,13 +48,14 @@ from ...domain.knowledge.entities import (
     KnowledgeDocument,
     KnowledgeDocumentVersion,
 )
-from ...domain.knowledge.enums import SourceKind, Visibility
+from ...domain.knowledge.enums import DocumentStatus, SourceKind, Visibility
 from ...domain.knowledge.value_objects import normalize_and_hash
 from ..commands.knowledge import ImportAttackRelease, IngestKnowledgeDocument
 from ..errors import (
     ApplicationError,
     AttackReleaseContentConflictError,
     AttackReleaseProjectionIncompleteError,
+    AttackReleaseProjectionInvalidBindingError,
     AttackReleaseProjectionMissingVersionError,
 )
 from ..ports.attack import FRAMEWORK, AttackBundle, AttackBundleParser, AttackTechnique
@@ -71,6 +72,7 @@ from ..services.attack_projection import (
     technique_document_body,
     technique_document_title,
     technique_external_key,
+    technique_external_key_for_id,
 )
 from ..services.attack_release_fingerprint import fingerprint_from_records
 from .knowledge import KnowledgeIngestionHandler
@@ -386,6 +388,80 @@ class AttackImportHandler:
     # ------------------------------------------------------------------
     # the atomic cutover
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # cutover validation: relational identity + retrievability
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _require_binding_identity(
+        *,
+        framework: str,
+        release: str,
+        binding: AttackReleaseProjectionRecord,
+        document: KnowledgeDocument,
+        version: KnowledgeDocumentVersion,
+    ) -> None:
+        """Refuse a binding whose rows exist but whose relationship is invalid.
+
+        Every binding names a document AND a version. A cutover that trusted the
+        names without checking the relationship could point a technique's document
+        at another document's version, or point a runbook at an ATT&CK release --
+        and retrieval would serve it confidently either way. Each predicate below
+        is one way that failure looks, and all of them run BEFORE any authority
+        mutation (closure-3 sections 13-16).
+        """
+        expected = technique_external_key_for_id(binding.technique_id)
+        if (
+            version.document_id != binding.document_id
+            or document.source_kind is not SourceKind.MITRE_ATTACK
+            or document.visibility is not Visibility.GLOBAL
+            or document.tenant_id is not None
+            or document.status is not DocumentStatus.ACTIVE
+            or document.external_key != expected
+            or version.content_hash != binding.content_hash
+        ):
+            raise AttackReleaseProjectionInvalidBindingError(
+                f"ATT&CK release {release!r} binds {binding.technique_id} to a "
+                "document version that is not this release's projection: the "
+                "version does not belong to the bound document, the document is "
+                "not a GLOBAL ACTIVE MITRE_ATTACK projection target, its "
+                "external key is not this technique's canonical key, or the "
+                "content-hash chain canonical == binding == version is broken. "
+                "Nothing was changed."
+            )
+
+    @staticmethod
+    async def _require_retrievable(
+        uow: UnitOfWork,
+        *,
+        framework: str,
+        release: str,
+        binding: AttackReleaseProjectionRecord,
+        version: KnowledgeDocumentVersion,
+        active_profile_id: object,
+    ) -> None:
+        """Refuse to make a release authoritative for content it cannot serve.
+
+        A version row existing is not the same as a version being retrievable.
+        Cutting authority over to a version with no chunks -- or with chunks the
+        current embedding space does not cover -- would serve nothing while
+        claiming everything. The projection state is REUSED from the ingestion
+        path rather than re-derived in SQL, so there is exactly one definition
+        of "projected" (closure-3 section 17).
+        """
+        del framework  # the lock scope, not a lookup key here
+        state = await uow.knowledge_chunks.projection_state(
+            document_version_id=version.id
+        )
+        if state.is_empty or (
+            active_profile_id is not None and state.embedding_profile_id is None
+        ):
+            raise AttackReleaseProjectionIncompleteError(
+                f"ATT&CK release {release!r} cannot be made authoritative: "
+                f"{binding.technique_id} has no retrievable projection "
+                "(no chunks, or no embedding space fully covers the current "
+                "generation). Nothing was changed."
+            )
+
     async def _cutover(self, command: ImportAttackRelease) -> None:
         """Make a release authoritative AND point retrieval at its projection.
 
@@ -465,13 +541,19 @@ class AttackImportHandler:
                         "projection is not of its own content"
                     )
 
-            # Resolve EVERY binding to its live version and document BEFORE the
-            # first mutation. The resolution can fail -- a binding whose foreign
-            # key was somehow bypassed, a document that no longer resolves -- and a
-            # refusal must leave the framework's authority untouched. Relying on
-            # the transaction to roll a flipped release back would make that
-            # guarantee a property of the caller's UnitOfWork rather than of this
-            # method, which is not a guarantee at all.
+            # Resolve AND fully validate EVERY binding against its live version
+            # and document BEFORE the first mutation. Resolution can fail -- a
+            # binding whose foreign key was somehow bypassed, a document that no
+            # longer resolves -- and validation can fail even when every row
+            # exists: the version may belong to a different document, the document
+            # may not be a GLOBAL MITRE_ATTACK projection target, its external key
+            # may not be this technique's canonical key, or the hash chain
+            # canonical == binding == version may be broken. A refusal must leave
+            # the framework's authority untouched. Relying on the transaction to
+            # roll a flipped release back would make that guarantee a property of
+            # the caller's UnitOfWork rather than of this method, which is not a
+            # guarantee at all (closure-3 sections 13-18).
+            active_profile = await uow.embedding_profiles.get_active()
             resolved: list[tuple[KnowledgeDocument, KnowledgeDocumentVersion]] = []
             for binding in bindings:
                 version = await uow.knowledge_documents.get_version(
@@ -490,6 +572,23 @@ class AttackImportHandler:
                         f"ATT&CK release {release!r} binds {binding.technique_id} to "
                         "a document that does not resolve"
                     )
+                self._require_binding_identity(
+                    framework=framework,
+                    release=release,
+                    binding=binding,
+                    document=document,
+                    version=version,
+                )
+                await self._require_retrievable(
+                    uow,
+                    framework=framework,
+                    release=release,
+                    binding=binding,
+                    version=version,
+                    active_profile_id=(
+                        active_profile.id if active_profile is not None else None
+                    ),
+                )
                 resolved.append((document, version))
 
             releases = await uow.attack_releases.list_for_framework(

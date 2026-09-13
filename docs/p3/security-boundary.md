@@ -259,8 +259,9 @@ ATT&CK knowledge is imported from local, operator-supplied STIX 2.1 JSON. Four
 rules make the imported corpus an *authority* rather than whatever the last import
 happened to write: a released name is immutable (§10.1); at most one release per
 framework is authoritative (§10.2); the bundle is never fetched over the network
-(§10.3); and an import becomes authoritative only through an atomic cutover that
-validates the staged projection before it mutates anything (§10.4).
+(§10.3); an import becomes authoritative only through an atomic cutover that
+validates the staged projection before it mutates anything (§10.4); and the
+authoritative projection has exactly one writer (§10.7).
 
 ### 10.1 A pinned release is immutable
 
@@ -363,17 +364,20 @@ An import is three acts, and only the last one can change what anyone reads:
    together or not at all — there is no window in which `attack_release` claims an
    authority whose content retrieval does not return.
 
-The cutover is fail-closed, and the checks that can be answered from the release's
-own rows run **before the first mutation**. The remaining bindings are resolved as
-the pointers move, in the same transaction, so a refusal at any point rolls the
-whole cutover back and leaves the canonical authority and every document pointer
-exactly as they were:
+The cutover validates in the order the brief requires: lock, release, binding
+count and completeness, then ALL documents and versions resolved, then ALL
+relational identities, then ALL hash chains, then ALL retrieval-projection
+availability -- and only then the mutation. Every binding is fully resolved and
+validated **before the first mutation**, so a refusal never depends on the
+caller's transaction rolling a flipped release back:
 
 | Condition | When it is checked | Code |
 |---|---|---|
 | Every canonical technique must have a staged binding, the binding count must equal the release's declared technique count, and every bound document must still be `ACTIVE` | before the first mutation | `ATTACK_RELEASE_PROJECTION_INCOMPLETE` |
 | Every binding's content hash must still equal its canonical row's | before the first mutation | `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` |
-| Every binding must resolve to a version and a document that still exist | while the pointers move, in the same transaction | `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` |
+| Every binding must resolve to a version and a document that still exist | before the first mutation | `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` |
+| Every binding's version must belong to its document, the document must be a GLOBAL ACTIVE `MITRE_ATTACK` target with the canonical `mitre-attack:<technique_id>` key, and the chain canonical == binding == version must hold | before the first mutation | `ATTACK_RELEASE_PROJECTION_INVALID_BINDING` |
+| Every bound version must have a retrievable projection (chunks exist, and the ACTIVE embedding space fully covers the current generation when one is configured) | before the first mutation | `ATTACK_RELEASE_PROJECTION_INCOMPLETE` |
 | An authoritative release has no staged projection for some technique, or its bound documents serve some other version | `knowledge doctor` only | `ATTACK_RELEASE_PROJECTION_DIVERGED` |
 
 `ATTACK_RELEASE_CONTENT_CONFLICT` is unchanged: it is still the immutability
@@ -445,6 +449,25 @@ revision existed is **not** covered. An operator in that position must run
 `alembic upgrade head` first (free: the upgrade is additive) and only then
 downgrade.
 
+### 10.7 MITRE_ATTACK has exactly one writer
+
+`MITRE_ATTACK` is a system-managed source. The ordinary knowledge handler --
+built by the container's `knowledge_ingestion_handler` factory -- refuses it on
+both ingest and retire with `SYSTEM_MANAGED_KNOWLEDGE_SOURCE`, and `ingest-file
+--source-kind` does not offer it. The ATT&CK importer stages through a dedicated
+`attack_projection_ingestion_handler` factory that may write MITRE_ATTACK and
+nothing else. Capability is trusted bootstrap configuration, never a command
+field: there is no `allow_system_source`, `trusted`, or `internal` flag, and no
+metadata inference, because a caller-controlled bypass would be self-asserted
+authority.
+
+Ordinary retirement of a MITRE document is refused for the same reason. A
+generic retire that withdrew the authoritative projection would leave the
+release ACTIVE while retrieval serves nothing -- and it would make the release
+un-activatable afterwards, since a retired document is unusable as a cutover
+target. MITRE lifecycle, if it ever needs one, belongs to an ATT&CK-specific
+workflow that does not exist yet.
+
 ## 11. Where each claim is tested
 
 Every claim above is pinned by an executable test. The mapping is kept here so a
@@ -468,6 +491,8 @@ the sentence stopped being true.
 | Section 10.4 — a staged release leaves normal retrieval untouched; the cutover validates before mutating and switches authority and retrieval in one transaction | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
 | Section 10.5 — the binding is provenance, not authority, and re-activating an older release restores the version it staged | `tests/unit/knowledge/test_attack_import.py`, `tests/unit/knowledge/test_attack_projection.py` |
 | Section 10.6 — a downgrade that would destroy state refuses before any DDL (`P3A_DOWNGRADE_UNSAFE`), and the untouched round trip still succeeds | `tests/integration/migrations/` |
+| Section 10.7 — MITRE_ATTACK is system-managed; ordinary ingest/retire refuse it and the importer stages through a dedicated capability | `tests/unit/knowledge/test_ingestion_handler.py`, `tests/unit/knowledge/test_knowledge_cli.py`, `tests/architecture/test_knowledge_boundary.py` |
+| Cutover relational validation — version belongs to bound document, GLOBAL ACTIVE MITRE target, canonical key, full hash chain, retrievable projection | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
 | Section 8 — secrets never reach the surface | `tests/unit/knowledge/test_knowledge_cli.py`, `tests/unit/knowledge/test_diagnostics.py` |
 | Section 9 — no LLM judge; the artifact is recomputable and labelled | `tests/unit/evaluation/knowledge/test_evaluation_knowledge.py` |
 | Scope rules, normalization, hashing, lifecycle | `tests/unit/knowledge/test_domain_knowledge.py` |

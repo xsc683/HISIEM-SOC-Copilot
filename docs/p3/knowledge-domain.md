@@ -168,12 +168,20 @@ true rather than merely intended:
    written **INACTIVE**, in one short transaction. `activate=True` does not
    activate anything at this point — it records that the import has authority
    *intent*.
-2. **Staging.** Each technique is ingested through the ordinary knowledge path
-   with `activate_version=False`, so its immutable version, its chunks and its
-   embeddings are all created — but `active_version_id` is **not** moved. One
-   binding row per technique is then recorded in `attack_release_projection`.
-   A staged release is therefore fully projected and completely invisible to
-   retrieval.
+2. **Staging.** Each technique is ingested through a dedicated MITRE-capable
+   ingestion handler -- the same ingestion use case, but built by the
+   container's `attack_projection_ingestion_handler` factory with a capability
+   the ordinary factory cannot mint -- with `activate_version=False`, so its
+   immutable version, its chunks and its embeddings are all created — but
+   `active_version_id` is **not** moved. One binding row per technique is then
+   recorded in `attack_release_projection`. A staged release is therefore fully
+   projected and completely invisible to retrieval.
+
+   `MITRE_ATTACK` is system-managed. The ordinary knowledge handler refuses it
+   with `SYSTEM_MANAGED_KNOWLEDGE_SOURCE` on both ingest and retire, and
+   `ingest-file --source-kind` does not offer it. There is no caller-controlled
+   bypass flag: capability comes from wiring at bootstrap, never from a command
+   field, metadata, tenant, actor, or CLI flag.
 3. **Cutover**, only when the import has authority intent. It is ONE transaction:
    take the framework's advisory lock, **validate before any mutation**, flip the
    release's authority, mirror `attack_technique.active`, then move each bound

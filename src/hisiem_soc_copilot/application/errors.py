@@ -171,6 +171,35 @@ class AttackReleaseProjectionMissingVersionError(ApplicationError):
     code = "ATTACK_RELEASE_PROJECTION_MISSING_VERSION"
 
 
+class SystemManagedKnowledgeSourceError(ApplicationError):
+    """Refused: this source kind is owned by a system workflow, not by callers.
+
+    ``MITRE_ATTACK`` knowledge is written and retired only by the ATT&CK
+    import/stage/cutover application path. Letting an ordinary ingest or retire
+    touch it would hand a second writer the authoritative projection -- the
+    closure-2 cutover would then be a suggestion rather than the single writer
+    the invariant requires (closure-3 section 4).
+    """
+
+    code = "SYSTEM_MANAGED_KNOWLEDGE_SOURCE"
+
+
+class AttackReleaseProjectionInvalidBindingError(ApplicationError):
+    """A staged binding names the right rows but the wrong relationship.
+
+    The binding row exists and its document and version resolve, yet they are not
+    THIS release's projection: the version does not belong to the bound document,
+    the document is not a GLOBAL MITRE_ATTACK projection target, its external
+    key is not the canonical ``mitre-attack:<technique_id>`` for the bound
+    technique, or the content-hash chain
+    canonical == binding == version is broken. This is a different defect from a
+    missing version -- the row exists, the relationship is invalid -- so it gets
+    its own code rather than borrowing one (closure-3 section 13).
+    """
+
+    code = "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+
+
 class KnowledgeCorpusPreconditionError(ApplicationError):
     """The corpus under evaluation is not the corpus the baseline expects.
 

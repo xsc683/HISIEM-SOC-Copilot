@@ -537,6 +537,10 @@ created_version=True rebuilt_projection=True
   bytes cannot create a second version" a database fact.
 - Changing the content appends version 2 and moves `active_version_id`. The old
   version row is never modified. Nothing is overwritten silently.
+- `ingest-file --source-kind` accepts only `CURATED_GUIDANCE` and
+  `TENANT_RUNBOOK`. `MITRE_ATTACK` content enters through `import-attack` (§8)
+  alone: the ordinary handler refuses it with `SYSTEM_MANAGED_KNOWLEDGE_SOURCE`,
+  and the parser refuses the value before anything is read.
 - The same file ingested from a Windows checkout and a Linux checkout hashes
   identically.
 
@@ -551,6 +555,11 @@ Retirement is terminal and does not require an embedding provider — withdrawin
 document is a lifecycle transition, not an embedding operation, and it must keep
 working during an embedding outage. A retired document leaves normal search.
 Citations captured before the retirement **still resolve**.
+
+Retiring a MITRE document through this command is refused with
+`SYSTEM_MANAGED_KNOWLEDGE_SOURCE`: the authoritative projection is withdrawn
+only by an ATT&CK-specific workflow, and withdrawing it underneath an ACTIVE
+release would orphan that release's authority.
 
 ## 8. Importing MITRE ATT&CK
 
@@ -932,6 +941,9 @@ P2 response/durability tests, and the ToolRegistry selectable-name set
 | `import-attack` → `ATTACK_RELEASE_CONTENT_CONFLICT` | The same release name was imported with a different technique collection | Re-import the pinned bundle, or use a new release name (§8) |
 | `import-attack` → `ATTACK_RELEASE_PROJECTION_INCOMPLETE` | The staged projection is not complete: a crash mid-staging, or a bound document was retired underneath the release | Re-run the same import to finish staging; the message names the missing techniques. Nothing was changed (§8) |
 | `import-attack` → `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` | A binding does not resolve, or its content hash no longer matches its canonical row | The staged projection is not of this release's content. Re-run the import; if it persists, the database was restored out of band (§8) |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_INVALID_BINDING` | The binding exists but its relationship is invalid: version belongs to another document, non-MITRE/non-GLOBAL/retired target, wrong external key, or broken canonical == binding == version hash chain | The staged binding is not this release's projection. Re-stage the release; if it persists, the database was edited out of band (§8) |
+| `ingest-file --source-kind MITRE_ATTACK` | Rejected by the parser | MITRE content enters through `import-attack` (§8); the ordinary path is not its writer |
+| `ingest-file`/`retire` → `SYSTEM_MANAGED_KNOWLEDGE_SOURCE` | An ordinary write or retirement targeted a MITRE document | Use `import-attack` for MITRE content; MITRE lifecycle belongs to an ATT&CK-specific workflow |
 | `doctor` → `NOT_READY`, `attack_release_projection` FAIL, `ATTACK_RELEASE_PROJECTION_DIVERGED` | The authoritative release and what normal retrieval serves disagree | Re-import that release. It is already ACTIVE, so the import cuts over even without `--activate` (§8) |
 | `alembic downgrade` → `P3A_DOWNGRADE_UNSAFE` | The database holds rows the pre-closure schema cannot represent | Nothing was changed. Take a physical backup and remove the listed rows deliberately, or stay at head. If `alembic current` is `c41f7b2e9d08`, run `alembic upgrade head` first (§3, **Downgrade safety**) |
 | `ingest-file` → `EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX` | The configured provider differs from the ACTIVE profile | Switching the embedding space is a whole-corpus reindex, not an ingest; restore the original provider configuration, or reindex the corpus (§5) |

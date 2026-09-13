@@ -45,6 +45,7 @@ from ..application.commands.knowledge import (
     RetireKnowledgeDocument,
 )
 from ..application.errors import ApplicationError
+from ..application.handlers.knowledge import ORDINARY_WRITABLE_SOURCES
 from ..application.ports.knowledge import KnowledgeQuery, KnowledgeSearchResult
 from ..application.services.knowledge_retrieval import RetrievalMode
 from ..bootstrap.container import Container
@@ -99,7 +100,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest-file", help="ingest one local .txt/.md document")
     ingest.add_argument("--path", required=True)
-    ingest.add_argument("--source-kind", required=True, choices=[k.value for k in SourceKind])
+    # MITRE_ATTACK is deliberately not offered: it is system-managed and can
+    # only be written by the ATT&CK import path (see `import-attack`). This is a
+    # UX guard, not the boundary -- the application handler refuses it anyway.
+    ingest.add_argument(
+        "--source-kind",
+        required=True,
+        choices=sorted(kind.value for kind in ORDINARY_WRITABLE_SOURCES),
+    )
     ingest.add_argument("--external-key", required=True)
     ingest.add_argument("--visibility", required=True, choices=[v.value for v in Visibility])
     ingest.add_argument("--tenant", default=None, help="required for TENANT, forbidden for GLOBAL")

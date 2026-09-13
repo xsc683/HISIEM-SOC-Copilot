@@ -49,6 +49,13 @@ citation in `citation_id` outlive every rebuild described in §7.
 
 `MAX_RESULT_LIMIT = 5` — a request for more is **rejected**, not clamped.
 
+The ATT&CK authoritative projection has single-writer cutover semantics: an
+`MITRE_ATTACK` document's `active_version_id` moves only inside the ATT&CK
+cutover transaction, never by ordinary ingestion. Retrieval itself needs no
+release awareness -- it reads the pointer, and the cutover guarantees the
+pointer -- but that guarantee is what makes serving a MITRE hit the same claim
+as serving the authoritative release.
+
 ## 2. The scope is mandatory
 
 ```python

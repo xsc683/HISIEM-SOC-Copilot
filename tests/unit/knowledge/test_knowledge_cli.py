@@ -391,6 +391,32 @@ def _keys(value: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 # local file inputs (_load_inputs), via main
 # ---------------------------------------------------------------------------
+def test_ingest_file_refuses_a_system_managed_source_kind() -> None:
+    """``MITRE_ATTACK`` cannot be ingested through the ordinary CLI path.
+
+    This asserts the UX guard -- the parser refuses the value -- not the
+    boundary: the application handler refuses it too, and that is covered where
+    the use case lives.
+    """
+    parser = cli_module._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "ingest-file",
+                "--path",
+                "guide.md",
+                "--source-kind",
+                "MITRE_ATTACK",
+                "--external-key",
+                "mitre-attack:T1110",
+                "--visibility",
+                "GLOBAL",
+                "--title",
+                "Brute Force",
+            ]
+        )
+
+
 def test_a_missing_input_file_fails_before_the_container_is_opened(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

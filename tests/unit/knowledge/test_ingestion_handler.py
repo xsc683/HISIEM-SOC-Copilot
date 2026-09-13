@@ -34,6 +34,7 @@ from hisiem_soc_copilot.application.errors import (
     KnowledgeEmbeddingProfileError,
     KnowledgeIngestionConflictError,
     NotFoundError,
+    SystemManagedKnowledgeSourceError,
 )
 from hisiem_soc_copilot.application.handlers.knowledge import (
     KnowledgeIngestionHandler,
@@ -1797,3 +1798,99 @@ async def test_the_declared_chunk_size_bound_binds_even_without_chunker_limits()
     assert "max_chunk_chars" in str(excinfo.value)
     assert runtime.documents.documents == {}
     assert runtime.chunks.chunks == {}
+
+# ---------------------------------------------------------------------------
+# system-managed sources (closure-3 section 4)
+# ---------------------------------------------------------------------------
+
+async def test_the_ordinary_handler_refuses_a_mitre_ingest_before_any_write() -> None:
+    """MITRE_ATTACK has exactly one writer: the ATT&CK import path.
+
+    An ordinary handler given a MITRE command must refuse with
+    SYSTEM_MANAGED_KNOWLEDGE_SOURCE, and the refusal must leave the stores
+    untouched. The ATT&CK importer stages through a handler built with the MITRE
+    capability instead -- that the importer still works is covered where the
+    importer lives.
+    """
+    runtime = FakeRuntime()
+    handler = _handler(runtime=runtime, provider=_provider(runtime))
+
+    with pytest.raises(SystemManagedKnowledgeSourceError) as excinfo:
+        await handler.ingest(
+            _command(
+                source_kind=SourceKind.MITRE_ATTACK,
+                external_key="mitre-attack:T1110",
+                visibility=Visibility.GLOBAL,
+                tenant_id=None,
+            )
+        )
+
+    assert excinfo.value.code == "SYSTEM_MANAGED_KNOWLEDGE_SOURCE"
+    assert runtime.documents.documents == {}
+    assert runtime.documents.versions == {}
+    assert runtime.chunks.chunks == {}
+
+
+async def test_the_ordinary_handler_cannot_retire_a_mitre_document() -> None:
+    """Withdrawing the authoritative projection would orphan the release.
+
+    The release would stay ACTIVE while retrieval serves nothing -- so the
+    ordinary retire path refuses with the same code, and the document stays
+    ACTIVE. MITRE lifecycle, if it ever needs one, belongs to an ATT&CK-specific
+    workflow that does not exist yet.
+    """
+    runtime = FakeRuntime()
+    document = KnowledgeDocument.create(
+        id=uuid4(),
+        source_kind=SourceKind.MITRE_ATTACK,
+        external_key="mitre-attack:T1110",
+        visibility=Visibility.GLOBAL,
+        tenant_id=None,
+        title="T1110: Brute Force",
+        now=T0,
+    )
+    document.clear_events()
+    runtime.documents.documents[document.id] = document
+    handler = _handler(runtime=runtime, provider=_provider(runtime))
+
+    with pytest.raises(SystemManagedKnowledgeSourceError) as excinfo:
+        await handler.retire(
+            RetireKnowledgeDocument(
+                tenant_id=TENANT, document_id=document.id, reason="operator error"
+            )
+        )
+
+    assert excinfo.value.code == "SYSTEM_MANAGED_KNOWLEDGE_SOURCE"
+    assert document.status is DocumentStatus.ACTIVE
+
+
+async def test_a_dedicated_handler_still_writes_mitre_when_wired_for_it() -> None:
+    """The refusal is about the CAPABILITY, not the source kind.
+
+    A handler built with the MITRE capability -- the shape the container's
+    ``attack_projection_ingestion_handler`` builds -- stages a MITRE version
+    without moving the pointer, proving the boundary is not a global MITRE ban.
+    """
+    runtime = FakeRuntime()
+    handler = KnowledgeIngestionHandler(
+        unit_of_work_factory=runtime.factory,
+        embedding_provider=_provider(runtime),
+        chunker=StructureAwareChunker(),
+        clock=FakeClock(T0),
+        allowed_source_kinds=frozenset({SourceKind.MITRE_ATTACK}),
+    )
+
+    outcome = await handler.ingest(
+        IngestKnowledgeDocument(
+            source_kind=SourceKind.MITRE_ATTACK,
+            external_key="mitre-attack:T1110",
+            visibility=Visibility.GLOBAL,
+            title="T1110: Brute Force",
+            content=CONTENT,
+            tenant_id=None,
+            activate_version=False,
+        )
+    )
+
+    assert outcome.version_created is True
+    assert outcome.document.source_kind is SourceKind.MITRE_ATTACK

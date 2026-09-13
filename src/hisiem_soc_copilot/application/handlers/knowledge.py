@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from ...domain.knowledge.entities import KnowledgeDocument, KnowledgeDocumentVersion
-from ...domain.knowledge.enums import DocumentStatus
+from ...domain.knowledge.enums import DocumentStatus, SourceKind
 from ...domain.knowledge.errors import (
     InvalidKnowledgeDocumentError,
     InvalidKnowledgeVersionError,
@@ -61,6 +61,7 @@ from ..errors import (
     KnowledgeEmbeddingProfileError,
     KnowledgeIngestionConflictError,
     NotFoundError,
+    SystemManagedKnowledgeSourceError,
 )
 from ..ports.chunking import ChunkingPort, DocumentChunk
 from ..ports.clock import ClockPort
@@ -94,6 +95,17 @@ class KnowledgeIngestionLimits:
     max_chunk_chars: int = 8_000
 
 
+#: Knowledge source kinds the ordinary (non-ATT&CK) use case may write.
+#:
+#: ``MITRE_ATTACK`` is deliberately absent: it is a system-managed source whose
+#: only writer is the ATT&CK import/stage/cutover path. This is wiring, not a
+#: command field, because a caller-controlled bypass flag would be self-asserted
+#: authority (closure-3 section 5).
+ORDINARY_WRITABLE_SOURCES: frozenset[SourceKind] = frozenset(
+    {SourceKind.CURATED_GUIDANCE, SourceKind.TENANT_RUNBOOK}
+)
+
+
 class KnowledgeIngestionHandler:
     """Ingest and retire knowledge documents against short transactions.
 
@@ -118,12 +130,18 @@ class KnowledgeIngestionHandler:
         chunker: ChunkingPort,
         clock: ClockPort,
         limits: KnowledgeIngestionLimits | None = None,
+        allowed_source_kinds: frozenset[SourceKind] | None = None,
     ) -> None:
         self._uow_factory = unit_of_work_factory
         self._embedding_provider = embedding_provider
         self._chunker = chunker
         self._clock = clock
         self._limits = limits or KnowledgeIngestionLimits()
+        self._allowed_source_kinds = (
+            allowed_source_kinds
+            if allowed_source_kinds is not None
+            else ORDINARY_WRITABLE_SOURCES
+        )
 
     @property
     def chunker_version(self) -> str:
@@ -140,6 +158,12 @@ class KnowledgeIngestionHandler:
         asking a provider for its identity -- and inventing vectors to get past
         that check is the one thing section 87 forbids outright.
         """
+        if command.source_kind not in self._allowed_source_kinds:
+            raise SystemManagedKnowledgeSourceError(
+                f"{command.source_kind.value} is managed by the ATT&CK "
+                "import/cutover workflow; ordinary knowledge ingestion cannot "
+                "write it"
+            )
         provider = self._embedding_provider
         if provider is None:
             raise KnowledgeEmbeddingProfileError(
@@ -216,6 +240,12 @@ class KnowledgeIngestionHandler:
             document = await uow.knowledge_documents.get(
                 tenant_id=command.tenant_id, document_id=command.document_id
             )
+            if document is not None and document.source_kind not in self._allowed_source_kinds:
+                raise SystemManagedKnowledgeSourceError(
+                    f"{document.source_kind.value} is managed by the ATT&CK "
+                    "import/cutover workflow; ordinary knowledge retirement "
+                    "cannot withdraw it"
+                )
             if document is None:
                 raise NotFoundError(
                     "knowledge document not found",

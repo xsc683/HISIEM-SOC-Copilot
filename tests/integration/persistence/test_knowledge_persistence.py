@@ -41,10 +41,17 @@ from uuid import UUID
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import insert, text
+from sqlalchemy import insert, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from hisiem_soc_copilot.application.commands.knowledge import ImportAttackRelease
+from hisiem_soc_copilot.application.errors import (
+    AttackReleaseProjectionInvalidBindingError,
+)
+from hisiem_soc_copilot.application.handlers.attack_import import AttackImportHandler
+from hisiem_soc_copilot.application.handlers.knowledge import KnowledgeIngestionHandler
+from hisiem_soc_copilot.application.ports.attack import FRAMEWORK
 from hisiem_soc_copilot.application.ports.clock import SystemClock
 from hisiem_soc_copilot.application.ports.knowledge import (
     ATTACK_RELEASE_STATUS_ACTIVE,
@@ -58,6 +65,7 @@ from hisiem_soc_copilot.application.ports.knowledge import (
     KnowledgeContentChunkRecord,
     KnowledgeQuery,
 )
+from hisiem_soc_copilot.application.ports.unit_of_work import UnitOfWork
 from hisiem_soc_copilot.application.services.knowledge_retrieval import (
     KnowledgeCitationResolver,
     KnowledgeRetrievalService,
@@ -94,17 +102,28 @@ from hisiem_soc_copilot.evaluation.knowledge import (
 from hisiem_soc_copilot.infrastructure.embedding.deterministic import (
     DeterministicEmbeddingProvider,
 )
+from hisiem_soc_copilot.infrastructure.knowledge.attack_source import (
+    MitreStixAttackSource,
+)
+from hisiem_soc_copilot.infrastructure.knowledge.chunker_port import (
+    StructureAwareChunker,
+)
 from hisiem_soc_copilot.infrastructure.persistence.orm.knowledge import (
+    AttackReleaseProjectionRow,
     KnowledgeChunkEmbeddingRow,
     KnowledgeContentChunkRow,
     KnowledgeDocumentRow,
 )
 from hisiem_soc_copilot.infrastructure.persistence.repositories.knowledge import (
+    SqlAlchemyAttackReleaseProjectionRepository,
     SqlAlchemyAttackReleaseRepository,
     SqlAlchemyAttackTechniqueRepository,
     SqlAlchemyEmbeddingProfileRepository,
     SqlAlchemyKnowledgeChunkRepository,
     SqlAlchemyKnowledgeDocumentRepository,
+)
+from hisiem_soc_copilot.infrastructure.persistence.unit_of_work import (
+    SqlAlchemyUnitOfWork,
 )
 from tests.support.db_runtime import SKIP_REASON, apply_settings, server_reachable
 
@@ -2814,3 +2833,249 @@ async def test_two_fresh_databases_rank_and_score_one_corpus_identically(
         assert first_mode.cross_tenant_leakage_count == second_mode.cross_tenant_leakage_count
 
     assert first_suite.hybrid_gate == second_suite.hybrid_gate
+
+# ---------------------------------------------------------------------------
+# ATT&CK import/stage/cutover against the real schema (closure-3 section 26)
+#
+# The unit tests prove the handler's decisions against doubles. These prove the
+# same flow against PostgreSQL + pgvector: the cutover's SQL (advisory lock,
+# set-based mirror, pointer moves), the projection repositories, and the full
+# stage -> activate -> reactivate cycle with real chunks and real embeddings.
+# ---------------------------------------------------------------------------
+
+_T1110_STIX = "attack-pattern--11111111-1111-4111-8111-111111111111"
+_T1059_STIX = "attack-pattern--22222222-2222-4222-8222-222222222222"
+# (unused; SystemClock supplies handler time)
+
+
+def _pattern(
+    *,
+    stix_id: str,
+    technique_id: str,
+    name: str,
+    description: str,
+) -> dict[str, object]:
+    return {
+        "type": "attack-pattern",
+        "id": stix_id,
+        "name": name,
+        "description": description,
+        "external_references": [
+            {
+                "source_name": "mitre-attack",
+                "external_id": technique_id,
+                "url": f"https://attack.mitre.org/techniques/{technique_id}",
+            }
+        ],
+        "kill_chain_phases": [
+            {"kill_chain_name": "mitre-attack", "phase_name": "credential-access"}
+        ],
+        "x_mitre_platforms": ["Linux"],
+        "x_mitre_domains": ["enterprise-attack"],
+    }
+
+
+def _attack_bundle(*, t1110_description: str) -> bytes:
+    import json as _json
+
+    return _json.dumps(
+        {
+            "type": "bundle",
+            "id": "bundle--00000000-0000-4000-8000-000000000000",
+            "spec_version": "2.1",
+            "objects": [
+                _pattern(
+                    stix_id=_T1110_STIX,
+                    technique_id="T1110",
+                    name="Brute Force",
+                    description=t1110_description,
+                ),
+                _pattern(
+                    stix_id=_T1059_STIX,
+                    technique_id="T1059",
+                    name="Command and Scripting Interpreter",
+                    description="Adversaries may abuse command shells.",
+                ),
+            ],
+        }
+    ).encode("utf-8")
+
+
+def _attack_setup(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[AttackImportHandler, DeterministicEmbeddingProvider]:
+    """The REAL importer, wired as the container wires it.
+
+    The ingestion handler carries the MITRE capability (the container's
+    ``attack_projection_ingestion_handler`` shape), staged against the real
+    repositories through a real UnitOfWork per transaction. Anything here that
+    drifts from the container's wiring is a test bug, not flexibility.
+    """
+    provider = DeterministicEmbeddingProvider(dimension=4)
+
+    def _factory() -> UnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    ingestion = KnowledgeIngestionHandler(
+        unit_of_work_factory=_factory,
+        embedding_provider=provider,
+        chunker=StructureAwareChunker(),
+        clock=SystemClock(),
+        allowed_source_kinds=frozenset({SourceKind.MITRE_ATTACK}),
+    )
+    handler = AttackImportHandler(
+        unit_of_work_factory=_factory,
+        parser=MitreStixAttackSource(),
+        ingestion=ingestion,
+        clock=SystemClock(),
+    )
+    return handler, provider
+
+
+async def _served_t1110(session_factory: async_sessionmaker[AsyncSession]) -> str:
+    """What normal retrieval would serve for T1110: the ACTIVE version's bytes."""
+    async with session_factory() as session:
+        documents = SqlAlchemyKnowledgeDocumentRepository(session)
+        document = await documents.find_by_external_key(
+            tenant_id=None,
+            source_kind=SourceKind.MITRE_ATTACK,
+            external_key="mitre-attack:T1110",
+            visibility=Visibility.GLOBAL,
+        )
+        assert document is not None
+        assert document.active_version_id is not None
+        version = await documents.get_version(
+            tenant_id=None, document_version_id=document.active_version_id
+        )
+        assert version is not None
+        return version.normalized_content
+
+
+async def _active_release(session_factory: async_sessionmaker[AsyncSession]) -> str:
+    async with session_factory() as session:
+        releases = SqlAlchemyAttackReleaseRepository(session)
+        active = await releases.get_active(framework=FRAMEWORK)
+        assert active is not None
+        return active.source_release
+
+
+async def test_attack_stage_activate_reactivate_against_real_postgres(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Stage is inert, activation cuts over, reactivation restores -- for real.
+
+    v14.1 activates and serves A. v15.1 stages with revised content and serves
+    nothing new. Activating v15.1 serves B. Re-activating v14.1 serves A again,
+    the exact staged version, all through real SQL.
+    """
+    handler, _ = _attack_setup(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v14.1",
+            payload=_attack_bundle(t1110_description="v14.1 body."),
+            activate=True,
+        )
+    )
+    assert await _active_release(session_factory) == "v14.1"
+    assert "v14.1 body." in await _served_t1110(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v15.1",
+            payload=_attack_bundle(t1110_description="v15.1 revised body."),
+            activate=False,
+        )
+    )
+    assert await _active_release(session_factory) == "v14.1"
+    assert "v14.1 body." in await _served_t1110(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v15.1",
+            payload=_attack_bundle(t1110_description="v15.1 revised body."),
+            activate=True,
+        )
+    )
+    assert await _active_release(session_factory) == "v15.1"
+    assert "v15.1 revised body." in await _served_t1110(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v14.1",
+            payload=_attack_bundle(t1110_description="v14.1 body."),
+            activate=True,
+        )
+    )
+    assert await _active_release(session_factory) == "v14.1"
+    assert "v14.1 body." in await _served_t1110(session_factory)
+
+
+async def test_attack_invalid_binding_refused_against_real_postgres(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A cross-document binding fails closed against the real schema too.
+
+    v14.1 activates. v15.1 stages. Its T1110 binding is then rewritten to name
+    T1059's version, and activation refuses with INVALID_BINDING while v14.1
+    keeps serving.
+    """
+    handler, _ = _attack_setup(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v14.1",
+            payload=_attack_bundle(t1110_description="v14.1 body."),
+            activate=True,
+        )
+    )
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v15.1",
+            payload=_attack_bundle(t1110_description="v15.1 revised body."),
+            activate=False,
+        )
+    )
+
+    async with session_factory() as session:
+        projections = SqlAlchemyAttackReleaseProjectionRepository(session)
+        t1110 = next(
+            binding
+            for binding in await projections.list_for_release(
+                framework=FRAMEWORK, source_release="v15.1"
+            )
+            if binding.technique_id == "T1110"
+        )
+        t1059 = next(
+            binding
+            for binding in await projections.list_for_release(
+                framework=FRAMEWORK, source_release="v15.1"
+            )
+            if binding.technique_id == "T1059"
+        )
+        await session.execute(
+            update(AttackReleaseProjectionRow)
+            .where(AttackReleaseProjectionRow.id == t1110.id)
+            .values(document_version_id=t1059.document_version_id)
+        )
+        await session.commit()
+
+    with pytest.raises(AttackReleaseProjectionInvalidBindingError) as excinfo:
+        await handler.import_release(
+            ImportAttackRelease(
+                framework=FRAMEWORK,
+                release="v15.1",
+                payload=_attack_bundle(t1110_description="v15.1 revised body."),
+                activate=True,
+            )
+        )
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+    assert await _active_release(session_factory) == "v14.1"
+    assert "v14.1 body." in await _served_t1110(session_factory)

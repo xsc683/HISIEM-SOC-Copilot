@@ -27,6 +27,8 @@ from hisiem_soc_copilot.application.errors import (
     ApplicationError,
     AttackReleaseContentConflictError,
     AttackReleaseProjectionIncompleteError,
+    AttackReleaseProjectionInvalidBindingError,
+    AttackReleaseProjectionMissingVersionError,
 )
 from hisiem_soc_copilot.application.handlers.attack_import import (
     DEFAULT_MAX_BUNDLE_BYTES,
@@ -75,7 +77,9 @@ from hisiem_soc_copilot.domain.knowledge.enums import (
 from hisiem_soc_copilot.domain.knowledge.errors import InvalidMitreBundleError
 from hisiem_soc_copilot.domain.knowledge.value_objects import (
     CHUNK_GENERATION_INITIAL,
+    compute_content_hash,
     normalize_and_hash,
+    normalize_knowledge_content,
 )
 from hisiem_soc_copilot.infrastructure.knowledge.attack_source import MitreStixAttackSource
 from hisiem_soc_copilot.infrastructure.knowledge.chunker_port import StructureAwareChunker
@@ -1033,12 +1037,19 @@ def _provider() -> FakeEmbeddingProvider:
 def _ingestion(
     runtime: FakeRuntime, *, provider: FakeEmbeddingProvider | None = None
 ) -> KnowledgeIngestionHandler:
-    """The REAL ingestion use case, so imported documents are really written."""
+    """The REAL ingestion use case, so imported documents are really written.
+
+    Built with the ATT&CK projection capability, exactly as the container's
+    ``attack_projection_ingestion_handler`` builds it: the importer stages
+    through a handler that may write MITRE_ATTACK, while the ordinary factory
+    used by every other caller may not.
+    """
     return KnowledgeIngestionHandler(
         unit_of_work_factory=runtime.factory,
         embedding_provider=provider if provider is not None else _provider(),
         chunker=StructureAwareChunker(),
         clock=FakeClock(T0),
+        allowed_source_kinds=frozenset({SourceKind.MITRE_ATTACK}),
     )
 
 
@@ -2348,3 +2359,215 @@ async def test_no_tenant_scoped_document_is_ever_created_by_an_import() -> None:
         assert document.visibility is Visibility.GLOBAL
         assert document.tenant_id is None
         assert document.external_key.startswith("mitre-attack:")
+
+# ---------------------------------------------------------------------------
+# invalid bindings: the row exists, the relationship does not (closure-3)
+# ---------------------------------------------------------------------------
+
+async def _staged_v15(runtime: FakeRuntime, handler: AttackImportHandler) -> None:
+    """v14.1 ACTIVE and serving, v15.1 staged -- the shared setup for §28."""
+    await handler.import_release(_command(release="v14.1", activate=True))
+    await handler.import_release(_command(release="v15.1"))
+
+
+def _zero_mutation_snapshot(runtime: FakeRuntime) -> object:
+    """Capture everything the cutover must leave untouched on refusal."""
+    return (
+        list(runtime.attack_releases.releases),
+        list(runtime.attack_techniques.rows),
+        list(runtime.attack_release_projections.bindings),
+        list(runtime.attack_releases.activations),
+        list(runtime.attack_techniques.active_calls),
+        _authority_state(runtime),
+    )
+
+
+def _assert_zero_mutation(runtime: FakeRuntime, before: object) -> None:
+    (
+        releases,
+        rows,
+        bindings,
+        activations,
+        active_calls,
+        authority,
+    ) = before  # type: ignore[misc]
+    assert runtime.attack_releases.releases == releases
+    assert runtime.attack_techniques.rows == rows
+    assert runtime.attack_release_projections.bindings == bindings
+    assert runtime.attack_releases.activations == activations
+    assert runtime.attack_techniques.active_calls == active_calls
+    assert _authority_state(runtime) == authority
+
+
+async def test_a_binding_pointing_at_another_documents_version_is_refused() -> None:
+    """``version.document_id != binding.document_id`` is not a projection.
+
+    T1110's binding is rewritten to name T1059's version. The cutover must fail
+    with ATTACK_RELEASE_PROJECTION_INVALID_BINDING -- not MISSING_VERSION,
+    because both rows exist -- and leave authority and every pointer untouched.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    v1059 = _binding_of(runtime, "v15.1", "T1059")
+    broken = replace(
+        _binding_of(runtime, "v15.1", "T1110"),
+        document_version_id=v1059.document_version_id,
+    )
+    runtime.attack_release_projections.bindings = [
+        binding
+        for binding in runtime.attack_release_projections.bindings
+        if not (
+            binding.source_release == "v15.1" and binding.technique_id == "T1110"
+        )
+    ]
+    runtime.attack_release_projections.inject_binding(broken)
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionInvalidBindingError) as excinfo:
+        await handler.import_release(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+    _assert_zero_mutation(runtime, before)
+    assert _active_version_id_of(runtime, "T1110") == live
+
+
+async def test_a_binding_pointing_at_a_non_mitre_document_is_refused() -> None:
+    """The projection target must be a MITRE_ATTACK document.
+
+    The bound T1110 document's ``source_kind`` is rewritten to CURATED_GUIDANCE.
+    Retrieval would otherwise serve a runbook while claiming v15.1 authority.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    document = await _document_for(runtime, "T1110")
+    document.source_kind = SourceKind.CURATED_GUIDANCE
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionInvalidBindingError) as excinfo:
+        await handler.import_release(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+    _assert_zero_mutation(runtime, before)
+    assert _active_version_id_of(runtime, "T1110") == live
+
+
+async def test_a_binding_pointing_at_a_tenant_document_is_refused() -> None:
+    """A TENANT document is unresolvable from the GLOBAL cutover -- fail closed.
+
+    The cutover resolves through tenant ``None``, and reads are scope-filtered
+    (a P3-A tenant-isolation invariant this closure does not touch). A TENANT
+    document therefore does not resolve, and the refusal is MISSING_VERSION
+    rather than INVALID_BINDING. That is still fail-closed with zero mutation;
+    the code distinguishes "the row cannot be read" from "the relationship is
+    invalid", and this is the former.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    document = await _document_for(runtime, "T1110")
+    document.visibility = Visibility.TENANT
+    document.tenant_id = "tenant-a"
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionMissingVersionError) as excinfo:
+        await handler._cutover(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_MISSING_VERSION"
+    _assert_zero_mutation(runtime, before)
+    assert document.active_version_id == live
+
+
+async def test_a_binding_with_the_wrong_external_key_is_refused() -> None:
+    """T1110's binding must name the ``mitre-attack:T1110`` document.
+
+    Pointing it at the T1059 document's external key fails even though every
+    row involved exists and is individually well-formed. Runs the cutover
+    directly: a full re-import would re-stage around the mutation instead of
+    testing the cutover's own validation.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+
+    document = await _document_for(runtime, "T1110")
+    live = document.active_version_id
+    document.external_key = "mitre-attack:T1059"
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionInvalidBindingError) as excinfo:
+        await handler._cutover(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+    _assert_zero_mutation(runtime, before)
+    assert document.active_version_id == live
+
+
+async def test_a_binding_whose_hash_chain_is_broken_is_refused() -> None:
+    """canonical == binding == version, all three links.
+
+    Breaks the binding-to-version link by replacing the staged version with one
+    carrying different content (and its own valid hash) for the same document.
+    Same code, same zero-mutation guarantee. Runs the cutover directly so
+    re-staging cannot converge around the break first.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    binding = _binding_of(runtime, "v15.1", "T1110")
+    staged_version = runtime.documents.versions[binding.document_version_id]
+    runtime.documents.versions[binding.document_version_id] = replace(
+        staged_version,
+        normalized_content=staged_version.normalized_content + "\nExtra.\n",
+        content_hash=compute_content_hash(
+            normalize_knowledge_content(
+                staged_version.normalized_content + "\nExtra.\n"
+            )
+        ),
+    )
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionInvalidBindingError) as excinfo:
+        await handler._cutover(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
+    _assert_zero_mutation(runtime, before)
+    assert _active_version_id_of(runtime, "T1110") == live
+
+
+async def test_a_bound_version_with_no_chunks_is_not_authoritative() -> None:
+    """A version row existing is not the same as a version being retrievable.
+
+    v15.1's T1110 version has its content chunks deleted AFTER staging, so the
+    cutover -- run directly, because a full re-import would re-stage the chunks
+    back -- must refuse with INCOMPLETE rather than make the framework
+    authoritative for content retrieval cannot return.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    binding = _binding_of(runtime, "v15.1", "T1110")
+    runtime.chunks.chunks = {
+        chunk_id: chunk
+        for chunk_id, chunk in runtime.chunks.chunks.items()
+        if chunk.document_version_id != binding.document_version_id
+    }
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:
+        await handler._cutover(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+    _assert_zero_mutation(runtime, before)
+    assert _active_version_id_of(runtime, "T1110") == live

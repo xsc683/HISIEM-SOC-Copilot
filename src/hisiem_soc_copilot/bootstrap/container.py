@@ -44,6 +44,7 @@ from ..application.services.knowledge_retrieval import (
 from ..application.services.workspace_service import InvestigationWorkspaceService
 from ..config import Settings
 from ..domain.investigation.value_objects import BudgetLimits
+from ..domain.knowledge.enums import SourceKind
 from ..infrastructure.auth.header_provider import HeaderTrustedContextProvider
 from ..infrastructure.auth.hisiem_service_provider import (
     HisiemServiceTrustedContextProvider,
@@ -430,17 +431,12 @@ class Container:
             max_chunk_chars=k.max_chunk_chars,
         )
 
-    def knowledge_ingestion_handler(
-        self, *, embedding_provider: EmbeddingProvider | None = None
+    def _ingestion_handler(
+        self,
+        *,
+        embedding_provider: EmbeddingProvider | None,
+        allowed_source_kinds: frozenset[SourceKind] | None,
     ) -> KnowledgeIngestionHandler:
-        """Build the knowledge ingestion/retirement handler.
-
-        There is NO silent fallback to a test provider: with no embedding
-        configuration the handler is built without one, and ``ingest`` refuses.
-        That refusal lives in the use case rather than here because retirement
-        does not embed anything -- a misconfigured embedding channel must not be
-        able to stop an operator from retiring a document (section 87).
-        """
         provider = embedding_provider or self.embedding_provider()
         k = self.settings.knowledge
         return KnowledgeIngestionHandler(
@@ -454,6 +450,45 @@ class Container:
                 max_chunks_per_document=k.max_chunks_per_document,
                 max_chunk_chars=k.max_chunk_chars,
             ),
+            allowed_source_kinds=allowed_source_kinds,
+        )
+
+    def knowledge_ingestion_handler(
+        self, *, embedding_provider: EmbeddingProvider | None = None
+    ) -> KnowledgeIngestionHandler:
+        """Build the knowledge ingestion/retirement handler.
+
+        There is NO silent fallback to a test provider: with no embedding
+        configuration the handler is built without one, and ``ingest`` refuses.
+        That refusal lives in the use case rather than here because retirement
+        does not embed anything -- a misconfigured embedding channel must not be
+        able to stop an operator from retiring a document (section 87).
+
+        This handler writes ORDINARY sources only (``CURATED_GUIDANCE`` and
+        ``TENANT_RUNBOOK``). ``MITRE_ATTACK`` is system-managed and is refused
+        here, so no caller of this factory -- CLI, evaluation harness, or
+        anything that forgot which factory it needed -- can move or withdraw
+        the authoritative ATT&CK projection (closure-3 section 6).
+        """
+        return self._ingestion_handler(
+            embedding_provider=embedding_provider,
+            allowed_source_kinds=None,
+        )
+
+    def attack_projection_ingestion_handler(
+        self, *, embedding_provider: EmbeddingProvider | None = None
+    ) -> KnowledgeIngestionHandler:
+        """Build the ATT&CK projection handler: MITRE_ATTACK ONLY.
+
+        The importer stages through the same ingestion use case as everything
+        else, but through THIS factory, so its writes carry a capability the
+        ordinary factory cannot mint. The allowlist is trusted bootstrap
+        configuration, never a command field, which is why a caller cannot
+        talk its way into it (closure-3 sections 5/6).
+        """
+        return self._ingestion_handler(
+            embedding_provider=embedding_provider,
+            allowed_source_kinds=frozenset({SourceKind.MITRE_ATTACK}),
         )
 
     def knowledge_retrieval_config(self) -> HybridRetrievalConfig:
@@ -517,7 +552,7 @@ class Container:
         return AttackImportHandler(
             unit_of_work_factory=self.unit_of_work_factory(),
             parser=self.attack_bundle_parser(),
-            ingestion=self.knowledge_ingestion_handler(
+            ingestion=self.attack_projection_ingestion_handler(
                 embedding_provider=embedding_provider
             ),
             clock=SystemClock(),
