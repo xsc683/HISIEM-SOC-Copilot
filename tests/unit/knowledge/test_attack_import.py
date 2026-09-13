@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -2563,6 +2563,63 @@ async def test_a_bound_version_with_no_chunks_is_not_authoritative() -> None:
         for chunk_id, chunk in runtime.chunks.chunks.items()
         if chunk.document_version_id != binding.document_version_id
     }
+    before = _zero_mutation_snapshot(runtime)
+
+    with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:
+        await handler._cutover(_command(release="v15.1", activate=True))
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+    _assert_zero_mutation(runtime, before)
+    assert _active_version_id_of(runtime, "T1110") == live
+
+async def test_a_bound_version_covered_only_by_a_retired_profile_is_refused() -> None:
+    """Covered, but by the wrong space: ``embedding_profile_id != ACTIVE``.
+
+    v14.1 activates (creating ACTIVE profile A through the real staging path).
+    v15.1 stages its revised T1110 -- also under A, because the handler refuses
+    to embed in any other space while A is ACTIVE. Its embeddings are then
+    re-pointed at a RETIRED profile B, which is exactly the state a reindex that
+    was abandoned half-way leaves behind: every chunk embedded, none of it in
+    the space vector retrieval actually filters on.
+
+    The cutover -- run directly, because a full re-import would converge the
+    projection back under A before validating -- must refuse with INCOMPLETE,
+    and leave authority and every pointer untouched. Under the old check
+    (``state.embedding_profile_id is None``) this state passed, because B does
+    fully cover the generation.
+    """
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler)
+    live = _active_version_id_of(runtime, "T1110")
+
+    binding = _binding_of(runtime, "v15.1", "T1110")
+    active = await runtime.profiles.get_active()
+    assert active is not None
+    retired = replace(
+        active,
+        id=uuid4(),
+        model_id="text-embedding-retired",
+        status="RETIRED",
+        retired_at=T0,
+    )
+    runtime.profiles.profiles.append(retired)
+    # NOTE: the double keys ``embeddings`` by ``(chunk_id, profile_id)`` and
+    # derives coverage from the KEY, exactly as the SQL groups by the profile
+    # column -- so the key must be rewritten too, not just the record.
+    runtime.chunks.embeddings = {
+        (chunk_id, retired.id if profile_id == active.id else profile_id): (
+            replace(embedding, embedding_profile_id=retired.id)
+            if profile_id == active.id
+            else embedding
+        )
+        for (chunk_id, profile_id), embedding in runtime.chunks.embeddings.items()
+    }
+    state = await runtime.chunks.projection_state(
+        document_version_id=binding.document_version_id
+    )
+    assert state.chunk_count > 0
+    assert state.embedding_profile_id == retired.id
     before = _zero_mutation_snapshot(runtime)
 
     with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:

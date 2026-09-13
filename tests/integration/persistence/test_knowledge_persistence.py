@@ -47,6 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from hisiem_soc_copilot.application.commands.knowledge import ImportAttackRelease
 from hisiem_soc_copilot.application.errors import (
+    AttackReleaseProjectionIncompleteError,
     AttackReleaseProjectionInvalidBindingError,
 )
 from hisiem_soc_copilot.application.handlers.attack_import import AttackImportHandler
@@ -110,6 +111,7 @@ from hisiem_soc_copilot.infrastructure.knowledge.chunker_port import (
 )
 from hisiem_soc_copilot.infrastructure.persistence.orm.knowledge import (
     AttackReleaseProjectionRow,
+    EmbeddingProfileRow,
     KnowledgeChunkEmbeddingRow,
     KnowledgeContentChunkRow,
     KnowledgeDocumentRow,
@@ -3079,3 +3081,115 @@ async def test_attack_invalid_binding_refused_against_real_postgres(
     assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INVALID_BINDING"
     assert await _active_release(session_factory) == "v14.1"
     assert "v14.1 body." in await _served_t1110(session_factory)
+
+async def test_attack_stale_profile_coverage_refused_against_real_postgres(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Covered by the wrong space: the cutover must compare against ACTIVE.
+
+    v14.1 activates (creating ACTIVE profile A). v15.1 stages its revised T1110
+    -- also under A. Profile A is then retired and a fresh profile B activated,
+    and v15.1's T1110 embeddings are moved to B: exactly the state an abandoned
+    half-reindex leaves behind. Every chunk is embedded, so the old check (any
+    full coverage) passed; vector retrieval filters on A, so it would serve
+    nothing for the version.
+
+    Activation must refuse with INCOMPLETE, with v14.1 still ACTIVE, its mirror
+    intact, and the T1110 pointer untouched.
+    """
+    import uuid as _uuid
+    from datetime import datetime as _datetime
+
+    handler, _ = _attack_setup(session_factory)
+
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v14.1",
+            payload=_attack_bundle(t1110_description="v14.1 body."),
+            activate=True,
+        )
+    )
+    await handler.import_release(
+        ImportAttackRelease(
+            framework=FRAMEWORK,
+            release="v15.1",
+            payload=_attack_bundle(t1110_description="v15.1 revised body."),
+            activate=False,
+        )
+    )
+
+    async with session_factory() as session:
+        profiles = SqlAlchemyEmbeddingProfileRepository(session)
+        active_a = await profiles.get_active()
+        assert active_a is not None
+        now = _datetime(2026, 9, 14, 10, 0, 0)
+        await session.execute(
+            update(EmbeddingProfileRow)
+            .where(EmbeddingProfileRow.id == active_a.id)
+            .values(status="RETIRED", retired_at=now)
+        )
+        profile_b_id = _uuid.uuid4()
+        await profiles.add(
+            profile=EmbeddingProfileRecord(
+                id=profile_b_id,
+                provider=active_a.provider,
+                model_id="text-embedding-v2",
+                dimension=active_a.dimension,
+                distance_metric=active_a.distance_metric,
+                normalization=active_a.normalization,
+                profile_version=active_a.profile_version + 1,
+                status="ACTIVE",
+                created_at=now,
+                retired_at=None,
+            )
+        )
+        projections = SqlAlchemyAttackReleaseProjectionRepository(session)
+        t1110 = next(
+            binding
+            for binding in await projections.list_for_release(
+                framework=FRAMEWORK, source_release="v15.1"
+            )
+            if binding.technique_id == "T1110"
+        )
+        chunks = SqlAlchemyKnowledgeChunkRepository(session)
+        for content_chunk in await chunks.list_content_chunks(
+            document_version_id=t1110.document_version_id,
+            generation=CHUNK_GENERATION_INITIAL,
+        ):
+            await session.execute(
+                update(KnowledgeChunkEmbeddingRow)
+                .where(
+                    KnowledgeChunkEmbeddingRow.content_chunk_id == content_chunk.id
+                )
+                .values(embedding_profile_id=profile_b_id)
+            )
+        await session.commit()
+
+    # The cutover directly: a full re-import would re-stage first and trip
+    # the generic handler's retired-profile refusal before the cutover runs.
+    # The unit under test is the cutover's own validation, which runs here
+    # against real SQL (advisory lock, mirror, pointer moves).
+    with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:
+        await handler._cutover(
+            ImportAttackRelease(
+                framework=FRAMEWORK,
+                release="v15.1",
+                payload=_attack_bundle(t1110_description="v15.1 revised body."),
+                activate=True,
+            )
+        )
+
+    assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+    assert await _active_release(session_factory) == "v14.1"
+    assert "v14.1 body." in await _served_t1110(session_factory)
+    async with session_factory() as session:
+        techniques = SqlAlchemyAttackTechniqueRepository(session)
+        rows = await techniques.list_for_release(
+            framework=FRAMEWORK, source_release="v14.1"
+        )
+        assert rows and all(row.active for row in rows)
+        staged = await techniques.list_for_release(
+            framework=FRAMEWORK, source_release="v15.1"
+        )
+        assert staged and all(not row.active for row in staged)

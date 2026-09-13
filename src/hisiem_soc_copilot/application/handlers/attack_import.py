@@ -42,7 +42,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ...domain.knowledge.entities import (
     KnowledgeDocument,
@@ -437,29 +437,39 @@ class AttackImportHandler:
         release: str,
         binding: AttackReleaseProjectionRecord,
         version: KnowledgeDocumentVersion,
-        active_profile_id: object,
+        active_profile_id: UUID | None,
     ) -> None:
         """Refuse to make a release authoritative for content it cannot serve.
 
         A version row existing is not the same as a version being retrievable.
-        Cutting authority over to a version with no chunks -- or with chunks the
-        current embedding space does not cover -- would serve nothing while
-        claiming everything. The projection state is REUSED from the ingestion
-        path rather than re-derived in SQL, so there is exactly one definition
-        of "projected" (closure-3 section 17).
+        Cutting authority over to a version with no chunks -- or with chunks
+        some embedding space other than the ACTIVE one covers -- would serve
+        nothing on the vector channel while claiming everything. Vector
+        retrieval filters on the ACTIVE profile id, so "covered by any profile"
+        is not retrievable; only "covered by the ACTIVE profile" is. The
+        projection state is REUSED from the ingestion path rather than
+        re-derived in SQL, so there is exactly one definition of "projected"
+        (closure-3 section 17).
         """
         del framework  # the lock scope, not a lookup key here
         state = await uow.knowledge_chunks.projection_state(
             document_version_id=version.id
         )
-        if state.is_empty or (
-            active_profile_id is not None and state.embedding_profile_id is None
+        if (
+            state.is_empty
+            or state.embedding_count < state.chunk_count
+            or (
+                active_profile_id is not None
+                and state.embedding_profile_id != active_profile_id
+            )
         ):
             raise AttackReleaseProjectionIncompleteError(
                 f"ATT&CK release {release!r} cannot be made authoritative: "
                 f"{binding.technique_id} has no retrievable projection "
-                "(no chunks, or no embedding space fully covers the current "
-                "generation). Nothing was changed."
+                "(no chunks, incomplete embeddings, or no embedding space fully "
+                "covers the current generation -- or the covering space is not "
+                "the ACTIVE one, in which case vector retrieval would return "
+                "nothing for it). Nothing was changed."
             )
 
     async def _cutover(self, command: ImportAttackRelease) -> None:
