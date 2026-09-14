@@ -23,6 +23,8 @@ _EXECUTOR_CAPABLE = frozenset(
     {
         "hisiem.search_events",
         "hisiem.get_detection_rule",
+        "knowledge.retrieve_security_guidance",
+        "knowledge.resolve_attack_technique",
     }
 )
 

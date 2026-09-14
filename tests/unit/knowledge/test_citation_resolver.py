@@ -163,6 +163,7 @@ async def test_a_citation_in_a_retired_document_still_resolves() -> None:
     assert resolution.language == view.language
     assert resolution.source_version == view.source_version
     assert resolution.excerpt == view.content
+    assert resolution.content_hash == view.content_hash
     assert repository.calls == [(TENANT, view.chunk_id)]
 
 

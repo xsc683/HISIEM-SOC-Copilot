@@ -15,6 +15,7 @@ from functools import lru_cache
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.requests import Request
 
+from ..agent.knowledge.catalog import KnowledgeRetrievalCatalogAdapter
 from ..application.handlers.attack_import import AttackImportHandler
 from ..application.handlers.investigation import InvestigationCommandHandler
 from ..application.handlers.knowledge import (
@@ -207,12 +208,19 @@ class Container:
         hisiem_adapter = hisiem if hisiem is not None else self.hisiem()
         model_provider = model if model is not None else self.model_provider()
 
+        knowledge_catalog = KnowledgeRetrievalCatalogAdapter(
+            retrieval_service_factory=self.knowledge_retrieval_service_for_uow,
+            unit_of_work_factory=self.unit_of_work_factory(),
+        )
+
         def _runtime(tenant_id: str) -> GraphRuntime:
             return GraphRuntime(
                 uow_factory=uow_factory,
                 workflow_handler=workflow_handler,
                 model=model_provider,
-                executor=ToolExecutor(hisiem=hisiem_adapter),
+                executor=ToolExecutor(
+                    hisiem=hisiem_adapter, knowledge=knowledge_catalog
+                ),
                 normalizer=EvidenceNormalizer(),
                 registry=ToolRegistry(),
                 hisiem=hisiem_adapter,
@@ -501,20 +509,13 @@ class Container:
             chunker_version=self.knowledge_chunker().chunker_version,
         )
 
-    def knowledge_retrieval_service(
-        self, *, embedding_provider: EmbeddingProvider | None = None
+    def knowledge_retrieval_service_for_uow(
+        self,
+        uow: UnitOfWork,
+        *,
+        embedding_provider: EmbeddingProvider | None = None,
     ) -> KnowledgeRetrievalService:
-        """Build the retrieval service on its OWN short-lived UnitOfWork.
-
-        Retrieval is a read path: it never shares the request-scoped transaction
-        of a write, so a slow search can never hold a write transaction open.
-
-        ``embedding_provider`` overrides the configured provider. Only the CLI's
-        explicitly-labelled dev fixture uses it; the default is the deployment's
-        real configuration, so a caller cannot drift onto a test double by
-        forgetting an argument.
-        """
-        uow = self._read_scoped_unit_of_work()
+        """Build a service over a caller-owned, short-lived read UnitOfWork."""
         return KnowledgeRetrievalService(
             chunks=uow.knowledge_chunks,
             embedding_profiles=uow.embedding_profiles,
@@ -523,6 +524,20 @@ class Container:
             ),
             clock=SystemClock(),
             config=self.knowledge_retrieval_config(),
+        )
+
+    def knowledge_retrieval_service(
+        self, *, embedding_provider: EmbeddingProvider | None = None
+    ) -> KnowledgeRetrievalService:
+        """Build a retrieval service on a container-owned read UnitOfWork.
+
+        CLI/evaluation callers retain their established container-managed
+        lifetime. The Agent adapter instead uses ``knowledge_retrieval_service_for_uow``
+        and closes its UnitOfWork at the end of each retrieval call.
+        """
+        uow = self._read_scoped_unit_of_work()
+        return self.knowledge_retrieval_service_for_uow(
+            uow, embedding_provider=embedding_provider
         )
 
     def knowledge_citation_resolver(self) -> KnowledgeCitationResolver:

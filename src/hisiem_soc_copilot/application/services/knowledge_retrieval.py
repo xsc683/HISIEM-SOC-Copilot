@@ -668,4 +668,5 @@ class KnowledgeCitationResolver:
             source_version=view.source_version,
             excerpt=build_excerpt(view.content),
             document_status=view.document_status,
+            content_hash=view.content_hash,
         )

@@ -100,6 +100,125 @@ class EvidenceNormalizer:
         ]
 
 
+    def normalize_knowledge_guidance(
+        self, tool_result: ToolResult, *, tool_call_id: str
+    ) -> list[EvidenceObservation]:
+        """Turn one knowledge.retrieve_security_guidance result into per-hit observations.
+
+        One observation per hit: the excerpt is DATA (never instruction), and the
+        citation handle plus document/version/chunk ids ride in ``raw_reference``
+        so a Finding can cite the evidence and the resolver can re-validate the
+        handle later (spec sections 54/57).
+        """
+        observations: list[EvidenceObservation] = []
+        data = tool_result.data if isinstance(tool_result.data, dict) else None
+        if data is None:
+            return observations
+        hits = data.get("hits")
+        if not isinstance(hits, list):
+            return observations
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            citation_id = hit.get("citation_id")
+            document_id = hit.get("document_id")
+            content_hash = hit.get("verified_content_hash")
+            provenance = hit.get("retrieval_provenance")
+            if (
+                not citation_id
+                or not document_id
+                or not isinstance(content_hash, str)
+                or len(content_hash) != 64
+                or any(char not in "0123456789abcdef" for char in content_hash)
+                or not isinstance(provenance, dict)
+            ):
+                continue
+            observations.append(
+                EvidenceObservation(
+                    source_type="KNOWLEDGE",
+                    source_provider="knowledge",
+                    source_operation="retrieve_security_guidance",
+                    observation={
+                        k: v
+                        for k, v in hit.items()
+                        if v is not None
+                        and k
+                        in {
+                            "title",
+                            "excerpt",
+                            "source_kind",
+                            "source_version",
+                        }
+                    },
+                    source_tool_invocation_id=_uuid(tool_call_id),
+                    raw_reference={
+                        "citation_identity": {
+                            "citation_id": str(citation_id),
+                            "document_id": str(document_id),
+                            "document_version_id": str(
+                                hit.get("document_version_id") or ""
+                            ),
+                            "chunk_id": str(hit.get("chunk_id") or ""),
+                            "content_hash": content_hash,
+                        },
+                        "retrieval_provenance": {
+                            "mode": str(provenance.get("mode") or "UNKNOWN"),
+                            "profile_id": provenance.get("profile_id"),
+                            "retrieved_at": provenance.get("retrieved_at"),
+                        },
+                    },
+                )
+            )
+        return observations
+
+    def normalize_attack_technique(
+        self, tool_result: ToolResult, *, tool_call_id: str
+    ) -> list[EvidenceObservation]:
+        """Turn one knowledge.resolve_attack_technique result into one observation.
+
+        The canonical record (name, description, tactics, platforms) is DATA;
+        the authoritative release travels in the observation so the workbench
+        can display it without re-reading authority (spec section 67).
+        """
+        data = tool_result.data if isinstance(tool_result.data, dict) else None
+        if data is None:
+            return []
+        technique_id = data.get("technique_id")
+        if not technique_id:
+            return []
+        return [
+            EvidenceObservation(
+                source_type="KNOWLEDGE",
+                source_provider="knowledge",
+                source_operation="resolve_attack_technique",
+                observation={
+                    k: v
+                    for k, v in data.items()
+                    if v is not None
+                    and k
+                    in {
+                        "technique_id",
+                        "framework",
+                        "name",
+                        "description",
+                        "tactics",
+                        "platforms",
+                        "authoritative_release",
+                        "content_hash",
+                    }
+                },
+                source_tool_invocation_id=_uuid(tool_call_id),
+                raw_reference={
+                    "technique_id": str(technique_id),
+                    "framework": str(data.get("framework") or ""),
+                    "authoritative_release": str(
+                        data.get("authoritative_release") or ""
+                    ),
+                },
+            )
+        ]
+
+
 def _uuid(value: str) -> Any:
     from uuid import UUID
 

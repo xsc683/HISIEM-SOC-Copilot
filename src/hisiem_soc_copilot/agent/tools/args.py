@@ -13,7 +13,10 @@ from typing import Any
 from ...contracts.tools.types import (
     ALLOWED_EVENT_FIELDS,
     ALLOWED_LOGICAL_OPERATORS,
+    MAX_CONTEXT_TERMS,
+    MAX_RETRIEVE_LIMIT,
     MAX_SEARCH_LIMIT,
+    MAX_TOPIC_CHARS,
     LogSearchCondition,
 )
 
@@ -37,8 +40,16 @@ class DetectionRuleArgs:
 
 
 @dataclass(frozen=True)
+class RetrieveGuidanceArgs:
+    topic: str
+    context_terms: tuple[str, ...] = ()
+    limit: int = 5
+
+
+@dataclass(frozen=True)
 class ResolveTechniqueArgs:
     technique_id: str
+    framework: str = "mitre-attack"
 
 
 def _iso_datetime(value: Any) -> str:
@@ -93,6 +104,35 @@ def parse_detection_rule(arguments: dict[str, object]) -> DetectionRuleArgs:
     return DetectionRuleArgs(rule_id=rule_id)
 
 
+def parse_retrieve_guidance(arguments: dict[str, object]) -> RetrieveGuidanceArgs:
+    topic = _str_required(arguments.get("topic"), name="topic")
+    if len(topic) > MAX_TOPIC_CHARS:
+        raise ToolArgumentError(f"topic must be at most {MAX_TOPIC_CHARS} chars")
+    raw_terms = arguments.get("context_terms", ())
+    if raw_terms is None:
+        raw_terms = ()
+    if not isinstance(raw_terms, (list, tuple)):
+        raise ToolArgumentError("context_terms must be an array of string")
+    if len(raw_terms) > MAX_CONTEXT_TERMS:
+        raise ToolArgumentError(
+            f"context_terms must hold at most {MAX_CONTEXT_TERMS} terms"
+        )
+    terms: list[str] = []
+    for term in raw_terms:
+        if not isinstance(term, str) or not term.strip():
+            raise ToolArgumentError("each context_term must be a non-empty string")
+        terms.append(term.strip())
+    limit = _int_between(
+        arguments.get("limit", 5), low=1, high=MAX_RETRIEVE_LIMIT, name="limit"
+    )
+    return RetrieveGuidanceArgs(topic=topic, context_terms=tuple(terms), limit=limit)
+
+
 def parse_resolve_technique(arguments: dict[str, object]) -> ResolveTechniqueArgs:
     technique_id = _str_required(arguments.get("technique_id"), name="technique_id")
-    return ResolveTechniqueArgs(technique_id=technique_id.upper())
+    framework = arguments.get("framework", "mitre-attack")
+    if not isinstance(framework, str) or not framework.strip():
+        raise ToolArgumentError("framework must be a non-empty string")
+    return ResolveTechniqueArgs(
+        technique_id=technique_id.upper(), framework=framework.strip()
+    )

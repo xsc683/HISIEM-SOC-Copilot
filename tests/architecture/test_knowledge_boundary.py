@@ -99,17 +99,23 @@ _INFRASTRUCTURE_SQL_MODULE = "infrastructure/persistence/repositories/knowledge.
 # section 88 -- pinned LITERALLY, never computed from the code under test
 # ---------------------------------------------------------------------------
 
-# The pre-P3-A model-selectable surface: exactly the tools the executor implements.
-EXPECTED_MODEL_SELECTABLE = frozenset({"hisiem.get_detection_rule", "hisiem.search_events"})
+# The P3-B model-selectable surface: exactly the tools the executor implements.
+# P3-B activated the two knowledge tools; the TI/entity tools stay catalog-only.
+EXPECTED_MODEL_SELECTABLE = frozenset(
+    {
+        "hisiem.get_detection_rule",
+        "hisiem.search_events",
+        "knowledge.resolve_attack_technique",
+        "knowledge.retrieve_security_guidance",
+    }
+)
 
-# Catalog-only documentation entries. Knowledge lookup is spec'd here and stays
-# here: P3-A added a retrieval SERVICE, not a model-selectable TOOL.
+# Catalog-only documentation entries. The TI/entity tools stay here: specified
+# but without an executor, so the model can never select them.
 EXPECTED_FUTURE_CATALOG = frozenset(
     {
         "hisiem.get_entity_activity",
         "threat_intel.lookup_ip",
-        "knowledge.retrieve_security_guidance",
-        "knowledge.resolve_attack_technique",
     }
 )
 
@@ -394,24 +400,33 @@ def test_the_registry_model_selectable_set_is_the_pre_p3a_surface() -> None:
     registry = ToolRegistry()
 
     assert set(registry.model_selectable_names) == EXPECTED_MODEL_SELECTABLE, (
-        "P3-A added retrieval, not a tool: knowledge must not become model-selectable"
+        "the selectable surface must be exactly the 4-tool P3-B set"
     )
     assert set(AGENT_SELECTABLE_TOOLS) == EXPECTED_MODEL_SELECTABLE
     assert SYSTEM_CONTROLLED_TOOL == EXPECTED_SYSTEM_CONTROLLED
     assert SYSTEM_CONTROLLED_TOOL not in registry.model_selectable_names
 
     assert FUTURE_CATALOG_TOOLS == EXPECTED_FUTURE_CATALOG
-    assert "knowledge.retrieve_security_guidance" in FUTURE_CATALOG_TOOLS
-    assert "knowledge.resolve_attack_technique" in FUTURE_CATALOG_TOOLS
+    assert "knowledge.retrieve_security_guidance" not in FUTURE_CATALOG_TOOLS
+    assert "knowledge.resolve_attack_technique" not in FUTURE_CATALOG_TOOLS
+    assert "threat_intel.lookup_ip" in FUTURE_CATALOG_TOOLS
+    assert "hisiem.get_entity_activity" in FUTURE_CATALOG_TOOLS
 
     # Catalog-only means exactly that: no executor, no registration, no selection.
     for name in FUTURE_CATALOG_TOOLS:
         assert not registry.is_registered(name)
         assert name not in registry.model_selectable_names
 
-    assert [
+    # P3-B: the two knowledge tools ARE selectable (with executor + schema +
+    # policy backing); the TI/entity tools must never be.
+    assert sorted(
         name for name in registry.model_selectable_names if name.startswith("knowledge.")
-    ] == []
+    ) == [
+        "knowledge.resolve_attack_technique",
+        "knowledge.retrieve_security_guidance",
+    ]
+    assert "hisiem.get_entity_activity" not in registry.model_selectable_names
+    assert "threat_intel.lookup_ip" not in registry.model_selectable_names
 
 
 # ---------------------------------------------------------------------------

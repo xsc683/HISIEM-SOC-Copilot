@@ -1,13 +1,11 @@
 """Typed security-knowledge contract (brief sections 4, 20, 39, 40, 50, 51).
 
-This module REPLACES the old loose ``dict`` contract. It is still internal: the
-two catalog tools ``knowledge.retrieve_security_guidance`` and
-``knowledge.resolve_attack_technique`` remain in ``FUTURE_CATALOG_TOOLS`` and are
-NOT registered with the ToolRegistry, so no model can reach any of this yet
-(brief sections 4/88).
+This module REPLACES the old loose ``dict`` contract. The retrieval and ATT&CK
+catalog capabilities are exposed through the bounded Agent tool surface; tenant
+scope remains an explicit trusted-runtime argument, never a model argument.
 
 Typed retrieval travels as frozen dataclasses rather than ``list[dict]`` so a
-future tool layer cannot invent fields, and so the excerpt/citation boundary is a
+tool layer cannot invent fields, and so the excerpt/citation boundary is a
 compile-time fact instead of a convention.
 """
 
@@ -119,6 +117,7 @@ class CitationResolution:
     source_version: str | None = None
     excerpt: str | None = None
     document_status: str | None = None
+    content_hash: str | None = None
     reason: str | None = None
 
 
@@ -788,11 +787,10 @@ class AttackReleaseProjectionRepository(Protocol):
 
 
 class KnowledgeRetrievalCatalogPort(Protocol):
-    """The narrow, typed surface a FUTURE knowledge tool will call.
+    """The narrow capability surface consumed by the Agent tool executor.
 
-    Not registered anywhere yet (brief sections 4/88). It exists so the eventual
-    tool layer has exactly one entry point per capability instead of reaching
-    into repositories.
+    Tenant scope is explicit and required; callers cannot substitute a model
+    argument for this trusted runtime context.
     """
 
     async def retrieve_security_guidance(

@@ -42,10 +42,27 @@ def compute_dedup_key(
     resource address) must produce the same dedup key so RecordEvidenceBatch can
     skip a duplicate insert. Collection time is intentionally NOT part of the key.
     """
+    identity_reference = raw_reference
+    if (
+        source_provider == "knowledge"
+        and source_operation == "retrieve_security_guidance"
+        and isinstance(raw_reference, dict)
+    ):
+        citation_identity = raw_reference.get("citation_identity")
+        if isinstance(citation_identity, dict):
+            identity_reference = citation_identity
+        else:
+            # Tolerate pre-closure reference shapes while excluding fields
+            # that describe a retrieval execution rather than cited content.
+            identity_reference = {
+                key: value
+                for key, value in raw_reference.items()
+                if key not in {"retrieval_mode", "retrieval_profile_id", "retrieved_at"}
+            }
     payload = {
         "provider": source_provider,
         "operation": source_operation,
-        "raw_reference": raw_reference,
+        "raw_reference": identity_reference,
         "resource_address": resource_address,
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()

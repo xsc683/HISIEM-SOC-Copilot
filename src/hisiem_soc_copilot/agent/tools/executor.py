@@ -14,16 +14,25 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from ...application.ports.hisiem import HisiemPort
+from ...application.ports.knowledge import KnowledgeQuery
 from ...contracts.tools.types import (
     LogSearchCondition,
     ToolCandidate,
     ToolResult,
     ToolResultStatus,
 )
+from ..knowledge.catalog import (
+    KnowledgeRetrievalCatalogAdapter,
+    guidance_tool_result,
+)
 from .args import (
     DetectionRuleArgs,
+    ResolveTechniqueArgs,
+    RetrieveGuidanceArgs,
     SearchEventsArgs,
     parse_detection_rule,
+    parse_resolve_technique,
+    parse_retrieve_guidance,
     parse_search_events,
 )
 from .policy import validate_search_span
@@ -49,8 +58,14 @@ class ToolExecutor:
     rejection that must stop the step.
     """
 
-    def __init__(self, *, hisiem: HisiemPort) -> None:
+    def __init__(
+        self,
+        *,
+        hisiem: HisiemPort,
+        knowledge: KnowledgeRetrievalCatalogAdapter | None = None,
+    ) -> None:
         self._hisiem = hisiem
+        self._knowledge = knowledge
 
     async def execute(
         self,
@@ -83,6 +98,25 @@ class ToolExecutor:
                 result = await self._detection_rule(
                     rule_args, tenant_id=tenant_id, tool_call_id=tool_call_id
                 )
+            elif candidate.tool_name == "knowledge.retrieve_security_guidance":
+                guidance_args = parse_retrieve_guidance(candidate.arguments)
+                result = await self._retrieve_guidance(
+                    guidance_args, tenant_id=tenant_id, tool_call_id=tool_call_id
+                )
+            elif candidate.tool_name == "knowledge.resolve_attack_technique":
+                technique_args = parse_resolve_technique(candidate.arguments)
+                result = await self._resolve_technique(
+                    technique_args, tenant_id=tenant_id, tool_call_id=tool_call_id
+                )
+            elif candidate.tool_name.startswith("knowledge."):
+                # A knowledge tool with no wired adapter is an unavailable
+                # channel, not a policy rejection: the name is legitimate, the
+                # wiring is absent.
+                result = self._knowledge_unavailable(
+                    tool_name=candidate.tool_name,
+                    tool_call_id=tool_call_id,
+                    reason="no knowledge catalog is wired into this executor",
+                )
             else:
                 raise UnknownToolError(
                     f"tool '{candidate.tool_name}' is not supported by this executor"
@@ -107,6 +141,23 @@ class ToolExecutor:
                     error=str(exc),
                     error_code="POLICY_REJECTED",
                 ),
+            )
+        except Exception:
+            # Retrieval, database, provider, and citation-integrity failures are
+            # data-channel outages, never exceptions escaping the investigation graph.
+            if not candidate.tool_name.startswith("knowledge."):
+                raise
+            result = _error_result(
+                tool_call_id,
+                candidate.tool_name,
+                "KNOWLEDGE_UNAVAILABLE",
+                retryable=True,
+            )
+            return ToolExecution(
+                tool_name=candidate.tool_name,
+                tool_call_id=tool_call_id,
+                status=result.status,
+                result=result,
             )
 
     async def _search_events(
@@ -191,6 +242,123 @@ class ToolExecutor:
                 "tags": rule.tags,
                 "description": rule.description,
                 "logic_summary": rule.logic_summary,
+            },
+        )
+
+    async def _require_knowledge(
+        self, *, tool_name: str, tool_call_id: str
+    ) -> KnowledgeRetrievalCatalogAdapter | None:
+        """Return the catalog adapter, or None after recording unavailability.
+
+        The executor is constructed without a knowledge adapter in unit tests
+        and in any wiring that forgot it. That must read as "channel
+        unavailable", never as AttributeError out of the graph.
+        """
+        if self._knowledge is None:
+            return None
+        return self._knowledge
+
+    def _knowledge_unavailable(
+        self, *, tool_name: str, tool_call_id: str, reason: str
+    ) -> ToolResult:
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            status="UNAVAILABLE",
+            fetched_at=datetime.now(UTC).isoformat(),
+            data={},
+            error=reason,
+            error_code="KNOWLEDGE_UNAVAILABLE",
+        )
+
+    async def _retrieve_guidance(
+        self, args: RetrieveGuidanceArgs, *, tenant_id: str, tool_call_id: str
+    ) -> ToolResult:
+        """Run one knowledge search; the mode label is honest by construction.
+
+        HYBRID is attempted first; when no ACTIVE embedding profile or no
+        provider exists the service raises ``KnowledgeRetrievalUnavailableError``
+        for the vector channel, and this falls back to LEXICAL_ONLY with the
+        fallback labeled in the result (spec section 53). A lexical failure is
+        a genuine defect and propagates.
+        """
+        from ...application.errors import KnowledgeRetrievalUnavailableError
+
+        adapter = await self._require_knowledge(
+            tool_name="knowledge.retrieve_security_guidance",
+            tool_call_id=tool_call_id,
+        )
+        if adapter is None:
+            return self._knowledge_unavailable(
+                tool_name="knowledge.retrieve_security_guidance",
+                tool_call_id=tool_call_id,
+                reason="no knowledge catalog is wired into this executor",
+            )
+        query = KnowledgeQuery(
+            topic=args.topic,
+            context_terms=args.context_terms,
+            limit=args.limit,
+        )
+        try:
+            validated = await adapter.retrieve_security_guidance_validated(
+                tenant_id=tenant_id, query=query
+            )
+        except KnowledgeRetrievalUnavailableError:
+            validated = await adapter.retrieve_lexical_guidance_validated(
+                tenant_id=tenant_id, query=query
+            )
+        return guidance_tool_result(
+            tool_call_id=tool_call_id,
+            result=validated.result,
+            verified_content_hashes=validated.verified_content_hashes,
+        )
+
+    async def _resolve_technique(
+        self, args: ResolveTechniqueArgs, *, tenant_id: str, tool_call_id: str
+    ) -> ToolResult:
+        """Resolve one technique id against the authoritative release.
+
+        Returns NO_DATA (not an error) when no release is authoritative or the
+        id is unknown to it: absence of authority is a fact about the corpus,
+        not a failure of the call.
+        """
+        adapter = await self._require_knowledge(
+            tool_name="knowledge.resolve_attack_technique",
+            tool_call_id=tool_call_id,
+        )
+        if adapter is None:
+            return self._knowledge_unavailable(
+                tool_name="knowledge.resolve_attack_technique",
+                tool_call_id=tool_call_id,
+                reason="no knowledge catalog is wired into this executor",
+            )
+        technique_id = args.technique_id
+        framework = args.framework
+        record = await adapter.resolve_attack_technique(
+            tenant_id=tenant_id, technique_id=technique_id, framework=framework
+        )
+        if record is None:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name="knowledge.resolve_attack_technique",
+                status="NO_DATA",
+                fetched_at=datetime.now(UTC).isoformat(),
+                data={"technique_id": technique_id, "framework": framework},
+            )
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name="knowledge.resolve_attack_technique",
+            status="SUCCESS",
+            fetched_at=datetime.now(UTC).isoformat(),
+            data={
+                "technique_id": record.technique_id,
+                "framework": record.framework,
+                "name": record.name,
+                "description": record.description,
+                "tactics": list(record.tactics),
+                "platforms": list(record.platforms),
+                "authoritative_release": record.source_release,
+                "content_hash": record.content_hash,
             },
         )
 

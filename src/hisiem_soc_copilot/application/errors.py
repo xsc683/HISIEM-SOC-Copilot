@@ -227,6 +227,24 @@ class InvalidKnowledgeQueryError(ApplicationError):
         super().__init__(message)
 
 
+class KnowledgeCitationIntegrityError(ApplicationError):
+    """A retrieval citation failed re-validation before entering Evidence."""
+
+    code = "KNOWLEDGE_CITATION_INTEGRITY_FAILED"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class KnowledgeAuthorityIntegrityError(ApplicationError):
+    """An ACTIVE ATT&CK release lacks a valid canonical projection binding."""
+
+    code = "KNOWLEDGE_AUTHORITY_INTEGRITY_FAILED"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class KnowledgeRetrievalUnavailableError(ApplicationError):
     """Raised when retrieval cannot run at all, as opposed to returning no hits.
 

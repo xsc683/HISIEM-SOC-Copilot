@@ -70,7 +70,7 @@ from ...contracts.llm.types import (
 from ...contracts.llm.types import PlanStep
 from ...contracts.tools.types import ToolCandidate
 from ...domain.investigation.content import compute_content_hash
-from ...domain.investigation.entities import Evidence
+from ...domain.investigation.entities import Evidence, Finding
 from ...domain.investigation.enums import (
     EvidenceRelation,
     InvestigationPhase,
@@ -699,6 +699,14 @@ async def execute_and_ingest(
         observations = runtime.normalizer.normalize_detection_rule(
             execution.result, tool_call_id=execution.tool_call_id
         )
+    elif execution.result.tool_name == "knowledge.retrieve_security_guidance":
+        observations = runtime.normalizer.normalize_knowledge_guidance(
+            execution.result, tool_call_id=execution.tool_call_id
+        )
+    elif execution.result.tool_name == "knowledge.resolve_attack_technique":
+        observations = runtime.normalizer.normalize_attack_technique(
+            execution.result, tool_call_id=execution.tool_call_id
+        )
     if observations:
         await runtime.workflow_handler.record_evidence_batch(
             RecordEvidenceBatch(
@@ -881,6 +889,7 @@ async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[
             resolvable = [
                 r for r in candidate.evidence_relations
                 if _is_known_evidence(evidence_by_id, r.evidence_id)
+                and not _is_knowledge_evidence(evidence_by_id, r.evidence_id)
             ]
             if status in ("SUPPORTED", "CONTRADICTED"):
                 # Directional grounding: SUPPORTED needs at least one SUPPORTS
@@ -1002,6 +1011,54 @@ def _is_known_evidence_id(
         return False
 
 
+def _is_knowledge_evidence(
+    evidence_by_id: dict[UUID, Evidence], evidence_id: str
+) -> bool:
+    """Whether one model-cited id resolves to KNOWLEDGE-sourced evidence.
+
+    Knowledge evidence is CONTEXT-class: it may inform a hypothesis statement
+    but can never satisfy a SUPPORTS/CONTRADICTS grounding need (spec
+    sections 63-64).
+    """
+    try:
+        record = evidence_by_id[UUID(evidence_id)]
+    except (ValueError, AttributeError, KeyError):
+        return False
+    source_type = record.source.type
+    source_value = (
+        source_type.value if hasattr(source_type, "value") else str(source_type)
+    )
+    return source_value in ("KNOWLEDGE", "SYSTEM")
+
+
+def _findings_with_platform_evidence(
+    findings: list[Finding], evidence: list[Evidence]
+) -> bool:
+    """Whether any finding cites at least one OBSERVED platform evidence.
+
+    Platform evidence is any ``HISIEM_*`` source type: alert, event, log search,
+    entity observations produced by the SIEM. ``KNOWLEDGE`` (retrieved guidance
+    or ATT&CK records) and ``SYSTEM`` (rule metadata) are context, never
+    observation, and can never ground a definitive verdict on their own (spec
+    sections 63-64).
+    """
+    by_id = {e.id: e for e in evidence}
+    for finding in findings:
+        for citation in finding.evidence_citations:
+            record = by_id.get(citation)
+            if record is None:
+                continue
+            source_type = record.source.type
+            source_value = (
+                source_type.value
+                if hasattr(source_type, "value")
+                else str(source_type)
+            )
+            if source_value.startswith("HISIEM_"):
+                return True
+    return False
+
+
 async def finalize_result(
     runtime: GraphRuntime, state: InvestigationGraphState
 ) -> dict[str, Any]:
@@ -1072,21 +1129,28 @@ async def finalize_result(
                 UncertaintyCandidate(description=verdict_candidate.uncertainty)
             )
         result_key = _inv_key(inv_id, f"result:{verdict_candidate.disposition}")
+        platform_grounded = _findings_with_platform_evidence(findings, evidence)
         if disposition in (
             VerdictDisposition.MALICIOUS,
             VerdictDisposition.BENIGN,
-        ) and not findings:
-            # Grounding invariant: MALICIOUS/BENIGN requires at least one grounded
-            # Finding. The model proposed a firm verdict with NO validated finding —
-            # deterministically bounded to INCONCLUSIVE (never a guessed disposition,
-            # never FAILED).
+        ) and not platform_grounded:
+            # Grounding invariant: MALICIOUS/BENIGN requires at least one Finding
+            # cited to OBSERVED platform evidence (HISIEM_*). A finding cited
+            # only to KNOWLEDGE/SYSTEM evidence is context, not observation --
+            # guidance text can never be the thing that makes an attack real --
+            # so a firm verdict with no platform-grounded finding is
+            # deterministically bounded to INCONCLUSIVE (never a guessed
+            # disposition, never FAILED).
             disposition = VerdictDisposition.INCONCLUSIVE
-            summary = "No grounded finding supported the model's proposed verdict"
+            summary = (
+                "No platform-grounded finding supported the model's proposed "
+                "verdict"
+            )
             confidence = 0.0
             uncertainties = [
                 UncertaintyCandidate(
                     description="The model proposed a MALICIOUS/BENIGN verdict but no "
-                    "evidence-grounded finding was recorded"
+                    "finding cited observed platform evidence was recorded"
                 )
             ]
             result_key = _inv_key(inv_id, "result:INCONCLUSIVE")
