@@ -384,7 +384,9 @@ class FakeKnowledgeChunkRepository:
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return len(self.rows_for_version(document_version_id))
 
-    async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
+    async def projection_state(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID | None
+    ) -> ChunkProjectionState:
         rows = self.rows_for_version(document_version_id)
         if not rows:
             return ChunkProjectionState(None, None, 0)
@@ -392,14 +394,14 @@ class FakeKnowledgeChunkRepository:
         for row in rows:
             for profile_id in self.profiles_for(row):
                 per_profile[profile_id] = per_profile.get(profile_id, 0) + 1
-        # The ONE space that FULLY covers this generation, else None -- the same
-        # rule the SQL probe implements, so an ambiguous or partial projection
-        # reads as "not embedded" here too.
-        covering = [
-            profile_id for profile_id, count in per_profile.items() if count == len(rows)
-        ]
+        # Coverage is evaluated for the explicitly requested profile, exactly as
+        # the SQL probe evaluates the current ACTIVE space.
+        covered = (
+            embedding_profile_id is not None
+            and per_profile.get(embedding_profile_id, 0) == len(rows)
+        )
         return ChunkProjectionState(
-            embedding_profile_id=covering[0] if len(covering) == 1 else None,
+            embedding_profile_id=embedding_profile_id if covered else None,
             chunker_version=rows[0].chunker_version,
             chunk_count=len(rows),
             generation=rows[0].generation,
@@ -1592,7 +1594,12 @@ async def test_a_rechunk_appends_a_generation_and_leaves_the_old_one_standing() 
     # Everything is still stored: nothing was deleted to make room.
     assert len(runtime.chunks.chunks) == len(generation_one) + len(generation_two)
     # The projection normal retrieval reads now describes generation 2.
-    state = await runtime.chunks.projection_state(document_version_id=first.version.id)
+    active_profile = await runtime.profiles.get_active()
+    assert active_profile is not None
+    state = await runtime.chunks.projection_state(
+        document_version_id=first.version.id,
+        embedding_profile_id=active_profile.id,
+    )
     assert state.generation == 2
     assert state.chunk_count == len(generation_two)
 

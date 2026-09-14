@@ -519,7 +519,9 @@ class FakeKnowledgeChunkRepository:
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return len(self.rows_for_version(document_version_id))
 
-    async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
+    async def projection_state(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID | None
+    ) -> ChunkProjectionState:
         rows = self.rows_for_version(document_version_id)
         if not rows:
             return ChunkProjectionState(None, None, 0)
@@ -527,11 +529,12 @@ class FakeKnowledgeChunkRepository:
         for row in rows:
             for profile_id in self.profiles_for(row):
                 per_profile[profile_id] = per_profile.get(profile_id, 0) + 1
-        covering = [
-            profile_id for profile_id, count in per_profile.items() if count == len(rows)
-        ]
+        covered = (
+            embedding_profile_id is not None
+            and per_profile.get(embedding_profile_id, 0) == len(rows)
+        )
         return ChunkProjectionState(
-            embedding_profile_id=covering[0] if len(covering) == 1 else None,
+            embedding_profile_id=embedding_profile_id if covered else None,
             chunker_version=rows[0].chunker_version,
             chunk_count=len(rows),
             generation=rows[0].generation,
@@ -2364,10 +2367,32 @@ async def test_no_tenant_scoped_document_is_ever_created_by_an_import() -> None:
 # invalid bindings: the row exists, the relationship does not (closure-3)
 # ---------------------------------------------------------------------------
 
-async def _staged_v15(runtime: FakeRuntime, handler: AttackImportHandler) -> None:
+async def _staged_v15(
+    runtime: FakeRuntime, handler: AttackImportHandler, *, payload: bytes | None = None
+) -> None:
     """v14.1 ACTIVE and serving, v15.1 staged -- the shared setup for §28."""
     await handler.import_release(_command(release="v14.1", activate=True))
-    await handler.import_release(_command(release="v15.1"))
+    await handler.import_release(_command(release="v15.1", payload=payload))
+
+
+def _multi_chunk_t1110_bundle() -> bytes:
+    """Give the ACTIVE-coverage matrix a real partial-coverage generation."""
+    t1110 = _brute_force_object()
+    t1110["description"] = "\n\n".join(
+        (
+            T1110_DESCRIPTION,
+            "## Supplemental context",
+            "Additional content used to create a second immutable chunk.",
+        )
+    )
+    return _bundle(
+        t1110,
+        _revoked_object(),
+        _command_shell_object(),
+        _deprecated_object(),
+        _mobile_object(),
+        _identity_object(),
+    )
 
 
 def _zero_mutation_snapshot(runtime: FakeRuntime) -> object:
@@ -2616,7 +2641,8 @@ async def test_a_bound_version_covered_only_by_a_retired_profile_is_refused() ->
         for (chunk_id, profile_id), embedding in runtime.chunks.embeddings.items()
     }
     state = await runtime.chunks.projection_state(
-        document_version_id=binding.document_version_id
+        document_version_id=binding.document_version_id,
+        embedding_profile_id=retired.id,
     )
     assert state.chunk_count > 0
     assert state.embedding_profile_id == retired.id
@@ -2628,3 +2654,123 @@ async def test_a_bound_version_covered_only_by_a_retired_profile_is_refused() ->
     assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
     _assert_zero_mutation(runtime, before)
     assert _active_version_id_of(runtime, "T1110") == live
+
+async def _set_target_profile_coverage(
+    runtime: FakeRuntime,
+    *,
+    version_id: UUID,
+    active_coverage: str,
+    retired_coverage: str,
+    active_is_lower_uuid: bool,
+    active_enabled: bool = True,
+) -> tuple[UUID, UUID]:
+    """Arrange ACTIVE/RETIRED coverage independently for one staged version."""
+    profile = await runtime.profiles.get_active()
+    assert profile is not None
+    low_id = UUID("00000000-0000-4000-8000-000000000001")
+    high_id = UUID("00000000-0000-4000-8000-000000000002")
+    active_id, retired_id = (low_id, high_id) if active_is_lower_uuid else (high_id, low_id)
+
+    active_record = replace(
+        profile,
+        id=active_id,
+        model_id="text-embedding-active-test",
+        status="ACTIVE" if active_enabled else "RETIRED",
+        retired_at=None if active_enabled else T0,
+    )
+    retired_record = replace(
+        profile,
+        id=retired_id,
+        model_id="text-embedding-retired-test",
+        profile_version=profile.profile_version + 1,
+        status="RETIRED",
+        retired_at=T0,
+    )
+    runtime.profiles.profiles = [active_record, retired_record]
+
+    remapped = {}
+    for (chunk_id, profile_id), embedding in runtime.chunks.embeddings.items():
+        target_profile_id = active_id if profile_id == profile.id else profile_id
+        remapped[(chunk_id, target_profile_id)] = replace(
+            embedding, embedding_profile_id=target_profile_id
+        )
+    runtime.chunks.embeddings = remapped
+
+    chunks = runtime.chunks.rows_for_version(version_id)
+    assert len(chunks) > 1, "coverage matrix requires a partial generation"
+    original = {
+        chunk.id: runtime.chunks.embeddings.pop((chunk.id, active_id))
+        for chunk in chunks
+    }
+    if active_coverage == "all":
+        active_chunks = chunks
+    elif active_coverage == "partial":
+        active_chunks = chunks[:1]
+    elif active_coverage == "none":
+        active_chunks = ()
+    else:
+        raise AssertionError(f"unknown active coverage: {active_coverage}")
+
+    if retired_coverage == "all":
+        retired_chunks = chunks
+    elif retired_coverage == "partial":
+        retired_chunks = chunks[:1]
+    elif retired_coverage == "none":
+        retired_chunks = ()
+    else:
+        raise AssertionError(f"unknown retired coverage: {retired_coverage}")
+
+    for chunk in active_chunks:
+        embedding = replace(original[chunk.id], embedding_profile_id=active_id)
+        runtime.chunks.embeddings[(chunk.id, active_id)] = embedding
+    for chunk in retired_chunks:
+        embedding = replace(original[chunk.id], embedding_profile_id=retired_id)
+        runtime.chunks.embeddings[(chunk.id, retired_id)] = embedding
+    return active_id, retired_id
+
+
+@pytest.mark.parametrize(
+    (
+        "active_coverage",
+        "retired_coverage",
+        "active_is_lower_uuid",
+        "active_enabled",
+        "should_activate",
+    ),
+    [
+        ("all", "all", False, True, True),
+        ("all", "all", True, True, True),
+        ("all", "partial", False, True, True),
+        ("partial", "all", True, True, False),
+        ("none", "all", False, False, False),
+    ],
+)
+async def test_cutover_uses_active_profile_coverage_not_uuid_order(
+    active_coverage: str,
+    retired_coverage: str,
+    active_is_lower_uuid: bool,
+    active_enabled: bool,
+    should_activate: bool,
+) -> None:
+    runtime = FakeRuntime()
+    handler = _importer(runtime=runtime)
+    await _staged_v15(runtime, handler, payload=_multi_chunk_t1110_bundle())
+    binding = _binding_of(runtime, "v15.1", "T1110")
+    await _set_target_profile_coverage(
+        runtime,
+        version_id=binding.document_version_id,
+        active_coverage=active_coverage,
+        retired_coverage=retired_coverage,
+        active_is_lower_uuid=active_is_lower_uuid,
+        active_enabled=active_enabled,
+    )
+    before = _zero_mutation_snapshot(runtime)
+
+    if should_activate:
+        await handler._cutover(_command(release="v15.1", activate=True))
+        assert _active_version_id_of(runtime, "T1110") == binding.document_version_id
+    else:
+        with pytest.raises(AttackReleaseProjectionIncompleteError) as excinfo:
+            await handler._cutover(_command(release="v15.1", activate=True))
+        assert excinfo.value.code == "ATTACK_RELEASE_PROJECTION_INCOMPLETE"
+        _assert_zero_mutation(runtime, before)

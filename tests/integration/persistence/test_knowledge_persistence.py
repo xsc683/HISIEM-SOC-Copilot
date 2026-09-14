@@ -1623,6 +1623,14 @@ async def test_projection_state_tracks_empty_populated_and_rebuild(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await _add_profile(session_factory, profile_id=_PROFILE_1)
+    await _add_profile(
+        session_factory,
+        profile_id=_PROFILE_2,
+        status="RETIRED",
+        profile_version=2,
+        model_id="text-embedding-retired",
+        retired_at=_T1,
+    )
     await _ingest(
         session_factory,
         document_id=_DOC_GLOBAL,
@@ -1636,12 +1644,16 @@ async def test_projection_state_tracks_empty_populated_and_rebuild(
 
     async with session_factory() as session:
         chunks = SqlAlchemyKnowledgeChunkRepository(session)
-        state = await chunks.projection_state(document_version_id=_VERSION_G1)
+        state = await chunks.projection_state(
+            document_version_id=_VERSION_G1, embedding_profile_id=_PROFILE_1
+        )
         assert state == ChunkProjectionState(None, None, 0)
         assert state.is_empty is True
 
         # An unknown version has no projection either -- reported, never raised.
-        unknown = await chunks.projection_state(document_version_id=_VERSION_A2)
+        unknown = await chunks.projection_state(
+            document_version_id=_VERSION_A2, embedding_profile_id=_PROFILE_1
+        )
         assert unknown.is_empty is True
 
         # Empty input is a no-op, not an empty INSERT statement.
@@ -1679,17 +1691,36 @@ async def test_projection_state_tracks_empty_populated_and_rebuild(
                     embedding_profile_id=_PROFILE_1,
                     embedding=_V_AXIS_Y,
                 ),
+                _embedding(
+                    embedding_id=UUID(int=_EMBED_1.int + 1000),
+                    content_chunk_id=_CHUNK_1,
+                    embedding_profile_id=_PROFILE_2,
+                    embedding=_V_AXIS_X,
+                ),
+                _embedding(
+                    embedding_id=UUID(int=_EMBED_2.int + 1000),
+                    content_chunk_id=_CHUNK_2,
+                    embedding_profile_id=_PROFILE_2,
+                    embedding=_V_AXIS_Y,
+                ),
             ]
         )
         await session.commit()
 
     async with session_factory() as session:
         chunks = SqlAlchemyKnowledgeChunkRepository(session)
-        populated = await chunks.projection_state(document_version_id=_VERSION_G1)
+        populated = await chunks.projection_state(
+            document_version_id=_VERSION_G1, embedding_profile_id=_PROFILE_1
+        )
+        also_covered = await chunks.projection_state(
+            document_version_id=_VERSION_G1, embedding_profile_id=_PROFILE_2
+        )
         assert populated.is_empty is False
         assert populated.embedding_profile_id == _PROFILE_1
+        assert also_covered.embedding_profile_id == _PROFILE_2
         assert populated.chunker_version == CHUNKER_VERSION
         assert populated.chunk_count == 2
+        assert populated.embedding_count == 4
         assert await chunks.count_for_version(document_version_id=_VERSION_G1) == 2
 
         # A rebuild drops ONLY the embedding projections. The content chunks are
@@ -1699,13 +1730,15 @@ async def test_projection_state_tracks_empty_populated_and_rebuild(
         removed = await chunks.delete_embeddings_for_version_generation(
             document_version_id=_VERSION_G1, generation=CHUNK_GENERATION_INITIAL
         )
-        assert removed == 2
+        assert removed == 4
         await session.commit()
 
     async with session_factory() as session:
         documents = SqlAlchemyKnowledgeDocumentRepository(session)
         chunks = SqlAlchemyKnowledgeChunkRepository(session)
-        rebuilt = await chunks.projection_state(document_version_id=_VERSION_G1)
+        rebuilt = await chunks.projection_state(
+            document_version_id=_VERSION_G1, embedding_profile_id=_PROFILE_1
+        )
         # The PROJECTION is empty -- no space covers the generation any more --
         # while the version is not: "unembedded" and "no content" are different
         # states, and conflating them would make a rebuild look like a deletion.
@@ -2221,7 +2254,9 @@ async def test_rechunking_appends_a_generation_and_keeps_the_older_citation(
         repository = SqlAlchemyKnowledgeChunkRepository(session)
         # The CURRENT generation is what retrieval and the projection describe...
         assert await repository.count_for_version(document_version_id=_VERSION_G1) == 1
-        state = await repository.projection_state(document_version_id=_VERSION_G1)
+        state = await repository.projection_state(
+            document_version_id=_VERSION_G1, embedding_profile_id=_PROFILE_1
+        )
         assert state.generation == 2
         assert state.chunker_version == "chunker/v2"
         lexical = await repository.lexical_candidates(

@@ -23,6 +23,7 @@ from hisiem_soc_copilot.agent.graph.nodes import (
     _is_knowledge_evidence,
 )
 from hisiem_soc_copilot.agent.knowledge.catalog import (
+    CitationValidatedSearchResult,
     KnowledgeRetrievalCatalogAdapter,
     guidance_tool_result,
 )
@@ -450,7 +451,7 @@ async def test_attack_resolution_requires_active_projection_hash_chain() -> None
 
     async def self_find(**kwargs):
         technique_queries.append(kwargs["technique_id"])
-        return record
+        return record if kwargs["technique_id"] == "T1110" else None
 
     async def get_document(**kwargs):
         return document
@@ -481,12 +482,20 @@ async def test_attack_resolution_requires_active_projection_hash_chain() -> None
     )
     assert result is record
     assert technique_queries == ["T1110"]
+    assert (
+        await adapter.resolve_attack_technique(
+            tenant_id="tenant-a", technique_id="PowerShell"
+        )
+        is None
+    )
+    assert technique_queries == ["T1110", "POWERSHELL"]
 
     stored_version.content_hash = "cd" * 32
     with pytest.raises(KnowledgeAuthorityIntegrityError):
         await adapter.resolve_attack_technique(
             tenant_id="tenant-a", technique_id="T1110"
         )
+    assert technique_queries[-1] == "T1110"
 
 
 async def test_guidance_tool_result_labels_mode_from_profile() -> None:
@@ -557,3 +566,52 @@ def test_knowledge_evidence_dedup_ignores_retrieval_execution_metadata() -> None
     )
     assert first == repeated
     assert first != changed_content
+
+async def test_hybrid_fallback_reports_lexical_mode_and_profile() -> None:
+    from hisiem_soc_copilot.application.errors import KnowledgeRetrievalUnavailableError
+
+    lexical_profile = RetrievalProfile(
+        profile_id="lexical-v1",
+        lexical_candidate_limit=20,
+        vector_candidate_limit=20,
+        rrf_k=60,
+        max_chunks_per_document=2,
+        chunker_version="chunk-v1",
+        embedding_profile_id="",
+        embedding_model_id="",
+    )
+    calls: list[str] = []
+
+    class _Knowledge:
+        async def retrieve_security_guidance_validated(self, *, tenant_id, query):
+            calls.append("HYBRID")
+            raise KnowledgeRetrievalUnavailableError("ACTIVE vector channel unavailable")
+
+        async def retrieve_lexical_guidance_validated(self, *, tenant_id, query):
+            calls.append("LEXICAL_ONLY")
+            return CitationValidatedSearchResult(
+                result=KnowledgeSearchResult(
+                    hits=(), retrieval_profile=lexical_profile
+                ),
+                verified_content_hashes=(),
+            )
+
+    class _Hisiem:
+        pass
+
+    execution = await ToolExecutor(
+        hisiem=_Hisiem(),  # type: ignore[arg-type]
+        knowledge=_Knowledge(),  # type: ignore[arg-type]
+    ).execute(
+        candidate=ToolCandidate(
+            tool_name="knowledge.retrieve_security_guidance",
+            arguments={"topic": "SSH hardening"},
+        ),
+        tenant_id="tenant-a",
+        source_alert_ref={},
+    )
+
+    assert calls == ["HYBRID", "LEXICAL_ONLY"]
+    assert execution.status == "NO_DATA"
+    assert execution.result.data["retrieval_mode"] == "LEXICAL_ONLY"
+    assert execution.result.data["retrieval_profile_id"] == "lexical-v1"

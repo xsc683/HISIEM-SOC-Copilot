@@ -423,7 +423,7 @@ class KnowledgeIngestionHandler:
             )
 
         state = await uow.knowledge_chunks.projection_state(
-            document_version_id=version.id
+            document_version_id=version.id, embedding_profile_id=profile.id
         )
         if (
             state.is_embedded
@@ -760,13 +760,6 @@ class KnowledgeIngestionHandler:
             )
             if version is None or version.id != document.active_version_id:
                 return None
-            state = await uow.knowledge_chunks.projection_state(
-                document_version_id=version.id
-            )
-            if not state.is_embedded:
-                # Either nothing is chunked or the ACTIVE space does not FULLY
-                # cover the current generation; both mean phase 2 has real work.
-                return None
             profile = await uow.embedding_profiles.find_by_identity(
                 provider=expected_identity[0],
                 model_id=expected_identity[1],
@@ -775,7 +768,15 @@ class KnowledgeIngestionHandler:
                 normalization=expected_identity[4],
                 profile_version=expected_identity[5],
             )
-            if profile is None or state.embedding_profile_id != profile.id:
+            if profile is None:
+                return None
+            state = await uow.knowledge_chunks.projection_state(
+                document_version_id=version.id,
+                embedding_profile_id=profile.id,
+            )
+            if not state.is_embedded or state.embedding_profile_id != profile.id:
+                # Nothing is chunked or the expected profile does not fully cover
+                # the current generation; phase 2 must rebuild the projection.
                 return None
             if state.chunker_version != self._chunker.chunker_version:
                 return None

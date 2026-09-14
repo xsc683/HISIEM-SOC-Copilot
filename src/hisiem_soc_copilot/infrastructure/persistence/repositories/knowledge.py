@@ -38,7 +38,6 @@ from sqlalchemy import (
     RowMapping,
     ScalarSelect,
     Select,
-    Text,
     and_,
     delete,
     distinct,
@@ -49,10 +48,6 @@ from sqlalchemy import (
     text,
     update,
 )
-
-# Aliased: ``typing.cast`` (used for the rowcount result) and SQLAlchemy's SQL
-# ``cast`` expression are different functions with the same name.
-from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, aliased
@@ -222,20 +217,14 @@ def _generation_of_version(document_version_id: UUID) -> ScalarSelect[int]:
     )
 
 
-def _covering_profile_probe(document_version_id: UUID) -> ScalarSelect[str | None]:
-    """The embedding profile that FULLY covers this version's current generation.
+def _covering_profile_probe(
+    document_version_id: UUID, embedding_profile_id: UUID | None
+) -> ScalarSelect[UUID | None]:
+    """Whether the requested embedding profile covers the current generation.
 
-    "Fully covers" is the only definition that can drive a correct rebuild
-    decision. A bare ``MIN(embedding_profile_id)`` over the projection would answer
-    with a profile that happens to be present even when it covers only part of the
-    generation, and the caller would then read a half-indexed corpus as indexed --
-    leaving the chunks covered by some other profile unretrievable.
-
-    So the probe groups the projections BY PROFILE and keeps only the groups whose
-    distinct content-chunk count equals the generation's chunk count. ``MIN`` over
-    what survives is a covering profile when one exists and ``NULL`` when none
-    does. Both aliases are deliberate: an unaliased table appearing in the
-    enclosing query would be correlated away (see
+    Coverage is tested for the caller's ACTIVE profile, never selected by UUID
+    or by historical profile ordering. Both aliases are deliberate: an unaliased
+    table appearing in the enclosing query would be correlated away (see
     :func:`_generation_probe`), and the probe is embedded in a query that reads
     both of these tables.
     """
@@ -258,16 +247,13 @@ def _covering_profile_probe(document_version_id: UUID) -> ScalarSelect[str | Non
         .where(
             chunk.document_version_id == document_version_id,
             chunk.generation == generation,
+            embedding.embedding_profile_id == embedding_profile_id,
         )
         .group_by(embedding.embedding_profile_id)
         .having(func.count(distinct(chunk.id)) == generation_size)
         .subquery()
     )
-    return (
-        select(func.min(sa_cast(covering.c.profile_id, Text)))
-        .select_from(covering)
-        .scalar_subquery()
-    )
+    return select(covering.c.profile_id).select_from(covering).scalar_subquery()
 
 
 def _chunk_view_select(*, join_embeddings: bool = False) -> _ChunkViewSelect:
@@ -640,23 +626,17 @@ class SqlAlchemyKnowledgeChunkRepository(KnowledgeChunkRepository):
         return tuple(row_to_content_chunk(row) for row in result.scalars().all())
 
     async def projection_state(
-        self, *, document_version_id: UUID
+        self,
+        *,
+        document_version_id: UUID,
+        embedding_profile_id: UUID | None,
     ) -> ChunkProjectionState:
-        """What this version's retrieval projection currently is, in one round trip.
+        """Report current-generation coverage for the requested profile.
 
-        Reported over the CURRENT generation only: a chunker change appends a new
-        generation rather than replacing the old one, so the older generation's
-        chunks and their embeddings still exist and must not be mistaken for the
-        retrieval projection now being served.
-
-        ``COUNT(DISTINCT chunk.id)`` rather than ``COUNT(chunk.id)`` because the
-        LEFT JOIN multiplies a chunk by its embeddings -- a chunk embedded under two
-        profiles must still count once, or "every chunk is embedded" would be
-        reported from a corpus that is only half indexed in the ACTIVE space.
-        ``MIN`` over the profile id (folded to text, because PostgreSQL has no
-        ``min`` for ``uuid``) is the conservative answer when more than one profile
-        is present: it cannot equal the ACTIVE profile id in that case, so the
-        caller rebuilds rather than assuming a clean index.
+        Coverage never depends on which other profiles happen to be present or on
+        UUID ordering. ``COUNT(DISTINCT chunk.id)`` keeps the content count stable
+        across the outer join, while the coverage probe filters to the explicitly
+        requested profile.
         """
         result = await self._session.execute(
             select(
@@ -666,9 +646,9 @@ class SqlAlchemyKnowledgeChunkRepository(KnowledgeChunkRepository):
                 ),
                 func.max(KnowledgeContentChunkRow.generation).label("generation"),
                 func.count(KnowledgeChunkEmbeddingRow.id).label("embedding_count"),
-                _covering_profile_probe(document_version_id).label(
-                    "embedding_profile_id"
-                ),
+                _covering_profile_probe(
+                    document_version_id, embedding_profile_id
+                ).label("embedding_profile_id"),
             )
             .select_from(KnowledgeContentChunkRow)
             .outerjoin(

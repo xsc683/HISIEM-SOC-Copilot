@@ -453,15 +453,14 @@ class AttackImportHandler:
         """
         del framework  # the lock scope, not a lookup key here
         state = await uow.knowledge_chunks.projection_state(
-            document_version_id=version.id
+            document_version_id=version.id,
+            embedding_profile_id=active_profile_id,
         )
         if (
             state.is_empty
             or state.embedding_count < state.chunk_count
-            or (
-                active_profile_id is not None
-                and state.embedding_profile_id != active_profile_id
-            )
+            or active_profile_id is None
+            or state.embedding_profile_id != active_profile_id
         ):
             raise AttackReleaseProjectionIncompleteError(
                 f"ATT&CK release {release!r} cannot be made authoritative: "

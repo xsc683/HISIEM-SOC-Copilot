@@ -201,7 +201,9 @@ class ScopedChunkRepository:
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         raise NotImplementedError("retrieval never counts chunks")
 
-    async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
+    async def projection_state(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID | None
+    ) -> ChunkProjectionState:
         raise NotImplementedError("retrieval never inspects projection state")
 
     async def delete_embeddings_for_version_generation(
@@ -1187,7 +1189,9 @@ class RecordingChunkRepository:
     async def count_for_version(self, *, document_version_id: UUID) -> int:
         return 0
 
-    async def projection_state(self, *, document_version_id: UUID) -> ChunkProjectionState:
+    async def projection_state(
+        self, *, document_version_id: UUID, embedding_profile_id: UUID | None
+    ) -> ChunkProjectionState:
         return ChunkProjectionState(
             embedding_profile_id=None, chunker_version=None, chunk_count=0
         )

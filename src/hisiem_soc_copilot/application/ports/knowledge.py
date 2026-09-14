@@ -269,12 +269,11 @@ class ChunkProjectionState:
     older chunker's chunks -- and any citation into them -- resolvable (section
     3.3).
 
-    ``embedding_profile_id`` names the ONE embedding space that FULLY covers the
-    current generation, and is ``None`` when none does or when more than one does.
-    That definition is what makes a re-embedding decision terminate: an ambiguous
-    or partial projection always reads as "not embedded", so the caller re-embeds
-    instead of oscillating between two spaces. ``embedding_count`` is the raw
-    number of projections, reported for operators and diagnostics.
+    ``embedding_profile_id`` is the explicitly requested space when it FULLY
+    covers the current generation, and is ``None`` otherwise. Coverage therefore
+    remains independent of other complete or partial profiles and UUID ordering.
+    ``embedding_count`` is the raw number of projections, reported for operators
+    and diagnostics.
     """
 
     embedding_profile_id: UUID | None
@@ -534,7 +533,10 @@ class KnowledgeChunkRepository(Protocol):
     async def count_for_version(self, *, document_version_id: UUID) -> int: ...
 
     async def projection_state(
-        self, *, document_version_id: UUID
+        self,
+        *,
+        document_version_id: UUID,
+        embedding_profile_id: UUID | None,
     ) -> ChunkProjectionState: ...
 
     async def list_content_chunks(
