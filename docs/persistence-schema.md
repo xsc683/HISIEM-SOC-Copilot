@@ -999,6 +999,7 @@ locked_by TEXT NULL
 lease_token TEXT NULL
 published_at TIMESTAMPTZ NULL
 last_error_code VARCHAR(128) NULL
+traceparent TEXT NULL                 -- optional diagnostic W3C context; not business correlation
 created_at TIMESTAMPTZ NOT NULL
 ```
 

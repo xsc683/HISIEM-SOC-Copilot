@@ -28,6 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
+from time import perf_counter
 from uuid import UUID
 
 from ...application.errors import ExternalServiceError
@@ -53,6 +54,8 @@ from ...domain.response.value_objects import (
     submission_key,
 )
 from ...domain.shared.identifiers import utc_now
+from ..observability.context import bind_log_context, set_span_attribute, start_span
+from ..observability.metrics import record_counter, record_histogram
 from .investigation_runner import NonRetryableRunError
 
 _PROVIDER = "hisiem"
@@ -85,6 +88,23 @@ class ResponseSubmitRunner:
         self._observe_delay = timedelta(seconds=observe_delay_seconds)
 
     async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
+        started = perf_counter()
+        with bind_log_context(response_proposal_id=aggregate_id), start_span(
+            "response.submit"
+        ) as span:
+                try:
+                    await self._run_impl(aggregate_id=aggregate_id, tenant_id=tenant_id)
+                except Exception:
+                    set_span_attribute(span, "result", "error")
+                    raise
+                else:
+                    set_span_attribute(span, "result", "success")
+                finally:
+                    record_histogram(
+                        "response.submit_duration", perf_counter() - started
+                    )
+
+    async def _run_impl(self, *, aggregate_id: str, tenant_id: str) -> None:
         proposal_id = UUID(aggregate_id)
         uow = self._uow_factory()
         try:
@@ -384,6 +404,23 @@ class ResponseObserveRunner:
         self._checks = max(1, status_checks_per_delivery)
 
     async def run(self, *, aggregate_id: str, tenant_id: str) -> None:
+        started = perf_counter()
+        with bind_log_context(response_proposal_id=aggregate_id), start_span(
+            "response.observe"
+        ) as span:
+                try:
+                    await self._run_impl(aggregate_id=aggregate_id, tenant_id=tenant_id)
+                except Exception:
+                    set_span_attribute(span, "result", "error")
+                    raise
+                else:
+                    set_span_attribute(span, "result", "success")
+                finally:
+                    record_histogram(
+                        "response.observe_duration", perf_counter() - started
+                    )
+
+    async def _run_impl(self, *, aggregate_id: str, tenant_id: str) -> None:
         proposal_id = UUID(aggregate_id)
         uow = self._uow_factory()
         try:
@@ -692,6 +729,10 @@ class ResponseSubmitExhaustionHandler:
                 aggregate_revision=0,
             )
             await uow.commit()
+            record_counter(
+                "response.attention_required",
+                attributes={"response_state": "ATTENTION_REQUIRED"},
+            )
         finally:
             await uow.close()
 

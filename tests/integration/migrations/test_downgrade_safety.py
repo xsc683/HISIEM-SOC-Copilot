@@ -3,7 +3,7 @@
 ``c41f7b2e9d08`` dropped ``knowledge_content_chunk``, ``knowledge_chunk_embedding``
 and ``attack_release`` unconditionally, and stopped updating the legacy
 ``knowledge_chunk`` table on the way up. Once the application had written anything
-through the new tables, ``downgrade -1`` therefore destroyed it silently -- and no
+through the new tables, ``downgrade -2`` therefore destroyed it silently -- and no
 test noticed, because the only downgrade test in the suite ran upgrade and
 downgrade back to back with no application write in between, so the backfill's own
 rows were the only rows present and they happened to be exactly what the old
@@ -49,14 +49,13 @@ _PORT = 5434
 _USER = "copilot"
 _PASSWORD = "copilot"
 
-#: The revision the closure branched from, and the current head. ``downgrade -1``
-#: from head crosses into the revision that destroys data, which is why the guard
-#: lives at the head rather than one step further down.
-_PREVIOUS_REVISION = "c41f7b2e9d08"
+#: Existing Knowledge projection revision whose downgrade guard protects P3-A data.
+_CLOSURE_REVISION = "c41f7b2e9d08"
+_PROJECTION_REVISION = "a5e93c07fd21"
 
 #: The revision a pre-closure deployment would be sitting on.
 _PRE_UPGRADE_REVISION = "ed6af82d9b13"
-_HEAD_REVISION = "a5e93c07fd21"
+_HEAD_REVISION = "b6c2a4d19f30"
 
 _UNSAFE_CODE = "P3A_DOWNGRADE_UNSAFE"
 
@@ -338,14 +337,16 @@ def _upgraded(database: str) -> str:
 def test_a_clean_upgrade_downgrades_all_the_way_back(scratch_database: str) -> None:
     """Nothing written through the new tables means nothing to lose.
 
-    Two steps, because head is the projection revision: the first crosses it, the
-    second crosses ``c41f7b2e9d08`` -- the revision that actually drops the tables.
-    Both must be allowed on a database the application has not written to.
+    Three steps: the first removes Stage B's nullable traceparent column, the
+    second crosses the projection revision (and runs its guard), and the third
+    crosses ``c41f7b2e9d08``, which drops the P3-A tables.
     """
     url = _upgraded(scratch_database)
 
     _alembic_ok("downgrade", "-1", database_url=url)
-    assert _revision(url) == _PREVIOUS_REVISION
+    assert _revision(url) == _PROJECTION_REVISION
+    _alembic_ok("downgrade", "-1", database_url=url)
+    assert _revision(url) == _CLOSURE_REVISION
     _alembic_ok("downgrade", "-1", database_url=url)
     assert _revision(url) == "ed6af82d9b13"
     # The legacy row survives both steps: it belongs to ed6af82d9b13, and the
@@ -379,8 +380,8 @@ def test_adopted_releases_alone_do_not_block_the_downgrade(
         "the upgrade should adopt exactly the seeded release, unpinned"
     )
 
-    _alembic_ok("downgrade", "-1", database_url=url)
-    assert _revision(url) == _PREVIOUS_REVISION
+    _alembic_ok("downgrade", "-2", database_url=url)
+    assert _revision(url) == _CLOSURE_REVISION
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +393,7 @@ def test_new_content_chunks_block_the_downgrade(scratch_database: str) -> None:
     url = _upgraded(scratch_database)
     _add_version_2_and_chunk(scratch_database)
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
 
     assert completed.returncode != 0
     output = completed.stdout + completed.stderr
@@ -410,7 +411,7 @@ def test_a_new_generation_blocks_the_downgrade(scratch_database: str) -> None:
     url = _upgraded(scratch_database)
     _add_version_2_and_chunk(scratch_database, generation=2)
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
 
     assert completed.returncode != 0
     output = completed.stdout + completed.stderr
@@ -428,7 +429,7 @@ def test_a_changed_projection_blocks_the_downgrade(scratch_database: str) -> Non
     url = _upgraded(scratch_database)
     _mutate_backfilled_projection(scratch_database)
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
 
     assert completed.returncode != 0
     output = completed.stdout + completed.stderr
@@ -442,7 +443,7 @@ def test_a_pinned_release_blocks_the_downgrade(scratch_database: str) -> None:
     url = _upgraded(scratch_database)
     _pin_a_release(scratch_database)
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
 
     assert completed.returncode != 0
     output = completed.stdout + completed.stderr
@@ -458,7 +459,7 @@ def test_an_attack_projection_binding_blocks_the_downgrade(
     url = _upgraded(scratch_database)
     _record_a_binding(scratch_database)
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
 
     assert completed.returncode != 0
     output = completed.stdout + completed.stderr
@@ -481,7 +482,7 @@ def test_a_refused_downgrade_changes_nothing(scratch_database: str) -> None:
         database=scratch_database,
     )
 
-    completed = _alembic("downgrade", "-1", database_url=url)
+    completed = _alembic("downgrade", "-2", database_url=url)
     assert completed.returncode != 0
 
     assert _revision(url) == _HEAD_REVISION, "a refused downgrade must not move"

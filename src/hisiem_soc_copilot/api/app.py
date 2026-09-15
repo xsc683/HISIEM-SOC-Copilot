@@ -25,13 +25,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        container = Container(settings if settings is not None else _settings())
-        await container.open()
-        app.state.container = container
+        configured = settings if settings is not None else _settings()
+        container = Container(configured)
+        telemetry = container.setup_observability(app)
         try:
+            await container.open()
+            app.state.container = container
             yield
         finally:
-            await container.close()
+            try:
+                await container.close()
+            finally:
+                telemetry.shutdown()
 
     app = FastAPI(title="HISIEM SOC Copilot", version="0.1.0", lifespan=lifespan)
     register_exception_handlers(app)

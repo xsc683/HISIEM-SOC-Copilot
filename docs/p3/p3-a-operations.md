@@ -162,7 +162,7 @@ Two databases are relevant here, and they are **not** interchangeable.
 
 | Database | State | Use |
 |---|---|---|
-| `127.0.0.1:5433` | The operator's Copilot database. PostgreSQL 16.15. Revision `979070495d4f` (P2) — **three** revisions behind P3-A head (`ed6af82d9b13`, `c41f7b2e9d08`, `a5e93c07fd21`). `pg_available_extensions` lists neither `vector` nor any pgvector package, so `CREATE EXTENSION vector` **cannot** succeed on this server as packaged. | **READ-ONLY.** Safe for `doctor`, which only reads. Never run `alembic upgrade`/`downgrade` or any DDL against it until its server image carries pgvector (§2.5). |
+| `127.0.0.1:5433` | The operator's Copilot database. PostgreSQL 16.15. Revision `979070495d4f` (P2) — **four** revisions behind the current head (`ed6af82d9b13`, `c41f7b2e9d08`, `a5e93c07fd21`, `b6c2a4d19f30`). `pg_available_extensions` lists neither `vector` nor any pgvector package, so `CREATE EXTENSION vector` **cannot** succeed on this server as packaged. | **READ-ONLY.** Safe for `doctor`, which only reads. Never run `alembic upgrade`/`downgrade` or any DDL against it until its server image carries pgvector (§2.5). |
 | `127.0.0.1:5434` | The pgvector-capable test database used by the P3-A integration suite. | Migrated, exercised, and cycled by tests. |
 
 That is why the P3-A integration tests hardcode `127.0.0.1:5434` rather than
@@ -202,10 +202,9 @@ instead of repeating the cause.
 
 The P3-A chain is `979070495d4f` (the P2 response lifecycle migration) →
 `ed6af82d9b13` (the original P3-A schema) → `c41f7b2e9d08` (the closure revision:
-immutable content chunks and the ATT&CK release model) → **`a5e93c07fd21`** (head;
-the release → knowledge projection binding, which is what lets an import stage a
-release without changing what retrieval serves, plus the fail-closed downgrade
-guard).
+immutable content chunks and the ATT&CK release model) → `a5e93c07fd21` (the release
+→ knowledge projection binding and fail-closed downgrade guard) → **`b6c2a4d19f30`**
+(head; the Stage B nullable outbox `traceparent` diagnostic-context column).
 
 `ed6af82d9b13` is released and **strictly unmodifiable**, so the closure's schema
 changes arrive as new revisions stacked on top of it. The upgrade is additive and
@@ -223,11 +222,12 @@ because that table is the rebuildable projection.
 .venv/Scripts/python.exe -m alembic check
 ```
 
-At the current head, `downgrade -1` steps back to `c41f7b2e9d08` and undoes **only
-what `a5e93c07fd21` created** — the `attack_release_projection` table — after
-running the downgrade guard (see **Downgrade safety** below). One more step
-(`downgrade -2`, or `downgrade ed6af82d9b13` explicitly) is the one that undoes
-what `c41f7b2e9d08` created: `knowledge_content_chunk`,
+At the Stage B head, `downgrade -1` removes only the nullable outbox `traceparent`
+column. `downgrade -2` steps back through `a5e93c07fd21` and undoes **only what it
+created** — the `attack_release_projection` table — after running the downgrade
+guard (see **Downgrade safety** below). The next step, `downgrade -3` (or an explicit
+target of `ed6af82d9b13`), is the one that undoes what `c41f7b2e9d08` created:
+`knowledge_content_chunk`,
 `knowledge_chunk_embedding`, `attack_release`, and the foreign key it added to
 `attack_technique`. Every pre-P3-A object —
 `investigation`, `domain_event`, `outbox_message`, `command_receipt`,

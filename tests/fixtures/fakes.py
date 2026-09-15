@@ -75,6 +75,7 @@ class FakeOutboxStore:
         *,
         destination: str = "investigation.graph.run",
         available_at: Any = None,
+        traceparent: str | None = None,
     ) -> None:
         self._seq += 1
         self.rows[event_id] = {
@@ -87,6 +88,7 @@ class FakeOutboxStore:
             "locked_by": None,
             "lease_token": None,
             "available_at": available_at if available_at is not None else self.now,
+            "traceparent": traceparent,
         }
 
     def advance(self, seconds: float) -> None:
@@ -131,6 +133,7 @@ class FakeOutboxStore:
                     lease_token=row["lease_token"],
                     locked_at=self.now,
                     locked_by=worker,
+                    traceparent=row.get("traceparent"),
                 )
             )
         return claimed

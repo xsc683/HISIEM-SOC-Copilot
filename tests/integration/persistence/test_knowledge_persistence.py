@@ -27,7 +27,7 @@ rather than against a fake:
 
 Skipped when the pgvector-capable PostgreSQL on 127.0.0.1:5434 is unreachable, so
 the suite stays green on a dev machine without it. Requires the schema already
-migrated to head (``c41f7b2e9d08``).
+migrated to head (``b6c2a4d19f30``).
 """
 
 from __future__ import annotations

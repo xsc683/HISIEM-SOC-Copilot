@@ -129,6 +129,8 @@ class OutboxRecord:
     locked_at: datetime | None = None
     locked_by: str | None = None
     last_error_code: str | None = None
+    # Optional W3C diagnostic context; never used for business routing or authority.
+    traceparent: str | None = None
 
 
 class EventLedger(Protocol):

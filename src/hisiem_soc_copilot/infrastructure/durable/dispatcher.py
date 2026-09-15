@@ -32,6 +32,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ...application.ports.durable import OutboxRecord, OutboxStore
+from ..observability.context import linked_worker_span
+from ..observability.metrics import record_counter
 from ..persistence.orm.events import DomainEventRow
 from .investigation_runner import NonRetryableRunError
 
@@ -169,12 +171,25 @@ class AsyncOutboxDispatcher:
         return delivered
 
     async def _deliver(self, record: OutboxRecord) -> None:
+        with linked_worker_span(
+            "durable.dispatch",
+            traceparent=record.traceparent,
+            attributes={"operation": record.destination},
+        ):
+            await self._deliver_claimed(record)
+
+    async def _deliver_claimed(self, record: OutboxRecord) -> None:
         if record.destination != self._destination:
-            await self._outbox.mark_dead_letter(
+            dead_lettered = await self._outbox.mark_dead_letter(
                 outbox_id=record.id,
                 lease_token=record.lease_token,
                 error_code="UNKNOWN_DESTINATION",
             )
+            if dead_lettered:
+                record_counter(
+                    "durable.dead_letter_count",
+                    attributes={"operation": record.destination},
+                )
             return
         try:
             target = await self._resolver.resolve(event_id=record.event_id)
@@ -222,11 +237,16 @@ class AsyncOutboxDispatcher:
                 # A deterministic configuration failure can never be fixed by
                 # retry/backoff — DEAD_LETTER immediately, no retry loop, no
                 # provider exception text persisted.
-                await self._outbox.mark_dead_letter(
+                dead_lettered = await self._outbox.mark_dead_letter(
                     outbox_id=record.id,
                     lease_token=record.lease_token,
                     error_code=exc.code,
                 )
+                if dead_lettered:
+                    record_counter(
+                        "durable.dead_letter_count",
+                        attributes={"operation": record.destination},
+                    )
                 logger.warning(
                     "aggregate %s run failed NON-RETRYABLE (%s); dead-lettered",
                     aggregate_id,
@@ -235,7 +255,9 @@ class AsyncOutboxDispatcher:
                 return
             except Exception as exc:  # recoverable: retry with backoff
                 await self._fail(record, "RUN_FAILED", target=(tenant_id, aggregate_id))
-                logger.warning("aggregate %s run failed: %s", aggregate_id, exc)
+                logger.warning(
+                    "aggregate %s run failed (%s)", aggregate_id, type(exc).__name__
+                )
                 return
         await self._outbox.mark_published(
             outbox_id=record.id,
@@ -317,11 +339,16 @@ class AsyncOutboxDispatcher:
                     type(exc).__name__,
                 )
                 return
-        await self._outbox.mark_dead_letter(
+        dead_lettered = await self._outbox.mark_dead_letter(
             outbox_id=record.id,
             lease_token=record.lease_token,
             error_code=error_code,
         )
+        if dead_lettered:
+            record_counter(
+                "durable.dead_letter_count",
+                attributes={"operation": record.destination},
+            )
 
     async def _retry_later(self, record: OutboxRecord, error_code: str) -> None:
         """Schedule another attempt WITHOUT ever consuming the dead-letter budget.
@@ -330,7 +357,7 @@ class AsyncOutboxDispatcher:
         an exhaustion hook that could not persist its business fact. Backoff keeps
         the attempt rate bounded, so retrying indefinitely is safe.
         """
-        await self._outbox.mark_failed(
+        retry_scheduled = await self._outbox.mark_failed(
             outbox_id=record.id,
             lease_token=record.lease_token,
             error_code=error_code,
@@ -338,6 +365,10 @@ class AsyncOutboxDispatcher:
             + timedelta(seconds=self._backoff_seconds(record.attempt_count)),
             attempt_count=record.attempt_count,
         )
+        if retry_scheduled:
+            record_counter(
+                "durable.retry_count", attributes={"operation": record.destination}
+            )
 
     @staticmethod
     def _backoff_seconds(attempt_count: int) -> int:
@@ -369,5 +400,5 @@ class AsyncOutboxDispatcher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # keep the worker alive on transient errors
-                logger.warning("outbox drain error: %s", exc)
+                logger.warning("outbox drain error (%s)", type(exc).__name__)
             await asyncio.sleep(self._poll)

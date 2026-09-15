@@ -1,0 +1,82 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  attributes/drop_sensitive_trace_attributes:
+    actions:
+      - key: url.full
+        action: delete
+      - key: url.original
+        action: delete
+      - key: url.path
+        action: delete
+      - key: url.query
+        action: delete
+      - key: http.url
+        action: delete
+      - key: http.target
+        action: delete
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+      - key: db.statement
+        action: delete
+      - key: db.query.text
+        action: delete
+      - key: gen_ai.prompt
+        action: delete
+      - key: gen_ai.completion
+        action: delete
+      - key: prompt
+        action: delete
+      - key: response
+        action: delete
+      - key: embedding.vector
+        action: delete
+  attributes/drop_high_cardinality_metric_attributes:
+    actions:
+      - key: investigation_id
+        action: delete
+      - key: tenant_id
+        action: delete
+      - key: trace_id
+        action: delete
+      - key: span_id
+        action: delete
+      - key: request_id
+        action: delete
+      - key: alert_id
+        action: delete
+      - key: user_id
+        action: delete
+      - key: tool_call_id
+        action: delete
+      - key: tool_invocation_id
+        action: delete
+      - key: execution_command_id
+        action: delete
+      - key: correlation_id
+        action: delete
+  batch:
+
+exporters:
+  otlp:
+    endpoint: ${env:OTEL_EXPORTER_OTLP_ENDPOINT}
+    tls: {}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [attributes/drop_sensitive_trace_attributes, batch]
+      exporters: [otlp]
+    metrics:
+      receivers: [otlp]
+      processors: [attributes/drop_high_cardinality_metric_attributes, batch]
+      exporters: [otlp]

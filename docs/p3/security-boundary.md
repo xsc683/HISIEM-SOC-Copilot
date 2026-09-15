@@ -437,14 +437,15 @@ content:
 | `ATTACK_PROJECTION_BINDING` | Any release to projection binding at all; the old schema cannot express which version a release staged |
 
 Every predicate is chosen to be **zero** on a database that was upgraded and then
-not written to, so the immediate round trip
-`ed6af82d9b13 → upgrade head → downgrade -1` still succeeds. A guard that blocked
-that would itself be the bug.
+not written to, so downgrading through the P3-A guard after a clean Stage B upgrade
+still succeeds. From the Stage B head, `downgrade -1` removes only the new nullable
+outbox trace-context column; `downgrade -2` reaches this guard. A guard that blocked
+the clean path would itself be the bug.
 
 **The honest residual.** The guard lives in the NEW revision because
 `c41f7b2e9d08` is frozen and must not be edited. It therefore intercepts any
-downgrade that STARTS at this head — `downgrade -1` and `downgrade <older-rev>`
-both run it first — but a database left sitting at `c41f7b2e9d08` from before this
+downgrade that crosses this revision — from the Stage B head, `downgrade -2` and
+`downgrade <older-rev>` run it first — but a database left sitting at `c41f7b2e9d08` from before this
 revision existed is **not** covered. An operator in that position must run
 `alembic upgrade head` first (free: the upgrade is additive) and only then
 downgrade.

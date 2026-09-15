@@ -31,6 +31,7 @@ from ....application.ports.durable import (
     ToolInvocationRecord,
     ToolInvocationStore,
 )
+from ...observability.context import capture_traceparent
 from ..orm.events import (
     CommandReceiptRow,
     DomainEventRow,
@@ -99,6 +100,7 @@ class SqlAlchemyEventLedger(EventLedger):
                     status="PENDING",
                     attempt_count=0,
                     available_at=available_at or now,
+                    traceparent=capture_traceparent(),
                     created_at=now,
                 )
             )
@@ -495,6 +497,7 @@ class SqlAlchemyOutboxStore(OutboxStore):
                         lease_token=token,
                         locked_at=now,
                         locked_by=worker,
+                        traceparent=row.traceparent,
                     )
                 )
             await session.commit()

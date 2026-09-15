@@ -40,6 +40,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import httpx
@@ -79,6 +80,8 @@ from ..llm.schemas import (
     to_plan,
     to_verdict,
 )
+from ..observability.context import set_span_attribute, start_span
+from ..observability.metrics import record_counter, record_histogram
 
 _PROVIDER = "command_code"
 _PROTOCOL = "openai_compatible_chat_completions"
@@ -306,6 +309,47 @@ class OpenAICompatibleModelProvider:
         schema: dict[str, object],
         wire_model: type[Any],
     ) -> Any:
+        started = perf_counter()
+        metric_operation = f"llm.{operation}"
+        metric_attributes = {
+            "model_provider": _PROVIDER,
+            "operation": metric_operation,
+        }
+        record_counter("llm.calls", attributes=metric_attributes)
+        with start_span(
+            "llm.call",
+            attributes={"model_provider": _PROVIDER, "operation": metric_operation},
+        ) as span:
+            try:
+                result = await self._complete_impl(
+                    operation=operation,
+                    builder=builder,
+                    request=request,
+                    schema=schema,
+                    wire_model=wire_model,
+                )
+            except Exception as exc:
+                set_span_attribute(span, "result", "error")
+                error_category = _metric_error_category(exc)
+                attrs = {**metric_attributes, "error_category": error_category}
+                record_counter("llm.errors", attributes=attrs)
+                record_histogram(
+                    "llm.duration", perf_counter() - started, metric_attributes
+                )
+                raise
+            set_span_attribute(span, "result", "success")
+            record_histogram("llm.duration", perf_counter() - started, metric_attributes)
+            return result
+
+    async def _complete_impl(
+        self,
+        *,
+        operation: str,
+        builder: MessageBuilder,
+        request: Any,
+        schema: dict[str, object],
+        wire_model: type[Any],
+    ) -> Any:
         attempt = 0
         while True:
             attempt += 1
@@ -329,6 +373,18 @@ class OpenAICompatibleModelProvider:
                 # Deterministic: never retried. The runtime applies its fallback.
                 self._record_failure(operation, exc, attempt, latency_ms=latency_ms)
                 raise
+            if completion.input_tokens is not None:
+                record_histogram(
+                    "llm.input_tokens",
+                    float(completion.input_tokens),
+                    {"model_provider": _PROVIDER, "operation": f"llm.{operation}"},
+                )
+            if completion.output_tokens is not None:
+                record_histogram(
+                    "llm.output_tokens",
+                    float(completion.output_tokens),
+                    {"model_provider": _PROVIDER, "operation": f"llm.{operation}"},
+                )
             self._record_success(operation, completion, attempt, latency_ms=latency_ms)
             return wire
 
@@ -467,6 +523,22 @@ class OpenAICompatibleModelProvider:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _metric_error_category(exc: Exception) -> str:
+    if isinstance(exc, ModelTimeoutError):
+        return "TIMEOUT"
+    if isinstance(exc, ModelUnavailableError):
+        return "UNAVAILABLE"
+    if isinstance(exc, ModelRateLimitedError):
+        return "RATE_LIMITED"
+    if isinstance(exc, ModelConfigurationError):
+        return "MODEL_CONFIGURATION"
+    if isinstance(exc, ModelRefusalError):
+        return "MODEL_REFUSAL"
+    if isinstance(exc, ModelOutputValidationError):
+        return "SCHEMA_MISMATCH"
+    return "PROVIDER_ERROR"
 
 
 def _schema_name(operation: str) -> str:

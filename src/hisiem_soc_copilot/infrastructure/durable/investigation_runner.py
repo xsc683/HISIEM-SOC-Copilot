@@ -17,6 +17,7 @@ Evidence dedups, so a checkpointed resume never duplicates rows.
 from __future__ import annotations
 
 from collections.abc import Callable
+from time import perf_counter
 from typing import Any
 from uuid import UUID
 
@@ -30,6 +31,8 @@ from ...application.ports.unit_of_work import UnitOfWork
 from ...config import LangGraphSettings
 from ...contracts.llm.errors import ModelConfigurationError
 from ...domain.investigation.enums import InvestigationStatus
+from ..observability.context import bind_log_context, set_span_attribute, start_span
+from ..observability.metrics import record_counter, record_histogram
 
 GRAPH_NAME = "investigation"
 GRAPH_VERSION = "v1"
@@ -84,15 +87,39 @@ class AsyncInvestigationGraphRunner:
     async def run_investigation(
         self, *, investigation_id: str, tenant_id: str
     ) -> None:
+        started = perf_counter()
+        record_counter("investigation.total")
+        with bind_log_context(investigation_id=investigation_id), start_span(
+            "investigation.run"
+        ) as span:
+                try:
+                    await self._run_investigation_impl(
+                        investigation_id=investigation_id, tenant_id=tenant_id
+                    )
+                    set_span_attribute(span, "result", "success")
+                except Exception:
+                    record_counter("investigation.failure")
+                    set_span_attribute(span, "result", "error")
+                    raise
+                finally:
+                    record_histogram(
+                        "investigation.duration", perf_counter() - started
+                    )
+
+    async def _run_investigation_impl(
+        self, *, investigation_id: str, tenant_id: str
+    ) -> None:
         investigation_uuid = UUID(investigation_id)
-        status = await self._domain_status(tenant_id, investigation_uuid)
+        with start_span("investigation.persist"):
+            status = await self._domain_status(tenant_id, investigation_uuid)
         if status is None:
             return
         if InvestigationStatus(status).is_terminal:
             # Domain reconciliation: a terminal investigation is never re-run.
             return
 
-        binding = await self._ensure_binding(tenant_id, investigation_uuid)
+        with start_span("investigation.persist"):
+            binding = await self._ensure_binding(tenant_id, investigation_uuid)
 
         if status == InvestigationStatus.CREATED.value:
             await self._workflow_handler.start_investigation(
@@ -112,10 +139,11 @@ class AsyncInvestigationGraphRunner:
         async with checkpointer_ctx as saver:
             graph = self._compile_graph(runtime, saver)
             try:
-                await graph.ainvoke(
-                    {"investigation_id": investigation_id},
-                    thread_config(binding.thread_id),
-                )
+                with start_span("graph.invoke"):
+                    await graph.ainvoke(
+                        {"investigation_id": investigation_id},
+                        thread_config(binding.thread_id),
+                    )
             except ModelConfigurationError as exc:
                 # A provider configuration/deployment failure (bad API key, 401/403,
                 # invalid endpoint, unknown model) is deterministic: NEVER silently

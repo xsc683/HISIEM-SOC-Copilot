@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from functools import lru_cache
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from starlette.requests import Request
@@ -64,6 +65,7 @@ from ..infrastructure.hisiem.adapter import HisiemHttpAdapter
 from ..infrastructure.knowledge.attack_source import MitreStixAttackSource
 from ..infrastructure.knowledge.chunker_port import StructureAwareChunker
 from ..infrastructure.knowledge.diagnostics import DiagnosticsReport, collect_diagnostics
+from ..infrastructure.observability.bootstrap import TelemetryHandle, setup_telemetry
 from ..infrastructure.persistence.database import build_engine, build_session_factory
 from ..infrastructure.persistence.repositories.durable import SqlAlchemyOutboxStore
 from ..infrastructure.persistence.unit_of_work import SqlAlchemyUnitOfWork
@@ -92,6 +94,10 @@ class Container:
         self._read_scoped_unit_of_works: list[UnitOfWork] = []
 
     # --- async resource lifecycle (called from lifespan) ---
+    def setup_observability(self, app: Any) -> TelemetryHandle:
+        """Configure optional telemetry before resources or workers are opened."""
+        return setup_telemetry(app, self.settings.observability)
+
     async def open(self) -> None:
         self.copilot_engine = build_engine(self.settings.database)
         self.copilot_sessions = build_session_factory(self.copilot_engine)
@@ -200,8 +206,8 @@ class Container:
         from ..agent.evidence.normalizer import EvidenceNormalizer
         from ..agent.graph.builder import build_investigation_graph
         from ..agent.graph.runtime import GraphRuntime
-        from ..agent.tools.executor import ToolExecutor
         from ..agent.tools.registry import ToolRegistry
+        from ..infrastructure.observability.tools import ObservedToolExecutor
 
         uow_factory = self.unit_of_work_factory()
         workflow_handler = self.investigation_workflow_handler()
@@ -218,7 +224,7 @@ class Container:
                 uow_factory=uow_factory,
                 workflow_handler=workflow_handler,
                 model=model_provider,
-                executor=ToolExecutor(
+                executor=ObservedToolExecutor(
                     hisiem=hisiem_adapter, knowledge=knowledge_catalog
                 ),
                 normalizer=EvidenceNormalizer(),

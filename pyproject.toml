@@ -24,6 +24,13 @@ dependencies = [
     # The one P3-A addition (brief §76): the official pgvector SQLAlchemy
     # integration for the untyped ``vector`` column. No ANN index, no vector DB.
     "pgvector>=0.3,<1",
+    "opentelemetry-api>=1.38,<2",
+    "opentelemetry-sdk>=1.38,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.38,<2",
+    "opentelemetry-instrumentation-fastapi>=0.59b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.59b0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0.59b0,<1",
+    "opentelemetry-instrumentation-psycopg>=0.59b0,<1",
 ]
 
 [project.optional-dependencies]

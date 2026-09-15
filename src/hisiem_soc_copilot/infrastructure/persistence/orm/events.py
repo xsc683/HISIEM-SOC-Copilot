@@ -153,6 +153,12 @@ class OutboxMessageRow(CopilotBase):
     lease_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Diagnostic-only W3C context; it is not a business correlation identifier.
+    traceparent: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Optional diagnostic W3C context; not business correlation.",
+    )
     created_at: Mapped[datetime] = mapped_column(nullable=False)
 
 

@@ -133,6 +133,9 @@ class ObservabilitySettings(BaseSettings):
 
     service_name: str = "hisiem-soc-copilot"
     tracing_enabled: bool = False
+    otlp_endpoint: str = "http://127.0.0.1:4317"
+    trace_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    metric_export_interval_millis: int = Field(default=60_000, ge=1_000, le=3_600_000)
 
 
 class ApplicationSettings(BaseSettings):

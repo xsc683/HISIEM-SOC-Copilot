@@ -62,10 +62,10 @@ _PASSWORD = "copilot"
 #: is frozen; the closure's new migration must revise exactly this one.
 #: The revision the PREVIOUS closure branched from.
 _PREVIOUS_REVISION = "ed6af82d9b13"
-#: The previous closure's revision -- now the revision BELOW head, and the one
-#: that actually drops the closure's tables when it is downgraded through.
+#: The Knowledge projection revision, below the new Stage B additive revision.
+_PROJECTION_REVISION = "a5e93c07fd21"
 _CLOSURE_REVISION = "c41f7b2e9d08"
-_HEAD_REVISION = "a5e93c07fd21"
+_HEAD_REVISION = "b6c2a4d19f30"
 
 #: The reviewed P3-A baseline. Pinned so the "frozen migrations were not edited"
 #: check compares against the commit a reviewer read rather than against HEAD.
@@ -499,6 +499,11 @@ def test_a_fresh_database_migrates_from_base_to_the_single_head(
         "knowledge_chunk",
         "alembic_version",
     } <= tables
+    assert _rows(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'copilot' "
+        "AND table_name = 'outbox_message' AND column_name = 'traceparent'",
+        database=scratch_database,
+    ) == [(1,)]
 
     # The extension ships in the image AND is created per database. Asserting the
     # binary is available is not the same assertion, so assert the extension.
@@ -647,7 +652,7 @@ def test_a_legacy_database_derives_release_authority_or_refuses_to_guess(
 
 @requires_postgres
 def test_downgrade_and_upgrade_round_trip_converges(scratch_database: str) -> None:
-    """Sections 9/10: ``downgrade -1`` returns to ``ed6af82d9b13``, and back.
+    """Sections 9/10: three safe steps return to ``ed6af82d9b13``, and back.
 
     A downgrade that dropped the legacy rows would make the round trip lossy, and
     the next upgrade would have nothing to backfill from -- so the legacy chunk is
@@ -657,12 +662,19 @@ def test_downgrade_and_upgrade_round_trip_converges(scratch_database: str) -> No
     url = _database_url(scratch_database)
     _prepare_legacy_database(scratch_database)
 
-    # TWO steps now. Head carries the projection binding and the downgrade
-    # guard; only the SECOND step crosses the revision that drops the closure's
-    # tables. Both are allowed here because this database has had no application
+    # THREE steps now: remove the Stage B traceparent column, cross the projection
+    # revision and its downgrade guard, then cross the revision that drops the
+    # closure's tables. All are safe because this database has had no application
     # write since the upgrade, which is exactly the precondition the guard
     # checks -- a refusal on this path would be the bug, not the fix (brief
     # section 3.4).
+    _alembic_ok("downgrade", "-1", database_url=url)
+    assert _alembic_ok("current", database_url=url).split()[0] == _PROJECTION_REVISION
+    assert _rows(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'copilot' "
+        "AND table_name = 'outbox_message' AND column_name = 'traceparent'",
+        database=scratch_database,
+    ) == [(0,)]
     _alembic_ok("downgrade", "-1", database_url=url)
     assert _alembic_ok("current", database_url=url).split()[0] == _CLOSURE_REVISION
     _alembic_ok("downgrade", "-1", database_url=url)
@@ -702,6 +714,11 @@ def test_downgrade_and_upgrade_round_trip_converges(scratch_database: str) -> No
     again = _alembic_ok("upgrade", "head", database_url=url)
     assert f"-> {_HEAD_REVISION}" in again
     assert _alembic_ok("current", database_url=url).count(f"{_HEAD_REVISION} (head)") == 1
+    assert _rows(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'copilot' "
+        "AND table_name = 'outbox_message' AND column_name = 'traceparent'",
+        database=scratch_database,
+    ) == [(1,)]
     assert _rows(
         "SELECT id, content, content_hash FROM copilot.knowledge_content_chunk",
         database=scratch_database,
