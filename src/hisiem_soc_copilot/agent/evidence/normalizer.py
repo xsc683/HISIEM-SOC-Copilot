@@ -22,6 +22,8 @@ from typing import Any
 
 from ...application.commands.investigation import EvidenceObservation
 from ...contracts.tools.types import ToolResult
+from ...domain.investigation.enums import EvidenceSourceType
+from ..tools.providers import ProviderIdentity
 
 
 class EvidenceNormalizer:
@@ -170,6 +172,51 @@ class EvidenceNormalizer:
                 )
             )
         return observations
+
+    def normalize_provider_result(
+        self,
+        tool_result: ToolResult,
+        *,
+        tool_call_id: str,
+        provider: ProviderIdentity,
+        operation: str,
+        schema_fingerprint: str | None = None,
+        source_type: str = "SYSTEM",
+    ) -> list[EvidenceObservation]:
+        """Normalize an admitted provider result through the existing Evidence path.
+
+        The provider result has already passed its result contract and bounds. Its
+        bounded data remains untrusted DATA, including instruction-like text. The
+        configured provider identity and schema digest are technical provenance;
+        neither grants platform authority or changes the existing Evidence model.
+        """
+        if tool_result.status not in {"SUCCESS", "NO_DATA"}:
+            return []
+        if tool_result.status == "NO_DATA" or not isinstance(tool_result.data, dict):
+            return []
+        try:
+            source_value = EvidenceSourceType(source_type).value
+        except ValueError:
+            return []
+        reference: dict[str, Any] = {
+            "provider_type": provider.provider_type,
+            "server_category": provider.server_category,
+        }
+        if provider.server_id is not None:
+            reference["server_id"] = provider.server_id
+        if schema_fingerprint is not None:
+            reference["schema_fingerprint"] = schema_fingerprint
+        return [
+            EvidenceObservation(
+                source_type=source_value,
+                source_provider=provider.provider_type,
+                source_operation=operation,
+                observation=dict(tool_result.data),
+                source_tool_invocation_id=_uuid(tool_call_id),
+                raw_reference=reference,
+                provenance_authority="EXTERNAL_EVIDENCE",
+            )
+        ]
 
     def normalize_attack_technique(
         self, tool_result: ToolResult, *, tool_call_id: str

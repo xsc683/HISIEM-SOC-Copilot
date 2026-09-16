@@ -85,6 +85,7 @@ class Container:
         self.dispatcher: AsyncOutboxDispatcher | None = None
         self.response_submit_dispatcher: AsyncOutboxDispatcher | None = None
         self.response_observe_dispatcher: AsyncOutboxDispatcher | None = None
+        self._mcp_providers: dict[str, Any] | None = None
         # Read-only factories below hand out a UnitOfWork that no command will
         # ever close (there is no request scope to close it). The connection they
         # check out is returned here instead, so the pool is not left holding an
@@ -102,6 +103,9 @@ class Container:
         self.copilot_engine = build_engine(self.settings.database)
         self.copilot_sessions = build_session_factory(self.copilot_engine)
         self.hisiem_adapter = HisiemHttpAdapter(settings=self.settings.hisiem)
+        if self.settings.mcp.enabled:
+            for provider in self._build_mcp_providers().values():
+                await provider.start()
         # Fail closed at startup: if the HISIEM service boundary is selected but
         # its credential is not configured, refuse to start rather than silently
         # accepting (or rejecting) every request.
@@ -132,6 +136,9 @@ class Container:
             await self.embedding_adapter.aclose()
         if self.hisiem_adapter is not None:
             await self.hisiem_adapter.close()
+        if self._mcp_providers is not None:
+            for provider in self._mcp_providers.values():
+                await provider.close()
         # Return every read-scoped connection to the pool BEFORE the engine is
         # disposed; disposing first would leave these sessions pointing at a dead
         # pool.
@@ -206,6 +213,9 @@ class Container:
         from ..agent.evidence.normalizer import EvidenceNormalizer
         from ..agent.graph.builder import build_investigation_graph
         from ..agent.graph.runtime import GraphRuntime
+        from ..agent.tools.executor import ToolExecutor
+        from ..agent.tools.native_provider import NativeToolProvider, native_admissions
+        from ..agent.tools.provider_router import ProviderRouter
         from ..agent.tools.registry import ToolRegistry
         from ..infrastructure.observability.tools import ObservedToolExecutor
 
@@ -218,6 +228,24 @@ class Container:
             retrieval_service_factory=self.knowledge_retrieval_service_for_uow,
             unit_of_work_factory=self.unit_of_work_factory(),
         )
+        registry = ToolRegistry(
+            admission
+            for provider in self._build_mcp_providers().values()
+            for admission in provider.admissions
+        ) if self.settings.mcp.enabled else ToolRegistry()
+        base_executor = ToolExecutor(
+            hisiem=hisiem_adapter,
+            knowledge=knowledge_catalog,
+            registry=registry,
+        )
+        native_provider = NativeToolProvider(base_executor)
+        routes = [(admission, native_provider) for admission in native_admissions()]
+        routes.extend(
+            (admission, provider)
+            for provider in self._build_mcp_providers().values()
+            for admission in provider.admissions
+        )
+        provider_router = ProviderRouter(routes)
 
         def _runtime(tenant_id: str) -> GraphRuntime:
             return GraphRuntime(
@@ -225,10 +253,13 @@ class Container:
                 workflow_handler=workflow_handler,
                 model=model_provider,
                 executor=ObservedToolExecutor(
-                    hisiem=hisiem_adapter, knowledge=knowledge_catalog
+                    hisiem=hisiem_adapter,
+                    knowledge=knowledge_catalog,
+                    provider_router=provider_router,
+                    registry=registry,
                 ),
                 normalizer=EvidenceNormalizer(),
-                registry=ToolRegistry(),
+                registry=registry,
                 hisiem=hisiem_adapter,
                 tenant_id=tenant_id,
             )
@@ -240,6 +271,40 @@ class Container:
             compile_graph=build_investigation_graph,
             checkpoint_settings=self.settings.langgraph,
         )
+
+    def _build_mcp_providers(self) -> dict[str, Any]:
+        """Build one MCP provider per trusted configured server.
+
+        Admissions are grouped by configured server before provider creation. A
+        discovered capability is never admitted here; only the explicit trusted
+        settings manifest enters the registry and router.
+        """
+        if self._mcp_providers is not None:
+            return self._mcp_providers
+        if not self.settings.mcp.enabled:
+            self._mcp_providers = {}
+            return self._mcp_providers
+        from ..infrastructure.mcp.provider import MCPToolProvider
+
+        admissions_by_server: dict[str, list[Any]] = {}
+        for admission in self.settings.mcp.admissions:
+            admissions_by_server.setdefault(admission.server_id, []).append(admission)
+        self._mcp_providers = {
+            server.server_id: MCPToolProvider(
+                server=server,
+                admissions=admissions_by_server.get(server.server_id, []),
+                global_bounds=self.settings.mcp.global_result_bounds,
+            )
+            for server in self.settings.mcp.servers
+        }
+        return self._mcp_providers
+
+    async def refresh_mcp_providers(self) -> None:
+        """Rediscover all configured MCP servers without changing admissions."""
+        if not self.settings.mcp.enabled:
+            return
+        for provider in self._build_mcp_providers().values():
+            await provider.refresh()
 
     def outbox_dispatcher(
         self,

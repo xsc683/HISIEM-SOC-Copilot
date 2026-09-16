@@ -9,7 +9,7 @@ come from the ToolExecutionContext the graph builds from trusted state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -35,8 +35,15 @@ from .args import (
     parse_retrieve_guidance,
     parse_search_events,
 )
-from .policy import validate_search_span
-from .registry import UnknownToolError
+from .policy import validate_candidate, validate_search_span
+from .provider_router import ProviderRouter
+from .providers import (
+    ProviderIdentity,
+    ProviderInvocationContext,
+    ProviderInvocationResult,
+    ProviderResultStatus,
+)
+from .registry import ToolRegistry, UnknownToolError
 
 
 @dataclass
@@ -47,6 +54,10 @@ class ToolExecution:
     tool_call_id: str
     status: ToolResultStatus
     result: ToolResult
+    provider: ProviderIdentity = field(
+        default_factory=lambda: ProviderIdentity(provider_type="native")
+    )
+    schema_fingerprint: str | None = None
 
 
 class ToolExecutor:
@@ -63,9 +74,13 @@ class ToolExecutor:
         *,
         hisiem: HisiemPort,
         knowledge: KnowledgeRetrievalCatalogAdapter | None = None,
+        provider_router: ProviderRouter | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
         self._hisiem = hisiem
         self._knowledge = knowledge
+        self._provider_router = provider_router
+        self._registry = registry
 
     async def execute(
         self,
@@ -74,6 +89,9 @@ class ToolExecutor:
         tenant_id: str,
         source_alert_ref: dict[str, str],
         tool_call_id: str | None = None,
+        investigation_id: str | None = None,
+        budget_remaining: int | None = None,
+        budget_already_reserved: bool = False,
     ) -> ToolExecution:
         """Validate + execute one candidate into a typed ToolExecution.
 
@@ -86,8 +104,31 @@ class ToolExecutor:
         """
         tool_call_id = tool_call_id or str(uuid4())
         fetched_at = datetime.now(UTC).isoformat()
+        provider_identity = ProviderIdentity(provider_type="native")
+        schema_fingerprint: str | None = None
         try:
-            if candidate.tool_name == "hisiem.search_events":
+            if self._registry is not None:
+                self._validate_candidate(
+                    candidate.tool_name, budget_remaining, budget_already_reserved
+                )
+            if self._provider_router is not None and self._provider_router.has(candidate.tool_name):
+                provider_result = await self._provider_router.invoke(
+                    candidate=candidate,
+                    context=ProviderInvocationContext(
+                        tenant_id=tenant_id,
+                        investigation_id=investigation_id,
+                        tool_call_id=tool_call_id,
+                        source_alert_ref=source_alert_ref,
+                        budget_remaining=budget_remaining,
+                        budget_already_reserved=budget_already_reserved,
+                    ),
+                )
+                provider_identity = provider_result.provider
+                schema_fingerprint = provider_result.schema_fingerprint
+                result = _tool_result_from_provider(
+                    provider_result, tool_call_id=tool_call_id, fetched_at=fetched_at
+                )
+            elif candidate.tool_name == "hisiem.search_events":
                 search_args = parse_search_events(candidate.arguments)
                 validate_search_span(search_args)
                 result = await self._search_events(
@@ -126,6 +167,8 @@ class ToolExecutor:
                 tool_call_id=tool_call_id,
                 status=result.status,
                 result=result,
+                provider=provider_identity,
+                schema_fingerprint=schema_fingerprint,
             )
         except (UnknownToolError, ValueError) as exc:
             # Argument/policy rejections are deterministic, typed, non-retryable.
@@ -159,6 +202,26 @@ class ToolExecutor:
                 status=result.status,
                 result=result,
             )
+
+    def _validate_candidate(
+        self,
+        tool_name: str,
+        budget_remaining: int | None,
+        budget_already_reserved: bool,
+    ) -> None:
+        if self._registry is None:
+            return
+        if budget_remaining is not None:
+            effective_budget = (
+                max(budget_remaining, 1)
+                if budget_already_reserved
+                else budget_remaining
+            )
+            validate_candidate(self._registry, tool_name, effective_budget)
+            return
+        spec = self._registry.get(tool_name)
+        if not spec.model_selectable:
+            raise UnknownToolError(f"tool '{tool_name}' is not model-selectable")
 
     async def _search_events(
         self, args: SearchEventsArgs, *, tenant_id: str, tool_call_id: str
@@ -362,6 +425,50 @@ class ToolExecutor:
             },
         )
 
+
+
+def _tool_result_from_provider(
+    provider_result: object, *, tool_call_id: str, fetched_at: str
+) -> ToolResult:
+    """Convert a provider-neutral result into the existing internal envelope."""
+    if not isinstance(provider_result, ProviderInvocationResult):
+        return ToolResult(
+            tool_call_id=tool_call_id,
+            tool_name="unknown",
+            status="UNAVAILABLE",
+            fetched_at=fetched_at,
+            error="provider returned an invalid result",
+            error_code="PROVIDER_ERROR",
+        )
+    failure = provider_result.failure
+    if failure is None:
+        error_code = None
+        error = None
+        continuation = None
+    else:
+        error_code = failure.code
+        error = failure.safe_message
+        continuation = (
+            "retryable"
+            if failure.code in {"TIMEOUT", "UNAVAILABLE", "RATE_LIMITED"}
+            else None
+        )
+    status_map: dict[ProviderResultStatus, ToolResultStatus] = {
+        "SUCCESS": "SUCCESS",
+        "NO_DATA": "NO_DATA",
+        "REJECTED": "REJECTED",
+        "UNAVAILABLE": "UNAVAILABLE",
+    }
+    return ToolResult(
+        tool_call_id=tool_call_id,
+        tool_name=provider_result.tool_name,
+        status=status_map[provider_result.status],
+        fetched_at=fetched_at,
+        data=provider_result.data,
+        error=error,
+        error_code=error_code,
+        continuation=continuation,
+    )
 
 def _error_result(
     tool_call_id: str, tool_name: str, code: str, *, retryable: bool

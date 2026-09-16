@@ -8,10 +8,12 @@ Per ``python-package-boundary.md``:
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .domain.knowledge.value_objects import (
@@ -136,6 +138,120 @@ class ObservabilitySettings(BaseSettings):
     otlp_endpoint: str = "http://127.0.0.1:4317"
     trace_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
     metric_export_interval_millis: int = Field(default=60_000, ge=1_000, le=3_600_000)
+
+
+class MCPResultBoundsSettings(BaseModel):
+    """Global/per-capability MCP result rejection limits."""
+
+    timeout_seconds: float = Field(default=30.0, gt=0)
+    max_items: int = Field(default=100, ge=1)
+    max_serialized_bytes: int = Field(default=256_000, ge=1)
+    max_text_chars: int = Field(default=32_000, ge=1)
+    max_depth: int = Field(default=8, ge=1)
+
+
+class MCPServerSettings(BaseModel):
+    """Trusted MCP server configuration; secrets are environment references."""
+
+    server_id: str = Field(min_length=1, max_length=128)
+    endpoint: str = Field(min_length=1, max_length=2048)
+    protocol_version: Literal["2026-07-28"] = "2026-07-28"
+    trusted_internal_transport: bool = False
+    allowed_hosts: list[str] = Field(default_factory=list)
+    auth_token_env: str | None = None
+    server_category: Literal["internal", "external"] = "external"
+    timeout_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_endpoint_and_secret_reference(self) -> MCPServerSettings:
+        parsed = urlsplit(self.endpoint)
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        if parsed.scheme not in {"http", "https"} or not host:
+            raise ValueError("MCP endpoint must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("MCP endpoint must not contain credentials")
+        if parsed.query or parsed.fragment:
+            raise ValueError("MCP endpoint must not contain query or fragment data")
+        if parsed.scheme != "https" and not self.trusted_internal_transport:
+            raise ValueError("remote MCP endpoint must use HTTPS")
+        normalized_hosts = [item.strip().lower() for item in self.allowed_hosts]
+        if any(
+            not item or ("." not in item and item not in {"localhost"})
+            for item in normalized_hosts
+        ):
+            raise ValueError("MCP allowed_hosts must contain normalized host names")
+        if normalized_hosts and host not in set(normalized_hosts):
+            raise ValueError("MCP endpoint host is outside the trusted allowlist")
+        self.allowed_hosts = normalized_hosts or [host]
+        if self.auth_token_env is not None and not re.fullmatch(
+            r"[A-Z_][A-Z0-9_]*", self.auth_token_env
+        ):
+                raise ValueError("MCP auth_token_env must be an environment variable name")
+        return self
+
+
+class MCPAdmissionSettings(BaseModel):
+    """Explicit trusted admission; discovery never creates these entries."""
+
+    internal_name: str = Field(min_length=1, max_length=128)
+    description: str = Field(min_length=1, max_length=512)
+    server_id: str = Field(min_length=1, max_length=128)
+    external_name: str = Field(min_length=1, max_length=128)
+    input_schema: dict[str, object] = Field(default_factory=dict)
+    result_schema: dict[str, object] | None = None
+    expected_external_schema_fingerprint: str = Field(default="", max_length=64)
+    risk: Literal["READ_ONLY", "HIGH_RISK", "WRITE"] = "READ_ONLY"
+    tenant_scope: Literal["GLOBAL_READ_ONLY", "TENANT_SCOPED"] = "GLOBAL_READ_ONLY"
+    model_selectable: bool = True
+    result_type: Literal["structured", "text"] = "structured"
+    result_bounds: MCPResultBoundsSettings = Field(default_factory=MCPResultBoundsSettings)
+
+
+class MCPSettings(BaseSettings):
+    """Trusted external provider settings for read-only MCP V1."""
+
+    model_config = SettingsConfigDict(env_prefix="MCP_", env_file=".env", extra="ignore")
+
+    enabled: bool = False
+    protocol_version: Literal["2026-07-28"] = "2026-07-28"
+    refresh_interval_seconds: float = Field(default=0.0, ge=0)
+    global_result_bounds: MCPResultBoundsSettings = Field(default_factory=MCPResultBoundsSettings)
+    servers: list[MCPServerSettings] = Field(default_factory=list)
+    admissions: list[MCPAdmissionSettings] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_trusted_manifest(self) -> MCPSettings:
+        if self.protocol_version != "2026-07-28":
+            raise ValueError("MCP protocol_version must be 2026-07-28")
+        server_ids = [server.server_id for server in self.servers]
+        if len(server_ids) != len(set(server_ids)):
+            raise ValueError("MCP server_id values must be unique")
+        internal_names = [entry.internal_name for entry in self.admissions]
+        if len(internal_names) != len(set(internal_names)):
+            raise ValueError("MCP admission internal_name values must be unique")
+        configured = set(server_ids)
+        for entry in self.admissions:
+            if entry.server_id not in configured:
+                raise ValueError(f"MCP admission references unknown server {entry.server_id}")
+            if entry.risk != "READ_ONLY" and entry.model_selectable:
+                raise ValueError("write/high-risk MCP capabilities cannot be model-selectable")
+            fingerprint = entry.expected_external_schema_fingerprint
+            if fingerprint and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                raise ValueError(
+                    "MCP external schema fingerprint must be 64 lowercase hex characters"
+                )
+            bounds = entry.result_bounds
+            global_bounds = self.global_result_bounds
+            for name in (
+                "timeout_seconds",
+                "max_items",
+                "max_serialized_bytes",
+                "max_text_chars",
+                "max_depth",
+            ):
+                if getattr(bounds, name) > getattr(global_bounds, name):
+                    raise ValueError(f"MCP admission {name} exceeds global result bound")
+        return self
 
 
 class ApplicationSettings(BaseSettings):
@@ -387,6 +503,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     agent_budget: AgentBudgetSettings = Field(default_factory=AgentBudgetSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
     evaluation: EvaluationSettings = Field(default_factory=EvaluationSettings)
     knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)

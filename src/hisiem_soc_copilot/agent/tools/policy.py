@@ -53,4 +53,6 @@ def validate_candidate(
         from .registry import UnknownToolError
 
         raise UnknownToolError(f"tool '{tool_name}' is not a registered read tool")
+    if not registry.get(tool_name).model_selectable:
+        raise ToolPolicyError(f"tool '{tool_name}' is system-controlled")
     assert_budget_available(budget_remaining)

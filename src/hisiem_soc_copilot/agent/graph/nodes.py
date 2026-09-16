@@ -604,6 +604,9 @@ async def execute_and_ingest(
                 "address_id": alert.get("alert_id") or "",
             },
             tool_call_id=str(invocation_id),
+            investigation_id=str(inv_id),
+            budget_remaining=RuntimeBudget.from_state(state).tool_calls,
+            budget_already_reserved=True,
         )
     except Exception as exc:  # deterministic, typed; continue the investigation
         await _finish_audit(runtime, inv_id, audit_key, "FAILED", error_code="EXECUTION_ERROR")
@@ -707,6 +710,14 @@ async def execute_and_ingest(
         observations = runtime.normalizer.normalize_attack_technique(
             execution.result, tool_call_id=execution.tool_call_id
         )
+    else:
+        observations = runtime.normalizer.normalize_provider_result(
+            execution.result,
+            tool_call_id=execution.tool_call_id,
+            provider=execution.provider,
+            operation=execution.tool_name,
+            schema_fingerprint=execution.schema_fingerprint,
+        )
     if observations:
         await runtime.workflow_handler.record_evidence_batch(
             RecordEvidenceBatch(
@@ -776,7 +787,16 @@ def _audit_outcome(
     if status in ("SUCCESS", "NO_DATA"):
         data = execution.result.data or {}
         count = data.get("total") if tool_name == "hisiem.search_events" else None
-        metadata: dict[str, Any] = {"tool": tool_name, "outcome": status}
+        metadata: dict[str, Any] = {
+            "tool": tool_name,
+            "outcome": status,
+            "provider_type": execution.provider.provider_type,
+            "server_category": execution.provider.server_category,
+        }
+        if execution.provider.server_id is not None:
+            metadata["server_id"] = execution.provider.server_id
+        if execution.schema_fingerprint is not None:
+            metadata["schema_fingerprint"] = execution.schema_fingerprint
         if count is not None:
             metadata["total"] = count
         return "SUCCEEDED", None, None, metadata
@@ -784,12 +804,49 @@ def _audit_outcome(
         "FAILED",
         execution.result.error_code or "TOOL_FAILED",
         (str(execution.result.error or "")[:300]) or "tool failed",
-        {"tool": tool_name, "outcome": status},
+        {
+            "tool": tool_name,
+            "outcome": status,
+            "provider_type": execution.provider.provider_type,
+            "server_category": execution.provider.server_category,
+            **(
+                {"server_id": execution.provider.server_id}
+                if execution.provider.server_id is not None
+                else {}
+            ),
+            **(
+                {"schema_fingerprint": execution.schema_fingerprint}
+                if execution.schema_fingerprint is not None
+                else {}
+            ),
+        },
     )
 
 
+_PROTECTED_RUNTIME_ARGUMENTS = frozenset(
+    {
+        "tenant_id",
+        "server_id",
+        "endpoint",
+        "scheme",
+        "host",
+        "port",
+        "transport",
+        "credential",
+        "token",
+        "password",
+        "passphrase",
+        "secret",
+        "api_key",
+        "access_token",
+        "authorization",
+        "bearer",
+    }
+)
+
+
 def _bounded_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Only query-shape arguments (no logs/raw content) may be persisted."""
+    """Only safe query-shape arguments may be persisted in the audit row."""
     if tool_name == "hisiem.search_events":
         return {
             "from": arguments.get("from"),
@@ -799,7 +856,11 @@ def _bounded_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, A
         }
     if tool_name == "hisiem.get_detection_rule":
         return {"rule_id": arguments.get("rule_id")}
-    return dict(arguments)
+    return {
+        key: value
+        for key, value in arguments.items()
+        if key.lower() not in _PROTECTED_RUNTIME_ARGUMENTS
+    }
 
 
 async def assess(runtime: GraphRuntime, state: InvestigationGraphState) -> dict[str, Any]:

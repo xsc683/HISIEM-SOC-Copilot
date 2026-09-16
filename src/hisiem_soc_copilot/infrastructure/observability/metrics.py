@@ -26,6 +26,8 @@ _COUNTERS = frozenset(
         "durable.retry_count",
         "durable.dead_letter_count",
         "response.attention_required",
+        "mcp.calls",
+        "mcp.errors",
     }
 )
 _HISTOGRAMS = frozenset(
@@ -39,6 +41,7 @@ _HISTOGRAMS = frozenset(
         "retrieval.hit_count",
         "response.submit_duration",
         "response.observe_duration",
+        "mcp.duration",
     }
 )
 _ALLOWED_LABEL_VALUES: dict[str, frozenset[str]] = {
@@ -50,7 +53,8 @@ _ALLOWED_LABEL_VALUES: dict[str, frozenset[str]] = {
             "knowledge.resolve_attack_technique",
         }
     ),
-    "tool_provider": frozenset({"native"}),
+    "tool_provider": frozenset({"native", "mcp"}),
+    "server_category": frozenset({"internal", "external"}),
     "model_provider": frozenset({"command_code", "scripted", "openai_compatible"}),
     "retrieval_mode": frozenset({"HYBRID", "LEXICAL_ONLY", "VECTOR_ONLY", "UNKNOWN"}),
     "result": frozenset({"success", "no_data", "partial", "rejected", "unavailable", "error"}),
@@ -61,6 +65,8 @@ _ALLOWED_LABEL_VALUES: dict[str, frozenset[str]] = {
             "AUTH_FAILURE",
             "SCHEMA_MISMATCH",
             "RATE_LIMITED",
+            "REMOTE_TOOL_ERROR",
+            "UNSUPPORTED_INTERACTION",
             "INVALID_RESULT",
             "RESULT_TOO_LARGE",
             "PROVIDER_ERROR",

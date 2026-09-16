@@ -13,6 +13,7 @@ no executor, schema, or policy backing it.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -20,6 +21,7 @@ from ...contracts.tools.types import (
     ModelToolSpec,
     model_tool_specs_by_name,
 )
+from .providers import AdmissionEntry
 
 ToolCapability = Literal["READ_ONLY"]
 
@@ -83,7 +85,7 @@ class UnknownToolError(KeyError):
 class ToolRegistry:
     """Owns the allowlist and resolves a candidate tool name to its executor."""
 
-    def __init__(self) -> None:
+    def __init__(self, admissions: Iterable[AdmissionEntry] = ()) -> None:
         self._tools: dict[str, ToolSpec] = {
             "hisiem.search_events": ToolSpec(
                 name="hisiem.search_events",
@@ -119,6 +121,33 @@ class ToolRegistry:
                 model_selectable=False,
             ),
         }
+        self._admission_specs: dict[str, ModelToolSpec] = {}
+        self.register_admissions(admissions)
+
+    def register_admissions(self, admissions: Iterable[AdmissionEntry]) -> None:
+        """Add only trusted explicit admissions to the existing registry.
+
+        Discovery never calls this method.  A write/high-risk admission can be
+        registered for system-controlled routing, but is never model-selectable.
+        """
+        for admission in admissions:
+            if admission.internal_name in self._tools:
+                raise ValueError(
+                    f"MCP admission collides with registered tool: {admission.internal_name}"
+                )
+            if admission.internal_name in FORBIDDEN_TOOLS:
+                raise ValueError(
+                    f"forbidden tool cannot be admitted: {admission.internal_name}"
+                )
+            self._tools[admission.internal_name] = ToolSpec(
+                name=admission.internal_name,
+                description=admission.description,
+                model_selectable=admission.is_model_selectable,
+            )
+            if admission.is_model_selectable:
+                self._admission_specs[admission.internal_name] = _model_tool_spec(
+                    admission
+                )
 
     def is_registered(self, tool_name: str) -> bool:
         return tool_name in self._tools
@@ -146,8 +175,37 @@ class ToolRegistry:
         registry allowlist stay the SAME surface.
         """
         by_name = model_tool_specs_by_name()
+        by_name.update(self._admission_specs)
         return [
             by_name[name]
             for name in self.model_selectable_names
             if name in by_name
         ]
+
+
+def _model_tool_spec(admission: AdmissionEntry) -> ModelToolSpec:
+    """Build a model-only description from the trusted internal schema."""
+    properties = admission.input_schema.get("properties")
+    required = admission.input_schema.get("required", [])
+    required_names = {
+        value for value in required if isinstance(required, list) and isinstance(value, str)
+    }
+    arguments: list[dict[str, str]] = []
+    if isinstance(properties, dict):
+        for name, value in properties.items():
+            if not isinstance(name, str) or not isinstance(value, dict):
+                continue
+            argument_type = value.get("type")
+            arguments.append(
+                {
+                    "name": name,
+                    "type": str(argument_type or "value"),
+                    "required": str(name in required_names).lower(),
+                    "description": str(value.get("description") or ""),
+                }
+            )
+    return ModelToolSpec(
+        name=admission.internal_name,
+        description=admission.description,
+        arguments_schema=arguments,
+    )
