@@ -6,6 +6,9 @@ authoritative detail is in [`domain-model.md`](domain-model.md),
 [`persistence-schema.md`](persistence-schema.md) and
 [`python-package-boundary.md`](python-package-boundary.md).
 
+For the two canonical full-size diagrams (plane architecture + end-to-end data flow),
+see [`architecture-diagrams.md`](architecture-diagrams.md).
+
 Figures 1–8, in the order they build on each other.
 
 ---

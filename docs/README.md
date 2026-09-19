@@ -14,6 +14,7 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 | Document | Read it for | Size |
 |---|---|---|
 | [`architecture-overview.md`](architecture-overview.md) | The visual model — investigation/authority chain, tool & evidence path, MCP admission, knowledge path, durable execution, truth boundaries, evaluation, cross-repository boundary | 8 figures |
+| [`architecture-diagrams.md`](architecture-diagrams.md) | The two canonical full-size diagrams — plane-oriented architecture graph, and the end-to-end investigation data flow | 2 diagrams |
 | [`product-positioning.md`](product-positioning.md) | What the product is and is not; target users and boundaries *(Chinese)* | 11 KB |
 | [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) | The user journey and what was in scope | 18 KB |
 | [`interview/INTERVIEW_GUIDE.md`](interview/INTERVIEW_GUIDE.md) | Review material: from a 30-second introduction down to deep follow-ups | large |
