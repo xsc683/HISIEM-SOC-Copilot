@@ -111,11 +111,13 @@ evidenced in [`stage-reports/`](stage-reports/).
 
 | Document | Read it for |
 |---|---|
+| [`stage-contracts/README.md`](stage-contracts/README.md) | **The inputs** — the frozen Four-Plane v1.0 contract, the Stage A–E implementation specs, and the execution prompts, now in-repo |
 | [`stage-reports/index.md`](stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
 | [`stage-reports/`](stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
 
 > Stage terminology is internal engineering history, not the product model. Read it for the
-> evidence behind a claim, not as an introduction.
+> evidence behind a claim, not as an introduction. The same applies to `stage-contracts/`:
+> where its frozen 2026-09-14 baseline disagrees with the code, **the code wins**.
 
 ---
 

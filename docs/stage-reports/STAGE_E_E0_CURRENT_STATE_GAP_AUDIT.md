@@ -31,7 +31,7 @@ Rationale, against the §27 pass criteria:
 
 | §27 criterion | Status | Evidence |
 |---|---|---|
-| 00 / 05 / 06 found and fully read | PASS | All three read in full from `D:\Project\four-plane\` |
+| 00 / 05 / 06 found and fully read | PASS | All three read in full from `D:\Project\four-plane\` (since 2026-09-23 in-repo at [`docs/stage-contracts/`](../stage-contracts/README.md)) |
 | Local + remote Git state verified | PASS | Both repos clean, branch/HEAD/remote identical |
 | Evaluation Plane inspected from code, not docs | PASS | 13,186 lines across `evaluation/` + `evaluation_harness/` inspected; gate functions read, not inferred |
 | GP-01 frozen-specific code identified | PASS | §26.5 |

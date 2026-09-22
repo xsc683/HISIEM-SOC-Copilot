@@ -105,3 +105,9 @@ the [README](../../README.md) and
 [`docs/architecture-overview.md`](../architecture-overview.md); the domain and persistence
 contracts are in [`docs/domain-model.md`](../domain-model.md) and
 [`docs/persistence-schema.md`](../persistence-schema.md).
+
+**What these reports were written against** — the frozen Four-Plane contract, the Stage A–E
+implementation specs and the execution prompts these reports' predecessors were given — is
+now in this repository at [`../stage-contracts/`](../stage-contracts/README.md). Read them as
+the **inputs** these reports are the **outputs** of. Until 2026-09-23 they lived outside both
+repositories, which is why these reports cited them by bare filename.
