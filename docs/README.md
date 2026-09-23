@@ -3,9 +3,10 @@
 This directory holds the authoritative technical documentation for HISIEM SOC Copilot.
 **You should never have to guess which document to open first.** Find your goal below.
 
-> **New here?** Read the [README](../README.md) first, then
-> [`architecture-overview.md`](architecture-overview.md) (eight figures). This page is for
-> when you want the detail behind one specific area.
+> **New here?** Read the [README](../README.md) first, then [`guide/`](guide/) — a
+> project-first walkthrough in four documents. Come back to
+> [`architecture-overview.md`](architecture-overview.md) (eight figures) for the visual
+> model, and to this page when you want the detail behind one specific area.
 
 ---
 
@@ -13,6 +14,7 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 | Document | Read it for | Size |
 |---|---|---|
+| [`guide/`](guide/) | **New here? Start with this.** Project-first walkthrough: what problem this decision layer solves, one investigation end to end, and why the agent cannot authorize itself. Four documents | 4 docs |
 | [`architecture-overview.md`](architecture-overview.md) | The visual model — investigation/authority chain, tool & evidence path, MCP admission, knowledge path, durable execution, truth boundaries, evaluation, cross-repository boundary | 8 figures |
 | [`architecture-diagrams.md`](architecture-diagrams.md) | The two canonical full-size diagrams — plane-oriented architecture graph, and the end-to-end investigation data flow | 2 diagrams |
 | [`product-positioning.md`](product-positioning.md) | What the product is and is not; target users and boundaries *(Chinese)* | 11 KB |
