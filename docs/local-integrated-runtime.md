@@ -1,4 +1,7 @@
-# Local Integrated Runtime — E1-C0 Baseline
+# Local Integrated Runtime
+
+> **Provenance.** This baseline was delivered as working step **E1-C0**. The code is
+> engineering history; this document is named after the runtime it describes.
 
 Normative reference for running the **HISIEM SOC Copilot** agent-evaluation
 runtime locally on a Windows dev machine, together with the **HISIEM** platform
@@ -67,7 +70,7 @@ Schema ownership: `copilot` is **Alembic-owned**; `langgraph_checkpoint` is
 
 ## 3. Deployment profiles (frozen)
 
-- **A — Full HISIEM (dataset generation, GP-01 E1-B):** everything in the infra
+- **A — Full HISIEM (dataset generation, GP-01 materialization):** everything in the infra
   compose including the data pipeline (Logstash, Kafka, Flink, Kibana) plus
   control-api. Launched by `scripts/dev/up-full.ps1`.
 - **B — Agent Evaluation (default):** siem-postgres (5432), Elasticsearch

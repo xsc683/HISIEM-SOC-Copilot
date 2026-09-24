@@ -2,7 +2,8 @@
 
 ## 1. Scope
 
-This document defines E1-B.4, the GP-01 Manifest Sealer contract.
+This document defines the GP-01 Manifest Sealer contract. (Provenance: delivered as
+working step `E1-B.4`; that code is engineering history, not the name of anything here.)
 
 The Sealer converts a verified materialized dataset into an immutable evaluation manifest that can be consumed by the Golden Path evaluation harness and scorer.
 
@@ -20,7 +21,8 @@ Immutable SealedManifest
 
 The Sealer does not ingest logs, resolve HISIEM resources, run the Copilot investigation, invoke an LLM, or determine the investigation result.
 
-E1-B.3 is the only stage responsible for proving that provider resources exist and satisfy the GP-01 materialization invariants.
+The materializer (`E1-B.3`) is the only step responsible for proving that provider resources
+exist and satisfy the GP-01 materialization invariants.
 
 ## 2. Input authority
 
@@ -606,7 +608,7 @@ The live preparation test does not by itself score model quality; scoring belong
 
 ## 27. Completion gate
 
-E1-B.4 is complete only when:
+The sealer is complete only when:
 
 ```text
 VerifiedDataset

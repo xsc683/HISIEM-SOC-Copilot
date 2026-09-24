@@ -194,43 +194,49 @@ documented for a future phase and deliberately **not implemented** here. A
 production retrieval must never use is a status that will eventually be used by
 accident.
 
-## 7. The model cannot reach any of this (P3-B is NOT YET ACTIVE)
+## 7. How the model reaches this subsystem
 
-The ToolRegistry's model-selectable surface is **exactly**:
+The ToolRegistry's model-selectable surface is **exactly four** read-only tools:
 
 ```
 hisiem.search_events
 hisiem.get_detection_rule
+knowledge.retrieve_security_guidance
+knowledge.resolve_attack_technique
 ```
 
 `hisiem.get_alert_context` is system-controlled and never offered to the model.
 
-The two knowledge tools — `knowledge.retrieve_security_guidance` and
-`knowledge.resolve_attack_technique` — remain in `FUTURE_CATALOG_TOOLS`:
+**Two of those four reach the knowledge subsystem.** The boundary is therefore not "the model
+cannot reach knowledge" but **"the model reaches it only through these two read-only,
+tenant-scoped, bounded tools"**. `FUTURE_CATALOG_TOOLS` holds exactly two names, and neither
+is a knowledge tool:
 
 ```python
 FUTURE_CATALOG_TOOLS = frozenset({
     "hisiem.get_entity_activity",
     "threat_intel.lookup_ip",
-    "knowledge.retrieve_security_guidance",
-    "knowledge.resolve_attack_technique",
 })
 ```
 
-They are **NOT YET ACTIVE**. No executor, schema, or policy backs them, so they
-are not registered, and a model that selects one gets `UnknownToolError`.
+What keeps the boundary closed:
 
-Additional closure:
+- **The path is layer-authorized.** `agent/knowledge/catalog.py` reaches the subsystem through
+  `application/ports/knowledge.py` and `application/services/knowledge_retrieval.py`. No file
+  under `agent/` imports `infrastructure/` or the operator CLI, so the model cannot reach
+  ingestion, mutation, or a release cutover.
+- **Retrieval degrades; it does not fail open.** When the validated (semantic) path is
+  unavailable — which is this repository's state, since no embedding provider is configured —
+  the executor falls back to **lexical** guidance and reports that. See §5 and §6.
+- **The CLI is not a production layer.** It is a separate dev/eval entry point
+  (`python -m hisiem_soc_copilot.knowledge.cli`), not mounted on the API.
+- **Still unreachable:** ingest, mutate, publish or freeze a release, and the cross-corpus
+  profile-switch path (see §10).
 
-- No file under `src/hisiem_soc_copilot/agent/` imports
-  `hisiem_soc_copilot.knowledge`. The operator CLI is unreachable from the Agent.
-- The knowledge CLI is a **dev/eval surface**, not a production layer. It is a
-  separate entry point (`python -m hisiem_soc_copilot.knowledge.cli`) and is not
-  mounted on the API.
-
-The architecture test pins the expected selectable-name set **literally**, not
-computed from the code under test, so any change to the surface is a visible diff
-in a test file rather than an invisible expansion.
+The architecture test pins **both** name sets literally — `EXPECTED_MODEL_SELECTABLE` (four
+names) and `EXPECTED_FUTURE_CATALOG` (two names) in
+`tests/architecture/test_knowledge_boundary.py` — so widening the surface is a visible diff in
+a test file rather than an invisible expansion.
 
 ## 8. Secrets
 
@@ -437,14 +443,14 @@ content:
 | `ATTACK_PROJECTION_BINDING` | Any release to projection binding at all; the old schema cannot express which version a release staged |
 
 Every predicate is chosen to be **zero** on a database that was upgraded and then
-not written to, so downgrading through the P3-A guard after a clean Stage B upgrade
-still succeeds. From the Stage B head, `downgrade -1` removes only the new nullable
+not written to, so downgrading through the P3-A guard after a clean upgrade from the previous revision
+still succeeds. From that revision's head, `downgrade -1` removes only the new nullable
 outbox trace-context column; `downgrade -2` reaches this guard. A guard that blocked
 the clean path would itself be the bug.
 
 **The honest residual.** The guard lives in the NEW revision because
 `c41f7b2e9d08` is frozen and must not be edited. It therefore intercepts any
-downgrade that crosses this revision — from the Stage B head, `downgrade -2` and
+downgrade that crosses this revision — from that revision's head, `downgrade -2` and
 `downgrade <older-rev>` run it first — but a database left sitting at `c41f7b2e9d08` from before this
 revision existed is **not** covered. An operator in that position must run
 `alembic upgrade head` first (free: the upgrade is additive) and only then
@@ -485,7 +491,7 @@ the sentence stopped being true.
 | Section 4 — hostile query input is plain search text | `tests/unit/knowledge/test_security_boundary.py` |
 | Section 5 — bounds are rejections, never truncations | `tests/unit/knowledge/test_security_boundary.py`, `tests/unit/knowledge/test_chunker.py`, `tests/unit/knowledge/test_ingestion_handler.py` |
 | Section 6 — embedding validation fails closed | `tests/unit/knowledge/test_security_boundary.py`, `tests/unit/knowledge/test_embedding_providers.py` |
-| Section 7 — P3-B tools are catalogued but not selectable | `tests/architecture/test_knowledge_boundary.py` |
+| Section 7 — the model reaches knowledge **only** through two read-only tools, and both name sets are pinned | `tests/architecture/test_knowledge_boundary.py` |
 | Section 10.1 — a pinned release is immutable; a conflicting re-import fails closed | `tests/unit/knowledge/test_attack_import.py` |
 | Section 10.2 — exactly one authoritative release per framework | `tests/unit/knowledge/test_attack_import.py`, `tests/integration/persistence/test_knowledge_persistence.py` |
 | Section 10.3 — the import port has no network capability | `tests/architecture/test_knowledge_boundary.py` |

@@ -1,29 +1,36 @@
-# Evaluation Closure Contract (E1-C4 / E1-C5 / E1-C6)
+# Evaluation Closure Contract
+
+> **Provenance.** This closure was delivered as three working steps, recorded in the
+> stage reports as **E1-C4** (deterministic scorer), **E1-C5** (repeatability collector)
+> and **E1-C6** (suite aggregation). Those codes are engineering-history labels; this
+> document names each piece by what it does, and shows a code only where it is the
+> provenance of a concrete artifact. For the numbering systems themselves see
+> [`../architecture-analysis/08-评估体系.md`](../architecture-analysis/08-评估体系.md).
 
 ## 1. Scope
 
 This document freezes the GP-01 evaluation closure: the deterministic correctness
-scorer (E1-C4), the bounded repeatability collector and its attempt classifier
-(E1-C5), and the evaluation-suite aggregation (E1-C6).
+scorer, the bounded repeatability collector and its attempt classifier, and the
+evaluation-suite aggregation.
 
 ```text
 SealedManifest (GP-01)
       ↓
-execute_real_model_run            (E1-C2, unchanged)
+execute_real_model_run                              [E1-C2]
       ↓
-tool-evidence-quality.json        (E1-C3, unchanged)
+tool-evidence-quality.json                          [E1-C3]
       ↓
-score.json                        (E1-C4, deterministic correctness)
+score.json                     deterministic scorer  [E1-C4]
       ↓
-bounded multi-run collector       (E1-C5, attempt classification)
+bounded multi-run collector    attempt classifier    [E1-C5]
       ↓
-suite-summary.json                (E1-C6, aggregation)
+suite-summary.json             suite aggregation     [E1-C6]
 ```
 
 The closure reuses the existing execution / telemetry / quality paths unchanged. It
 does not reimplement `StartAlertInvestigation`, the outbox dispatcher, the runner,
-LangGraph, the real `ModelProvider`, the E1-C2 telemetry gate, or the E1-C3 quality
-evaluator. Production code never imports `evaluation_harness`; the harness is the only
+LangGraph, the real `ModelProvider`, the real-model telemetry gate (`E1-C2`), or the
+tool-evidence quality evaluator (`E1-C3`). Production code never imports `evaluation_harness`; the harness is the only
 sanctioned `SealedManifest → Container` bridge.
 
 ---
@@ -42,7 +49,7 @@ production artifacts, model input, prompts, tools, or production state.
 
 ---
 
-## 3. E1-C4 — Deterministic correctness scorer
+## 3. Deterministic correctness scorer
 
 ### 3.1 Inputs (all read-only)
 
@@ -69,8 +76,8 @@ model.
 ```text
 execution_status              == COMPLETED
 InvestigationResult           present for the investigation
-E1-C2 model telemetry gate    == PASS
-E1-C3 tool/evidence gate      == PASS
+model telemetry gate          == PASS      (the real-model gate, E1-C2)
+tool-evidence quality gate    == PASS      (E1-C3)
 actual disposition            == sealed expected_verdict
 required_evidence_roles       all matched (GP-01: ["S1"])
 required role grounded        exact S1 Evidence → Finding → successful search_events ToolInvocation
@@ -89,8 +96,8 @@ only — there is no confidence threshold.
 ### 3.3 Evidence-coverage model
 
 `required_evidence_roles` is resolved evaluation-side from
-`manifest.oracle.required_evidence_roles`. A role is `matched` only when the E1-C3 exact
-provenance match for that role succeeded. GP-01 has one required role (`S1`), so
+`manifest.oracle.required_evidence_roles`. A role is `matched` only when the tool-evidence quality
+exact provenance match for that role succeeded (`E1-C3`). GP-01 has one required role (`S1`), so
 `evidence_coverage = 1.0` on match and `< 1` (FAIL) when a required role is unmatched.
 The role→evidence mapping is data-driven so later scenarios can supply multiple role
 matches without rewriting the engine.
@@ -127,7 +134,7 @@ that execution.
 
 ---
 
-## 4. E1-C5 — Repeatability / robustness
+## 4. Repeatability / robustness
 
 ### 4.1 Classification (stable codes only)
 
@@ -148,7 +155,7 @@ the provider baseline / config is valid;
 there IS actual failed model usage;
 every failed usage error_category ∈ {MODEL_UNAVAILABLE, MODEL_RATE_LIMITED, MODEL_TIMEOUT};
 no MODEL_CONFIGURATION / MODEL_REFUSAL / MODEL_OUTPUT_VALIDATION / provider-contract mismatch;
-the E1-C2 gate failure is explainable by those transient failures.
+the model gate failure (`E1-C2`) is explainable by those transient failures.
 ```
 
 Ambiguous cases (mixed transient + deterministic errors, or a gate failure not
@@ -159,8 +166,8 @@ MODEL_UNAVAILABLE / RATE_LIMITED / TIMEOUT   → INVALID_PROVIDER_TRANSIENT (may
 MODEL_REFUSAL / MODEL_OUTPUT_VALIDATION      → VALID_FAIL (counts)
 MODEL_CONFIGURATION / contract mismatch /
   preflight failure / unexpected infra error  → ABORT (no retry-until-success)
-E1-C2 PASS + E1-C3 FAIL                       → VALID_FAIL (counts)
-E1-C2 PASS + E1-C3 PASS + E1-C4 FAIL          → VALID_FAIL (counts)
+model gate PASS + quality gate FAIL                → VALID_FAIL (counts)
+model gate PASS + quality gate PASS + score FAIL   → VALID_FAIL (counts)
 ```
 
 A valid failure sample is NEVER discarded, replaced, or rerun-to-replace.
@@ -197,7 +204,7 @@ A valid failed sample is not rerun.
 
 ---
 
-## 5. E1-C6 — Evaluation suite summary
+## 5. Evaluation suite summary
 
 ### 5.1 Artifact
 
@@ -227,7 +234,7 @@ never gate.
 
 ```text
 preflight PASS; sealed manifest unchanged; 3 valid samples collected
-every valid sample: E1-C2 PASS, E1-C3 PASS, E1-C4 PASS
+every valid sample: model gate PASS, quality gate PASS, correctness gate PASS
 verdict correct 3/3; required evidence 3/3; grounding 3/3;
 control exclusion 3/3; citation integrity 3/3; result-finding integrity 3/3
 oracle firewall PASS for every valid execution; secret scan PASS

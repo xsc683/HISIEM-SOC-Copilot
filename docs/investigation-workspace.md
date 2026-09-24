@@ -212,7 +212,7 @@ BFF 以服务端派生的 `X-Tenant-ID` / `X-Actor-Subject` 转发，**绝不**�
 
 ```text
 POST / GET / cancel  /api/v1/investigations
-E1-C1..C6 评测命令
+评测命令（评估闭环；契约见 [`evaluation/evaluation-closure-contract.md`](evaluation/evaluation-closure-contract.md)）
 GP-01 scorer
 工具/证据 lineage
 provider 行为
@@ -238,6 +238,6 @@ provider 行为
 13 错误租户可读/取消                      → 否
 14 刷新后可重建                           → 是
 15 告警页可重新进入                       → 是
-16 既有 E1-C1..C6 测试保持绿色            → 是
+16 项既有评估测试保持绿色                  → 是
 17 GP-01 保持封存未修改                   → 是
 ```

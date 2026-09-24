@@ -388,9 +388,9 @@ runtime。
 
 ---
 
-## 21. E1-C2 Real-Model Evaluation Profile
+## 21. Real-Model Evaluation Profile
 
-E1-C2 用 **typed evaluation profile**（`evaluation_harness` 的 harness policy）驱动一次
+本节描述的档位在工程史里记为 **E1-C2**。它用 **typed evaluation profile**（`evaluation_harness` 的 harness policy）驱动一次
 REAL provider 的端到端 execution，不改动生产 Graph 的 provider 中立性：
 
 ```text

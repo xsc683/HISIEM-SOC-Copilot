@@ -8,10 +8,12 @@ calls and the embedding call it orchestrates. Ranking is plain functions over
 plain data, which is what makes a ranking reproducible and testable without a
 database.
 
-> **Not yet reachable by the model.** These services are internal. The catalog
-> tools that will eventually call them — `knowledge.retrieve_security_guidance`
-> and `knowledge.resolve_attack_technique` — are in `FUTURE_CATALOG_TOOLS` and are
-> **NOT YET ACTIVE** (see [security-boundary.md](security-boundary.md) §7).
+> **Reachable by the model — through two read-only tools.** These services are internal, but
+> `knowledge.retrieve_security_guidance` and `knowledge.resolve_attack_technique` are
+> **registered and selectable**, and they call into this surface via
+> `agent/knowledge/catalog.py` → `application/ports/knowledge.py`. They are read-only,
+> tenant-scoped and bounded; ingestion, mutation and release cutover remain unreachable from
+> the model. See [security-boundary.md](security-boundary.md) §7.
 
 ## 1. Types
 

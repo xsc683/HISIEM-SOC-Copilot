@@ -9,6 +9,9 @@ authoritative detail is in [`domain-model.md`](domain-model.md),
 For the two canonical full-size diagrams (plane architecture + end-to-end data flow),
 see [`architecture-diagrams.md`](architecture-diagrams.md).
 
+> The plane model names **eleven** planes; "four-plane" refers to the four this repository
+> closes. The two counts are not a 1:1 mapping — [`architecture-diagrams.md`](architecture-diagrams.md) §1 explains it.
+
 Figures 1–8, in the order they build on each other.
 
 ---

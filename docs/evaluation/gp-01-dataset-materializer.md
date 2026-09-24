@@ -2,7 +2,8 @@
 
 ## 1. Scope
 
-This document defines E1-B.3, the GP-01 Dataset Materializer contract.
+This document defines the GP-01 Dataset Materializer contract. (Provenance: delivered as
+working step `E1-B.3`; that code is engineering history, not the name of anything here.)
 
 The Materializer turns the committed logical GP-01 scenario into real HISIEM resources and resolves their provider identities for later evaluation.
 
@@ -572,7 +573,7 @@ Unit tests MUST cover at least:
 
 ## 22. Completion gate
 
-E1-B.3 is complete only when the real environment demonstrates:
+The materializer is complete only when the real environment demonstrates:
 
 ```text
 Logical GP-01

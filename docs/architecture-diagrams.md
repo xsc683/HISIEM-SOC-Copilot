@@ -20,6 +20,20 @@ model), [`domain-model.md`](domain-model.md), [`python-package-boundary.md`](pyt
 Plane-oriented: every component grouped by the responsibility plane that owns it, with the
 governance and authority chain made explicit as a flow.
 
+> **On the plane model — why "four" and "eleven" both appear.**
+> The frozen architecture contract names **eleven** responsibility planes, and this diagram
+> groups components by exactly those eleven. The machine-readable form is the `Plane` enum in
+> `evaluation/cross_plane/contracts.py`, whose own docstring says it is *"the planes named by
+> the architecture freeze — **not a new taxonomy**"*.
+>
+> "**Four-plane**" is a different thing: it is the framing of which planes this repository
+> **closes** (Knowledge, Capability, Observability, Analyst Experience), with the remaining
+> seven treated as **reused rather than re-architected**.
+>
+> So the two are **not a 1:1 mapping**, and they are not competing taxonomies either: four is a
+> **subset** of eleven, presented for a different purpose — *what this project closes* versus
+> *which plane a gate belongs to*. **Do not change either side to make the counts agree.**
+
 ```mermaid
 graph TB
 

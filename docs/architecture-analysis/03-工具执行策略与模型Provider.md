@@ -435,7 +435,7 @@ class ProviderInvocationContext:
 
 ---
 
-## 3. Provider 架构（Stage C）
+## 3. Provider 架构
 
 ### 3.1 关键论断
 

@@ -8,10 +8,13 @@ nothing that existed before them. The closure revision copies every pre-existing
 chunk forward **preserving its `id`**, so neither an upgrade nor a rollback
 discards knowledge that was already stored.
 
-> **P3-B is NOT YET ACTIVE.** The knowledge Agent tools
-> (`knowledge.retrieve_security_guidance`, `knowledge.resolve_attack_technique`)
-> are catalogued but not registered. No model can reach this subsystem. What
-> follows is an operator procedure, not an Agent capability.
+> **The knowledge Agent tools are live.** `knowledge.retrieve_security_guidance` and
+> `knowledge.resolve_attack_technique` **are registered and model-selectable** — the model
+> can read this subsystem through those two bounded, read-only tools (see
+> [security-boundary.md](security-boundary.md) §7).
+>
+> What follows is nevertheless an **operator procedure**: provisioning, ingest, release
+> cutover and evaluation are not reachable from the model, which can only query.
 
 ## 1. Prerequisites
 
@@ -204,7 +207,7 @@ The P3-A chain is `979070495d4f` (the P2 response lifecycle migration) →
 `ed6af82d9b13` (the original P3-A schema) → `c41f7b2e9d08` (the closure revision:
 immutable content chunks and the ATT&CK release model) → `a5e93c07fd21` (the release
 → knowledge projection binding and fail-closed downgrade guard) → **`b6c2a4d19f30`**
-(head; the Stage B nullable outbox `traceparent` diagnostic-context column).
+(head; the nullable outbox `traceparent` diagnostic-context column added by that revision).
 
 `ed6af82d9b13` is released and **strictly unmodifiable**, so the closure's schema
 changes arrive as new revisions stacked on top of it. The upgrade is additive and
@@ -222,7 +225,7 @@ because that table is the rebuildable projection.
 .venv/Scripts/python.exe -m alembic check
 ```
 
-At the Stage B head, `downgrade -1` removes only the nullable outbox `traceparent`
+At that revision's head, `downgrade -1` removes only the nullable outbox `traceparent`
 column. `downgrade -2` steps back through `a5e93c07fd21` and undoes **only what it
 created** — the `attack_release_projection` table — after running the downgrade
 guard (see **Downgrade safety** below). The next step, `downgrade -3` (or an explicit

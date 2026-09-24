@@ -88,7 +88,28 @@ Domain Entity 使用 UUID，由 Application 生成。
 
 ### Timestamp
 
-统一使用 `TIMESTAMPTZ`，语义为 UTC。
+**规范要求**：统一使用 `TIMESTAMPTZ`，语义为 UTC（timezone-aware）。
+
+**当前实现**：迁移与 ORM 实际使用 `sa.DateTime()`（等价于 PostgreSQL
+`TIMESTAMP WITHOUT TIME ZONE`，**naive**）。全库 **50** 个时间列**无一**为 timezone-aware ——
+`timezone=True` / `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE` 在 `alembic/versions/*.py` 与
+`src/hisiem_soc_copilot/infrastructure/persistence/orm/*.py` 中**零命中**。
+
+**Gap**：规范要求 aware，实现是 naive。这不是同一个类型——naive 列不携带偏移量，
+跨时区比较与序列化的语义取决于调用方约定，而不是由数据库保证。
+
+**Engineering status**：**Implementation Gap / Deferred Engineering Fix**。
+规范**不因实现而修改**；实现侧待单独排期（`DateTime(timezone=True)` + 迁移）。
+**本文档不因此把规范降级为 naive。**
+
+> **复核命令**（可复现）：
+> ```bash
+> grep -rE 'timezone=True|TIMESTAMPTZ|TIMESTAMP WITH TIME' alembic/versions/*.py \
+>   src/hisiem_soc_copilot/infrastructure/persistence/orm/*.py     # 应为空
+> grep -rhoE 'sa\.DateTime\([^)]*\)' alembic/versions/*.py | sort | uniq -c   # 应全部为 sa.DateTime()
+> ```
+> **各表定义中仍按规范写 `TIMESTAMPTZ`**（见 §5 起）——那描述的是**规范要求**，不是当前实现。
+> 两者的不一致由本节这条 Gap 统一承载，不要在表定义里逐处改写。
 
 ### Enum
 
@@ -2054,7 +2075,7 @@ approval permission
 | Checkpoint Schema | `langgraph_checkpoint` |
 | Checkpoint Migration | LangGraph-owned |
 | Domain IDs | UUID |
-| Timestamp | TIMESTAMPTZ / UTC |
+| Timestamp | `TIMESTAMPTZ` / UTC —— **规范要求**；当前实现为 naive `sa.DateTime()`，见 §4「Timestamp」的 Implementation Gap |
 | Status storage | VARCHAR + named CHECK |
 | Aggregate concurrency | Optimistic Lock |
 | Active Alert Investigation | PostgreSQL Partial Unique Index |

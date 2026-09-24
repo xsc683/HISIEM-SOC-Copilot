@@ -31,6 +31,12 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 | [`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md) | Commands, domain events, and how LangGraph state relates to (and is *not*) domain state | 35 KB |
 | [`model-provider-contract.md`](model-provider-contract.md) | The provider contract: bounded invocation, structured output, typed failures, fail-closed behaviour | 14 KB |
 | [`investigation-workspace.md`](investigation-workspace.md) | The analyst workspace projection contract | 9 KB |
+| [`architecture-analysis/README.md`](architecture-analysis/README.md) | **Code-level evidence layer** (9 documents): per-subsystem `file:line` forensics, the counter-intuitive shapes, and the boundaries as they actually are | — |
+
+> The evidence layer is **not** authority. It answers "is the code really like this?" —
+> the contracts above answer "what must the code be?". When they disagree, the contracts
+> govern and the code is the final fact; the evidence document is then the thing that needs
+> updating.
 
 ---
 
@@ -70,8 +76,9 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 **The model-selectable tool surface is exactly four read-only tools**, plus one
 system-controlled tool the model can never call. Unknown servers, unadmitted dynamic tools,
-write capabilities and schema drift all fail closed. Exact set and rules: `README §7` and
-[`investigation-tool-contract.md`](investigation-tool-contract.md).
+write capabilities and schema drift all fail closed. Exact set and rules:
+[`investigation-tool-contract.md`](investigation-tool-contract.md) §3–§4 — the contract is the authority; the root README
+only summarises it.
 
 ---
 
@@ -113,7 +120,7 @@ evidenced in [`stage-reports/`](stage-reports/).
 
 | Document | Read it for |
 |---|---|
-| [`stage-contracts/README.md`](stage-contracts/README.md) | **The inputs** — the frozen Four-Plane v1.0 contract, the Stage A–E implementation specs, and the execution prompts, now in-repo |
+| [`stage-contracts/README.md`](stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
 | [`stage-reports/index.md`](stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
 | [`stage-reports/`](stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
 
@@ -130,6 +137,10 @@ evidenced in [`stage-reports/`](stage-reports/).
 - Where a boundary exists, the boundary is written down — including the ones that cost
   something.
 - Architecture and persistence documents are authority: implementation follows them, and
-  `tests/architecture/` enforces the layer rules mechanically.
+  `tests/architecture/` enforces the layer rules mechanically. **A recorded divergence does
+  not make the document wrong** — the norm stands, and the gap is filed as an Implementation
+  Gap in the affected document instead of being smoothed over. See
+  [`persistence-schema.md`](persistence-schema.md) §4 for the one currently open case
+  (the spec requires timezone-aware `TIMESTAMPTZ`; the ORM layer is naive throughout).
 - Acceptance artifacts are machine-readable and produced by real runs; nothing is
   transcribed from a narrative.

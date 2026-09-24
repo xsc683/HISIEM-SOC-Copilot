@@ -183,6 +183,11 @@ redesigning:
 **Reused, not re-architected:** Domain Plane, Agent Runtime Plane, Persistence Plane,
 Durable Execution Plane, Human Authority Plane, HISIEM Integration Plane, Evaluation Plane.
 
+> The four planes above are the ones this repository **closes**; the frozen contract names
+> **eleven** (the rest are reused, not re-architected), and the acceptance gates classify by
+> that eleven-member `Plane` enum. The two counts are **not a 1:1 mapping** and neither side
+> should be changed to make them agree — see [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md) §1.
+
 Four global principles govern all of them:
 
 1. **No new undefined authority.** Knowledge ≠ verdict authority; an MCP provider ≠
@@ -197,15 +202,10 @@ Four global principles govern all of them:
 
 ## 7. Tool / MCP Governance
 
-**Discovery, admission and authorization are three different things.**
-
-- **Discovery** is what a server claims it offers.
-- **Admission** is what this system has decided to trust — a hand-written, server-side
-  entry declaring internal name, trusted description, configured server, external name,
-  argument/result contracts, expected schema fingerprint, risk classification, tenant
-  scope and per-capability bounds.
-- **Selection** is what the model may choose — which is only ever an admitted, read-only
-  capability.
+**Discovery, admission and authorization are three different things** — discovery is what a
+server claims it offers, admission is what this system has decided to trust, and selection is
+what the model may choose, which is only ever an admitted, read-only capability. The admission
+entry's fields are specified in the tool contract, not here.
 
 **The model-selectable surface is exactly four tools** (asserted by an architecture test):
 
@@ -219,22 +219,11 @@ knowledge.resolve_attack_technique
 plus `hisiem.get_alert_context`, which is **system-controlled** — the graph's hydrate node
 calls it directly and it is never offered to the model.
 
-**Fail-closed by construction:**
-
-| Rule | Effect |
-|---|---|
-| Unknown server | Rejected — only trusted configured endpoints are contacted |
-| Write / high-risk capability | `is_model_selectable` requires `READ_ONLY`; a write capability is never selectable |
-| Unadmitted dynamic tool | Discovered but unadmitted — visible to operators, invisible to the model |
-| Schema drift | Deterministic SHA-256 fingerprint over canonical name + input/output schema; drift → `SCHEMA_MISMATCH` |
-| Protocol downgrade | A pinned production protocol version; unsupported/legacy negotiation is rejected rather than silently downgraded |
-| Tenant | Server-side trusted context only. A model-supplied tenant field is rejected |
-
-Tool results are processed in a fixed order — protocol/result type, unsupported
-interaction modes, `is_error`, supported content types, trusted contract validation, then
-global and per-capability bounds — and failures map to typed categories. An oversized
-result is `RESULT_TOO_LARGE`, **never silently truncated**. All remote content is treated as
-untrusted data, including text that looks like instructions.
+Everything normative about this surface — the admission entry's fields, the fail-closed
+rules (unknown server, write capability, unadmitted dynamic tool, schema drift,
+protocol downgrade, tenant), the fixed result-processing order and the typed failure
+categories — belongs to [`docs/investigation-tool-contract.md`](docs/investigation-tool-contract.md)
+§3, not to this file. See it for the rules.
 
 **`MCP V1 is read-only and model-selectable writes do not exist.`** That is a deliberate
 scope boundary, not a pending feature.
@@ -486,7 +475,7 @@ in itself. What matters is *what* is verified:
 | KB-GOLDEN-V1 | Knowledge retrieval, citation and authority behaviour |
 | XP-01 | 29 cross-plane scenarios against 13 non-compensating gates, aggregated into one deterministic artifact |
 
-**Result at the Stage E seal:**
+**Result at the cross-plane acceptance seal (the Stage E seal):**
 
 ```text
 pytest                2236 passed / 17 skipped / 0 failed / 0 errors

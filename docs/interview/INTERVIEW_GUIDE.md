@@ -933,7 +933,7 @@ Fail-closed matters because partial sanitization leaves the forbidden value in p
 correlation is preserved (ids, statuses, durations) without content.
 
 **Reference.** `infrastructure/observability/`, `XP-OBS-002`, `XP-SEC-003` (gate
-`SECRET_LEAK`), Stage B docs.
+`SECRET_LEAK`), and the observability foundation stage report under [`../stage-reports/`](../stage-reports/).
 
 **Follow-up:** *"Why fail-closed rather than dropping the bad key?"* → Dropping the key keeps
 the observation but silently discards a field the caller believed was recorded. Rejecting the
@@ -1027,8 +1027,8 @@ or a reconstruction differing from server truth, FAILs `EXPECTED_FACTS_PRESENT`.
 **Concept.** End-to-end investigation correctness on a sealed, reproducible dataset.
 
 **Implementation.** A committed logical scenario is materialized into **real HISIEM
-resources** (materializer, E1-B.3), their provider identities resolved, and the result
-**sealed** into a manifest (E1-B.4). A real model run executes against the sealed manifest;
+resources** (the dataset materializer), their provider identities resolved, and the result
+**sealed** into a manifest (the manifest sealer). A real model run executes against the sealed manifest;
 tool/evidence quality is assessed; a **deterministic correctness scorer** scores it; a
 **bounded repeatability collector** classifies attempts; a suite summary aggregates. GP-01
 closure requires **3/3 valid correctness passes**.
@@ -1110,7 +1110,7 @@ paragraph.
 without changing this repository's production layers. The invariants were made testable
 without touching the systems under test — which is the part I would emphasize.
 
-**Reference.** [README §12](../README.md#12-evaluation), `docs/stage-reports/`.
+**Reference.** [README §12](../../README.md#12-evaluation), `docs/stage-reports/`.
 
 ---
 
