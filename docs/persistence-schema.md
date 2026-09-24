@@ -169,6 +169,18 @@ outbox_message
 Operational
 ────────────────────────────
 tool_invocation
+
+Knowledge (P3-A)
+────────────────────────────
+knowledge_document
+knowledge_document_version
+embedding_profile
+knowledge_content_chunk
+knowledge_chunk_embedding
+attack_release
+attack_technique
+attack_release_projection
+knowledge_chunk
 ```
 
 ---
@@ -1120,6 +1132,589 @@ UNIQUE(investigation_id, idempotency_key)
 
 ---
 
+## 28.1 P3-A 知识子系统表集合
+
+P3-A（Knowledge + Hybrid Retrieval）在 `copilot` schema 中落地 9 张表，由三个迁移建立：
+
+```text
+ed6af82d9b13   knowledge_document / knowledge_document_version / embedding_profile
+               knowledge_chunk / attack_technique
+c41f7b2e9d08   knowledge_content_chunk / knowledge_chunk_embedding / attack_release
+a5e93c07fd21   attack_release_projection
+```
+
+9 张表分两类，其区别是整套设计的支点：
+
+```text
+Immutable Knowledge Truth（只追加，永不 UPDATE）
+────────────────────────────
+knowledge_document
+knowledge_document_version
+knowledge_content_chunk
+attack_technique
+attack_release_projection
+
+Rebuildable Projection / Supporting Record（可重建，或被取代）
+────────────────────────────
+knowledge_chunk_embedding
+embedding_profile
+attack_release
+knowledge_chunk              （pre-closure 遗留表，P3-A 不再读写）
+```
+
+前提条件：本子系统使用 pgvector 的 `vector` 与 PostgreSQL 的 `tsvector`。`vector` 扩展必须装在
+本连接 `search_path` 可达的 schema（即 `copilot`）中，否则 `ed6af82d9b13` 的 `CREATE TABLE` 会以
+一条难以定位的 `type "vector" does not exist` 失败。两个相关迁移都在任何 DDL **之前**显式校验，
+并以可执行的信息失败——失败时"本次运行什么都没改"对运行本身成立，不依赖调用方的事务配置。
+
+---
+
+## 28.2 `knowledge_document`
+
+一个外部标识的知识文档。可变部分只有生命周期。
+
+```text
+id UUID PK
+source_kind VARCHAR(32) NOT NULL
+external_key VARCHAR(512) NOT NULL
+visibility VARCHAR(16) NOT NULL
+tenant_id VARCHAR(128) NULL
+title VARCHAR(512) NOT NULL
+status VARCHAR(16) NOT NULL
+active_version_id UUID NULL
+revision INTEGER NOT NULL DEFAULT 0
+lock_version INTEGER NOT NULL DEFAULT 0
+created_at TIMESTAMPTZ NOT NULL
+retired_at TIMESTAMPTZ NULL
+```
+
+Source Kind：
+
+```text
+MITRE_ATTACK
+CURATED_GUIDANCE
+TENANT_RUNBOOK
+```
+
+Visibility：
+
+```text
+GLOBAL
+TENANT
+```
+
+Status：
+
+```text
+ACTIVE
+RETIRED
+```
+
+约束：
+
+```text
+CHECK (source_kind IN ('MITRE_ATTACK','CURATED_GUIDANCE','TENANT_RUNBOOK'))
+CHECK (visibility IN ('GLOBAL','TENANT'))
+CHECK (status IN ('ACTIVE','RETIRED'))
+CHECK ((visibility = 'GLOBAL' AND tenant_id IS NULL)
+    OR (visibility = 'TENANT' AND tenant_id IS NOT NULL))
+CHECK ((status = 'ACTIVE' AND retired_at IS NULL)
+    OR (status = 'RETIRED' AND retired_at IS NOT NULL))
+CHECK (revision >= 0)
+CHECK (lock_version >= 0)
+```
+
+`visibility` 是**作用域**，不是权限：GLOBAL 无 tenant，TENANT 恰好属于一个 tenant。
+scope 不变量是数据库 CHECK 而不是应用约定，所以"GLOBAL 却带 tenant"不可表达。
+
+身份是 scope 内的 `(source_kind, external_key)`。不能用**一条** `UNIQUE(source_kind, external_key)`：
+PostgreSQL 的 `NULL` 在普通 unique index 中永不冲突，那条索引会静默放过任意多行 GLOBAL 文档。
+身份因此由**两条 PARTIAL unique index** 表达：
+
+```sql
+CREATE UNIQUE INDEX uq_knowledge_document_global_key
+ON copilot.knowledge_document (source_kind, external_key)
+WHERE visibility = 'GLOBAL';
+
+CREATE UNIQUE INDEX uq_knowledge_document_tenant_key
+ON copilot.knowledge_document (tenant_id, source_kind, external_key)
+WHERE visibility = 'TENANT';
+```
+
+主要索引：
+
+```text
+(tenant_id, status)
+```
+
+`source_kind`、`external_key`、`visibility` immutable；唯一的生命周期动作是 `ACTIVE -> RETIRED`，
+`RETIRED` 是终态，不支持 `RETIRED -> ACTIVE`。
+
+`active_version_id` 是**指针**，在同一事务内与该 version 及其 chunk 一起写入，因此不会指向一个检索投影
+缺失的 version。它刻意**不是** Foreign Key：两张表互相引用，deferred 循环约束并不会比事务本身多给任何
+保证。
+
+ORM ↔ Domain：
+
+```text
+KnowledgeDocumentRow   ↔   domain.knowledge.entities.KnowledgeDocument（Aggregate Root）
+
+mapper: document_to_row / row_to_document
+```
+
+`source_kind` / `visibility` / `status` 以原始字符串存储，schema 的 CHECK 是仲裁者，mapper 用枚举值
+转换；读到枚举外的值直接抛错而不是强制归一，因为损坏的行是需要浮出的 bug，不是需要抹平的东西。
+
+`row_to_document` 直接构造 aggregate，绝不调用 `KnowledgeDocument.create()`：那个工厂会追加
+`knowledge_document_created` Domain Event，而重新载入一行不是新的业务事实，重放会让审计账本重复。
+
+---
+
+## 28.3 `knowledge_document_version`
+
+一个不可变的文档版本。内容变化是**追加**，没有任何 UPDATE 路径。
+
+```text
+id UUID PK
+document_id UUID NOT NULL FK
+version INTEGER NOT NULL
+content_hash CHAR(64) NOT NULL
+title VARCHAR(512) NOT NULL
+normalized_content TEXT NOT NULL
+language VARCHAR(16) NOT NULL
+source_version VARCHAR(128) NULL
+metadata JSONB NOT NULL DEFAULT '{}'
+ingested_at TIMESTAMPTZ NOT NULL
+effective_at TIMESTAMPTZ NULL
+```
+
+约束：
+
+```text
+CHECK (version >= 1)
+CHECK (content_hash ~ '^[0-9a-f]{64}$')
+CHECK (length(normalized_content) > 0)
+
+UNIQUE(document_id, version)
+UNIQUE(document_id, content_hash)
+```
+
+`UNIQUE(document_id, content_hash)` 把"重复摄取相同字节不可能产生第二个 version"变成数据库事实，
+这正是并发摄取会收敛而不是竞争的原因。
+
+`source_version` 只记录哪个 release **创建**了这一行。两个 release 可以携带逐字节相同的 technique 内容
+而共用同一个 version，因此它**不是**"哪个 release 投影了这个 version"的答案——那是 §28.9 的职责。
+
+该表 immutable。
+
+ORM ↔ Domain：
+
+```text
+KnowledgeDocumentVersionRow   ↔   domain.knowledge.entities.KnowledgeDocumentVersion
+
+mapper: version_to_row / row_to_version
+```
+
+该表的列名是 `metadata`，而 ORM 属性名是 `doc_metadata`（`metadata` 被 `DeclarativeBase` 占用）；
+这一处重命名只存在于 mapper 中，任何其它地方都不得自行映射。
+
+---
+
+## 28.4 `embedding_profile`
+
+语料被索引到的向量空间。
+
+```text
+id UUID PK
+provider VARCHAR(64) NOT NULL
+model_id VARCHAR(128) NOT NULL
+dimension INTEGER NOT NULL
+distance_metric VARCHAR(16) NOT NULL
+normalization VARCHAR(16) NOT NULL
+profile_version INTEGER NOT NULL
+status VARCHAR(16) NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+retired_at TIMESTAMPTZ NULL
+```
+
+约束：
+
+```text
+CHECK (dimension >= 1 AND dimension <= 8192)
+CHECK (distance_metric IN ('COSINE'))
+CHECK (normalization IN ('NONE','L2'))
+CHECK (status IN ('ACTIVE','RETIRED'))
+CHECK (profile_version >= 1)
+CHECK ((status = 'ACTIVE' AND retired_at IS NULL)
+    OR (status = 'RETIRED' AND retired_at IS NOT NULL))
+```
+
+`distance_metric` 只冻结 `COSINE` 一个值：第二个 metric 是排序语义变更，需要自己的一轮设计，
+不在此处预先加入，检索路径显式拒绝其它值。
+
+索引：
+
+```text
+UNIQUE(provider, model_id, dimension, distance_metric, normalization, profile_version)
+```
+
+"至多一个 ACTIVE"由 partial unique index 表达，而不是应用代码——应用代码扛不住两个并发激活：
+
+```sql
+CREATE UNIQUE INDEX uq_embedding_profile_single_active
+ON copilot.embedding_profile (status)
+WHERE status = 'ACTIVE';
+```
+
+ORM ↔ Application Port：
+
+```text
+EmbeddingProfileRow   ↔   application.ports.knowledge.EmbeddingProfileRecord
+
+mapper: profile_to_row / row_to_profile
+```
+
+该表**没有** Domain Aggregate：它是检索配置，不是业务事实。
+
+---
+
+## 28.5 `knowledge_content_chunk`
+
+不可变的引用目标，即 citation 指向的东西。
+
+`knowledge_chunk` 把内容与 embedding 放在同一行，重新索引会删掉 citation 指向的正是那些行，
+历史 `kcit:` handle 随之全部失效。本表是那次 closure 的内容半边：内容写一次，永不重写——
+它必须活过一次重新 embedding、一次检索投影重建、一次重新切分（同一个 version 的**新 generation**，
+追加而非替换）、一次重启、一次 retirement，以及一个后续版本。
+
+```text
+id UUID PK
+document_id UUID NOT NULL FK
+document_version_id UUID NOT NULL FK
+generation INTEGER NOT NULL
+ordinal INTEGER NOT NULL
+heading_path TEXT NOT NULL
+content TEXT NOT NULL
+content_hash CHAR(64) NOT NULL
+token_count INTEGER NOT NULL
+language VARCHAR(16) NOT NULL
+chunker_version VARCHAR(64) NOT NULL
+lexical_document TSVECTOR GENERATED ALWAYS AS
+    (to_tsvector('simple', coalesce(heading_path,'') || ' ' || content)) STORED NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+```
+
+约束：
+
+```text
+CHECK (ordinal >= 0)
+CHECK (generation >= 1)
+CHECK (length(content) > 0)
+CHECK (content_hash ~ '^[0-9a-f]{64}$')
+CHECK (token_count >= 0)
+CHECK (length(chunker_version) > 0)
+```
+
+主要索引：
+
+```text
+UNIQUE(document_version_id, generation, ordinal)
+(document_id)
+(document_version_id)
+GIN (lexical_document)
+```
+
+`ordinal` 在一个 generation 内是**全序**，正是这一点让检索的稳定语义排序键成为全序而不是偏序。
+
+`generation` 让 chunker 变更非破坏：对同一个不可变 version 重新切分是**追加** generation N+1 并原地保留
+N，于是指向旧切分的 citation 仍然可解析。本子系统**没有** `delete_for_version`：不可变的历史知识内容
+不通过 P3-A 删除。
+
+`chunker_version` 被持久化，摄取据此判断**当前** generation 是否匹配冻结的 chunker 配置，而不是静默地
+继续服务由另一套代码构建的投影。
+
+`lexical_document` 是 GENERATED 列，全文本索引建在**这张表**上——词法检索读的是内容而不是向量，
+所以词法通道的寿命长于任何一次向量空间变更；而它是 GENERATED 的，所以这个投影不可能与它所描述的内容漂移。
+
+ORM ↔ Domain：
+
+```text
+KnowledgeContentChunkRow   ↔   domain.knowledge.entities.KnowledgeContentChunk
+
+mapper: content_chunk_to_row / row_to_content_chunk
+```
+
+Citation handle 形如 `kcit:<chunk_uuid>:<content_hash_prefix>`，命名的是**本表**的主键；
+重新 embedding、重建检索投影、重启、retirement 与后续 version 都不会让它失效。
+
+---
+
+## 28.6 `knowledge_chunk_embedding`
+
+content chunk 的**可重建** embedding 投影。
+
+本表不含内容，因此可以随时删除重建：换 embedding profile、重新索引、整库重建向量，都只是替换这里的行，
+不破坏任何 citation——citation 命名的是 content chunk，而不是这一行。
+
+```text
+id UUID PK
+content_chunk_id UUID NOT NULL FK
+embedding_profile_id UUID NOT NULL FK
+embedding VECTOR NOT NULL
+indexed_at TIMESTAMPTZ NOT NULL
+```
+
+约束：
+
+```text
+UNIQUE(content_chunk_id, embedding_profile_id)
+```
+
+主要索引：
+
+```text
+(embedding_profile_id)
+```
+
+`UNIQUE(content_chunk_id, embedding_profile_id)` 让重新 embedding 幂等：同一个 chunk 在同一个空间里
+恰好有一个向量。
+
+`embedding` 是**无维度**的 `vector` 类型：schema 里不烘焙任何维度，所以第二个不同尺寸的 embedding 模型
+不需要迁移；维度契约由 ACTIVE 的 embedding profile 强制。刻意**不建** HNSW、也**不建** IVFFlat——P3-A
+做精确排序，ANN 索引会静默改变"找到的是哪些邻居"。
+
+ORM ↔ Application Port：
+
+```text
+KnowledgeChunkEmbeddingRow   ↔   application.ports.knowledge.ChunkEmbeddingRecord
+
+mapper: embedding_to_row（写入方向；读取走 retrieval 查询）
+```
+
+---
+
+## 28.7 `attack_release`
+
+ATT&CK 权威，粒度是 **release**。
+
+```text
+id UUID PK
+framework VARCHAR(32) NOT NULL
+source_release VARCHAR(32) NOT NULL
+content_fingerprint CHAR(64) NULL
+status VARCHAR(16) NOT NULL
+technique_count INTEGER NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+activated_at TIMESTAMPTZ NULL
+```
+
+Status：
+
+```text
+ACTIVE
+INACTIVE
+```
+
+约束：
+
+```text
+CHECK (status IN ('ACTIVE','INACTIVE'))
+CHECK (content_fingerprint IS NULL OR content_fingerprint ~ '^[0-9a-f]{64}$')
+CHECK (technique_count >= 0)
+
+UNIQUE(framework, source_release)
+```
+
+"每个 framework 至多一个权威 release"是一条 partial unique index。`attack_technique.active` 表达不了这条
+规则：它是 technique-per-row，建在它上面的任何 unique index 都写不出这个约束，两个 release 可以同时自称
+current。用 SQL 而不是应用代码，因为应用代码扛不住两个并发激活：
+
+```sql
+CREATE UNIQUE INDEX uq_attack_release_single_active
+ON copilot.attack_release (framework)
+WHERE status = 'ACTIVE';
+```
+
+`content_fingerprint` 让被 pin 的 release immutable：以不同内容重新导入同一个 release 会被**拒绝**而不是
+被吸收。它只对本迁移从既有 technique 行 **ADOPT** 出来的 release 为 `NULL`——那些行是在 release 被指纹化
+之前写入的，从未计算过指纹；在迁移里重算会在这门语言里放进**第二份** release 指纹定义，无法与权威函数保持
+同步。这种 release 在下次导入相同字节时按**已存储的内容**重新推导指纹并 pin 住，而 `NULL` 指纹永不视为匹配。
+
+ORM ↔ Application Port：
+
+```text
+AttackReleaseRow   ↔   application.ports.knowledge.AttackReleaseRecord
+
+mapper: release_to_row / row_to_release
+```
+
+---
+
+## 28.8 `attack_technique`
+
+某个已 pin release 的规范 technique 行。
+
+```text
+id UUID PK
+framework VARCHAR(32) NOT NULL
+technique_id VARCHAR(32) NOT NULL
+source_release VARCHAR(32) NOT NULL
+name VARCHAR(512) NOT NULL
+description TEXT NOT NULL
+tactics JSONB NOT NULL
+platforms JSONB NOT NULL
+source_stix_id VARCHAR(128) NOT NULL
+content_hash CHAR(64) NOT NULL
+active BOOLEAN NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+```
+
+约束：
+
+```text
+CHECK (content_hash ~ '^[0-9a-f]{64}$')
+
+UNIQUE(framework, technique_id, source_release)
+FK (framework, source_release) REFERENCES attack_release
+    ON DELETE RESTRICT
+```
+
+重新导入同一个 release 不会复制 technique；新 release 是新的行集，旧 release 的行永不删除。
+
+该 Foreign Key 由 `c41f7b2e9d08` 在 ADOPT 之后建立，使"technique 行没有已注册 release"从此不可表达——
+这正是 technique 永远不可能成为回答"哪个 release 是 current"的地方的原因。
+
+`active` **镜像**所属 release 的权威，从不自己决定权威：在 legacy flag 相互矛盾的地方，镜像跟随 release，
+因为一个非权威 release 上残留 `active = true` 恰恰是 release 表存在的目的所要变成不可表达的那种状态。
+
+ORM ↔ Application Port：
+
+```text
+AttackTechniqueRow   ↔   application.ports.knowledge.AttackTechniqueRecord
+
+mapper: technique_to_row / row_to_technique
+```
+
+为同一个 technique 生成的 MITRE KnowledgeDocument 与之**相关但不是同一个权威**：document 是检索内容，
+本行是 technique 记录。
+
+---
+
+## 28.9 `attack_release_projection`
+
+一个 release 的 technique 与它 staged 的那个不可变 knowledge document version 之间的绑定。
+
+```text
+id UUID PK
+framework VARCHAR(32) NOT NULL
+source_release VARCHAR(32) NOT NULL
+technique_id VARCHAR(32) NOT NULL
+document_id UUID NOT NULL FK
+document_version_id UUID NOT NULL FK
+content_hash CHAR(64) NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+```
+
+约束：
+
+```text
+CHECK (content_hash ~ '^[0-9a-f]{64}$')
+
+UNIQUE(framework, source_release, technique_id)
+UNIQUE(framework, source_release, document_id)
+
+FK (framework, source_release)                REFERENCES attack_release           ON DELETE RESTRICT
+FK (framework, technique_id, source_release)  REFERENCES attack_technique          ON DELETE RESTRICT
+FK (document_id)                              REFERENCES knowledge_document        ON DELETE RESTRICT
+FK (document_version_id)                      REFERENCES knowledge_document_version ON DELETE RESTRICT
+```
+
+主要索引：
+
+```text
+(document_id)
+```
+
+release identity 与 knowledge content identity 是两个不同的事实：两个 release 可以携带逐字节相同的
+technique 内容，因而共用同一个 `knowledge_document_version`，而 `source_version` 只记录哪个 release
+**创建**了那一行。没有这条显式绑定时，没有任何事实能说"v15.1 对 T1110 的投影**就是**这个 version"，
+于是重新激活 v14.1 无法恢复它自己的投影，一个 staged 的 release 可以改变检索所服务的内容。
+
+绑定在 **stage** 时写入并永不重新推导，所以重新激活一个更旧的 release 恢复的是那个 release staged 的
+version，而不是"按当前匹配内容重建"出来的 version。
+
+本表不授予任何权威：哪个 release 权威由 §28.7 的 `status` 决定，这里只说某个 release 的投影**是**哪个
+version——原子切换把文档指针移到那个 version。
+
+ORM ↔ Application Port：
+
+```text
+AttackReleaseProjectionRow   ↔   application.ports.knowledge.AttackReleaseProjectionRecord
+
+mapper: row_to_projection / projection_values
+```
+
+绑定以数据库为权威，永不从内容反推。
+
+---
+
+## 28.10 `knowledge_chunk`
+
+**pre-closure 遗留表**。`knowledge_chunk` 曾是"一行既是内容又是 embedding"，这正是重新索引会杀死历史
+citation 的原因。`c41f7b2e9d08` 把每一行按**原主键**复制进 §28.5 / §28.6 的拆分对，并**刻意保留**这张表，
+以便 `downgrade` 逐字节放回 closure 之前的行。P3-A 从此不再读写它。
+
+```text
+id UUID PK
+document_id UUID NOT NULL FK
+document_version_id UUID NOT NULL FK
+ordinal INTEGER NOT NULL
+heading_path TEXT NOT NULL
+content TEXT NOT NULL
+content_hash CHAR(64) NOT NULL
+token_count INTEGER NOT NULL
+language VARCHAR(16) NOT NULL
+chunker_version VARCHAR(64) NOT NULL
+embedding_profile_id UUID NOT NULL FK
+embedding VECTOR NOT NULL
+lexical_document TSVECTOR GENERATED ALWAYS AS
+    (to_tsvector('simple', coalesce(heading_path,'') || ' ' || content)) STORED NOT NULL
+created_at TIMESTAMPTZ NOT NULL
+```
+
+约束：
+
+```text
+CHECK (ordinal >= 0)
+CHECK (length(content) > 0)
+CHECK (content_hash ~ '^[0-9a-f]{64}$')
+CHECK (token_count >= 0)
+```
+
+主要索引：
+
+```text
+UNIQUE(document_version_id, ordinal)
+(document_id)
+(document_version_id)
+(embedding_profile_id)
+GIN (lexical_document)
+```
+
+两条保留理由都是承重的。`downgrade -1` 要能逐字节恢复 pre-closure schema，而不是重建可能表达不出来的
+行——一个还没有 embedding 行的 content chunk 没有忠实的 `knowledge_chunk` 形式。以及：一张存在于数据库
+里但不在 ORM metadata 里的表是**永久**的 `alembic check` drift，会掩盖下一次真正的 drift。
+
+ORM：
+
+```text
+KnowledgeChunkRow（声明但无 mapper，也不被任何 P3-A 路径读写）
+```
+
+`knowledge doctor` 报告这张表及其行数，操作者在 catalog 里遇到它时能知道它是被取代的残留，而不是 live schema。
+
+---
+
 ## 29. 明确不创建的表
 
 V1 不建立：
@@ -1415,6 +2010,18 @@ evidence deduplication
 confidence range
 status enum validity
 referential integrity
+one active embedding profile
+unique embedding profile identity
+one active attack release per framework
+unique attack release per framework + source release
+unique knowledge document identity per scope
+knowledge document scope coherence
+unique knowledge document version per document
+knowledge document version deduplication
+unique chunk ordinal per document version + generation
+one embedding per content chunk per profile
+every attack technique belongs to a registered attack release
+every attack release projection binds a registered release, technique and document version
 ```
 
 Domain/Application 层保证：

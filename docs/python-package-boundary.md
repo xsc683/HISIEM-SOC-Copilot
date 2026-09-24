@@ -341,51 +341,37 @@ Agent Package 只负责认知与编排。
 ```text
 agent/
 ├── graph/
-│   ├── state.py
-│   ├── input.py
-│   ├── output.py
+│   ├── budget.py
 │   ├── builder.py
-│   ├── routing.py
-│   └── nodes/
-│       ├── load_investigation.py
-│       ├── hydrate_alert.py
-│       ├── plan.py
-│       ├── decide_next.py
-│       ├── execute_read_tool.py
-│       ├── ingest_evidence.py
-│       ├── assess.py
-│       ├── finalize_result.py
-│       ├── prepare_response.py
-│       ├── request_approval.py
-│       ├── wait_approval.py
-│       ├── load_approval.py
-│       ├── submit_response.py
-│       └── complete.py
+│   ├── nodes.py
+│   ├── runtime.py
+│   ├── state.py
+│   └── tool_audit.py
 │
 ├── llm/
-│   ├── provider.py
-│   ├── request.py
-│   ├── result.py
-│   └── structured.py
+│   └── __init__.py
 │
 ├── tools/
-│   ├── definition.py
-│   ├── registry.py
+│   ├── args.py
 │   ├── executor.py
-│   └── policy.py
+│   ├── native_provider.py
+│   ├── policy.py
+│   ├── provider_router.py
+│   ├── providers.py
+│   └── registry.py
 │
 ├── evidence/
-│   ├── normalizer.py
-│   └── dedup.py
+│   └── normalizer.py
 │
-├── prompts/
-│   ├── planning.py
-│   ├── investigation.py
-│   ├── assessment.py
-│   └── result.py
+├── knowledge/
+│   └── catalog.py
 │
-└── errors.py
+└── prompts/
+    └── __init__.py
 ```
+
+`llm/` 与 `prompts/` 当前只含包标记 `__init__.py`（分别为 Model Provider Protocol 边界与空命名空间占位），
+其余子包均列出其中的模块文件，与其它章节的树保持一致（不列各包的 `__init__.py`）。
 
 ---
 
