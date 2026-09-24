@@ -105,15 +105,22 @@ hisiem.get_alert_context
 V1 Allowlist：
 
 ```text
+已注册——模型实际可选（4 个）
 hisiem.search_events
-hisiem.get_entity_activity
 hisiem.get_detection_rule
-threat_intel.lookup_ip
 knowledge.retrieve_security_guidance
 knowledge.resolve_attack_technique
+
+规格中但未实现——未注册，模型不可选（2 个）
+hisiem.get_entity_activity
+threat_intel.lookup_ip
 ```
 
 未注册名称全部拒绝。
+
+> **为什么把上面 6 个分成两组**：`agent/tools/registry.py:35-42` 的 `AGENT_SELECTABLE_TOOLS` **只有 4 个**；`get_entity_activity` 与 `lookup_ip` 在 `FUTURE_CATALOG_TOOLS`（`:46-51`），该文件 docstring 明写它们是 *「Spec-defined but NOT-yet-implemented … they are NOT registered, so the model can never select a tool with no executor, schema, or policy backing it」*。
+>
+> 因此**模型可达面是 4 个，不是 6 个**——这与根 `README.md` §7「exactly four tools（有架构测试断言）」一致。本文之前把它们并列在同一个 Allowlist 里，与同一节末尾「未注册名称全部拒绝」自相矛盾；**审计模型可达面时以 4 个为准**。
 
 ---
 
