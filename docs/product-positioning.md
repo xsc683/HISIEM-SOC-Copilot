@@ -342,55 +342,21 @@ Agent 可以调查、建议和解释，高风险安全响应必须保留人工�
        HISIEM SOAR
 ```
 
-## 12. V1 Non-goals
+## 12. V1 不解决什么
 
-V1 明确不解决：
+**权威清单在 [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) §19「V1 Out of Scope」**——那份清单归它维护，本文不再维护第二份。
 
-- 通用安全知识问答。
-- 完整 Threat Hunting 平台。
-- 自动漏洞扫描。
-- 自动 Malware Analysis。
-- 自主攻击测试。
-- 自动关闭所有 Alert。
-- 全自动 Incident Response。
-- 复杂 Multi-Agent SOC。
-- 跨多个 SIEM 产品适配。
-- 替代 HISIEM Case Management。
-- 替代 HISIEM SOAR。
+这里只保留一条**定位级判据**：
 
-如果一个功能不能直接帮助完成 **Alert → Investigation → Evidence → Verdict → Response** 闭环，则默认不进入 V1。
+> 如果一个功能不能直接帮助完成 **Alert → Investigation → Evidence → Verdict → Response** 闭环，则默认不进入 V1。
 
-## 13. V1 成功标准
+据此排除的方向（方向性示例，完整清单见上链）：把产品做成通用安全问答或威胁狩猎平台、把结论建立在未经验证的自动化之上、或让 Agent 自主执行副作用；以及替代 HISIEM 的案件管理与 SOAR——V1 在这些方向上**不承担职责**，只与它们分工。
 
-V1 是否完成，不以页面数量、模型数量或代码量判断，而以是否能够完成以下真实闭环判断：
+## 13. 什么算完成
 
-```text
-HISIEM creates alert
-        ↓
-SOC Copilot receives alert reference
-        ↓
-Agent independently retrieves alert context
-        ↓
-Agent plans investigation
-        ↓
-Agent calls multiple tools
-        ↓
-Agent obtains Evidence
-        ↓
-Agent retrieves relevant security knowledge
-        ↓
-Agent updates and verifies hypothesis
-        ↓
-Agent generates Evidence-grounded Verdict
-        ↓
-Agent proposes response
-        ↓
-High-risk action requires human approval
-        ↓
-Approved action can be delegated to SOAR
-        ↓
-Full process is traceable and evaluable
-```
+**可判定的验收清单在 [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) §22「V1 Definition of Done」**（18 条条件）——那份清单归它维护。
+
+定位层面的判据只有一句：V1 的完成**不以页面数量、模型数量或代码量判断**，而以「一条真实告警能否被独立调查、得出有证据支撑的结论、并在人工授权后交由 HISIEM 执行，且全程可追溯、可复现」判断。
 
 ## 14. 产品差异化原则
 
