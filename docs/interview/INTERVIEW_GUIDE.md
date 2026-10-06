@@ -388,7 +388,7 @@ chunks were mutable, a citation would silently point at different text after a r
 **Trade-off.** Immutability means storage grows with rebuilds; the benefit is that a citation
 is a stable reference.
 
-**Reference.** `docs/p3/knowledge-domain.md`, `domain/knowledge/`.
+**Reference.** `docs/knowledge/domain.md`, `domain/knowledge/`.
 
 **Follow-up:** *"Why does the ATT&CK projection need single-writer cutover?"* → Because
 serving an ATT&CK hit is a claim about an authoritative release. If ordinary ingestion could
@@ -418,8 +418,8 @@ is enough at this scale and avoids a second truth store and a second operational
 so the hybrid evaluation proves wiring, not quality. Artifacts are labelled `PLUMBING_ONLY`.
 State this before being asked.
 
-**Reference.** `application/services/knowledge_retrieval.py`, `docs/p3/retrieval-contract.md`,
-`docs/p3/evaluation-contract.md`.
+**Reference.** `application/services/knowledge_retrieval.py`, `docs/knowledge/retrieval-contract.md`,
+`docs/evaluation/knowledge-evaluation-contract.md`.
 
 **Follow-up:** *"Why RRF rather than weighted score fusion?"* → Weighted fusion needs scores
 from different scales to be comparable, which for BM25 vs. cosine is a calibration problem
@@ -466,7 +466,7 @@ than quietly widening what retrieval can express.
 **Trade-off.** A knowledge-only investigation cannot reach a definitive verdict — correct, but
 it means the system must be able to say "I can't conclude" (`INCONCLUSIVE`).
 
-**Reference.** gate `KNOWLEDGE_ONLY_DEFINITIVE_VERDICT`, `docs/p3/security-boundary.md`.
+**Reference.** gate `KNOWLEDGE_ONLY_DEFINITIVE_VERDICT`, `docs/knowledge/security-boundary.md`.
 
 **Follow-up:** *"How does the workspace show this?"* → The frontend derives an authority class
 from the persisted source type and renders knowledge with a different label — and the
@@ -597,7 +597,7 @@ that resolves.
 trade. Content-based detection is not attempted.
 
 **Reference.** gates `FORBIDDEN_FACTS_ABSENT` in `XP-SEC-001/002`;
-`docs/p3/security-boundary.md`.
+`docs/knowledge/security-boundary.md`.
 
 **Follow-up:** *"What if the injected content changes the verdict?"* → It can influence a
 verdict — the model is reasoning over that text. What it cannot do is *authorize* anything:
@@ -933,7 +933,7 @@ Fail-closed matters because partial sanitization leaves the forbidden value in p
 correlation is preserved (ids, statuses, durations) without content.
 
 **Reference.** `infrastructure/observability/`, `XP-OBS-002`, `XP-SEC-003` (gate
-`SECRET_LEAK`), and the observability foundation stage report under [`../stage-reports/`](../stage-reports/).
+`SECRET_LEAK`), and the observability foundation stage report under [`../archive/engineering-history/stage-reports/`](../archive/engineering-history/stage-reports/).
 
 **Follow-up:** *"Why fail-closed rather than dropping the bad key?"* → Dropping the key keeps
 the observation but silently discards a field the caller believed was recorded. Rejecting the
@@ -1068,7 +1068,7 @@ recall is a positive signal for *wiring* (the vector channel really calls a prov
 than degrading to lexical) and no signal at all for retrieval quality. Artifacts are labelled
 `PLUMBING_ONLY` and must not be quoted as a semantic baseline.
 
-**Reference.** `docs/p3/evaluation-contract.md`.
+**Reference.** `docs/evaluation/knowledge-evaluation-contract.md`.
 
 **Follow-up:** *"What would it take to close it?"* → Configure a real embedding provider and
 re-run; the harness needs no change. That is the design intent — the fixture is a stand-in,
@@ -1110,7 +1110,7 @@ paragraph.
 without changing this repository's production layers. The invariants were made testable
 without touching the systems under test — which is the part I would emphasize.
 
-**Reference.** [README §12](../../README.md#12-evaluation), `docs/stage-reports/`.
+**Reference.** [README §12](../../README.md#12-evaluation), `docs/archive/engineering-history/stage-reports/`.
 
 ---
 

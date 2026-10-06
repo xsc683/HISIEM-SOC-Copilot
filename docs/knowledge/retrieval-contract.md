@@ -318,7 +318,7 @@ fails explicitly — including one that passes `allow_embedding_profile_switch=T
 There is no partial switch and no single-document cutover in P3-A. The flag is
 retained only so an existing caller receives that diagnosis instead of an
 unrecognised-argument error. See
-[p3-a-operations.md](p3-a-operations.md) §5.
+[p3-a-operations.md](operations.md) §5.
 
 `LEXICAL_ONLY` never needs an embedding provider or a profile, which is why it
 keeps working when the vector channel is unavailable — and why `doctor` reports

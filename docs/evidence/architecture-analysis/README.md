@@ -1,9 +1,9 @@
 # HISIEM-SOC-Copilot 架构与实现分析文档集
 
 > **怎么读本集** —— 本集是**代码级取证层**：不是契约，也不是入门材料。
-> 建议路径：先读 [`../guide/`](../guide/) 建立整体认知 → 再读权威契约 → 想确认「代码真的是这样吗」时再读本集。
+> 建议路径：先读 [`../guide/`](../../guide/) 建立整体认知 → 再读权威契约 → 想确认「代码真的是这样吗」时再读本集。
 > 本集独有的是 **`file:line` 锚点与反直觉的真实形态**。`docs/README.md` 规定「Architecture and persistence documents are authority」——**冲突时以权威契约为准**；而**代码是最终事实**。
-> 完整阅读地图见 [`../guide/04-想深入读哪一篇.md`](../guide/04-想深入读哪一篇.md)。
+> 完整阅读地图见 [`../guide/04-想深入读哪一篇.md`](../../guide/04-想深入读哪一篇.md)。
 >
 > 取证锚点：分支 `capability-mcp` @ `1e567be`。其后全部提交均为文档改动（`git diff --stat 1e567be..HEAD -- '*.py' '*.sql'` 为空），**代码未变**，故本集结论仍然现行。
 
@@ -113,7 +113,7 @@ T="$TEMP/mermaid-check"; mkdir -p "$T" && cd "$T"
 echo '{"name":"mc","private":true,"type":"module"}' > package.json
 npm install --silent --no-audit --no-fund mermaid@11.10.1 jsdom
 node ~/.claude/skills/code-level-architecture-docs/scripts/validate-mermaid.mjs \
-     "D:/Project/HISIEM-SOC-Copilot/docs/architecture-analysis"
+     "D:/Project/HISIEM-SOC-Copilot/docs/evidence/architecture-analysis"
 ```
 
 **分篇块数**：00×5、01×8、02×3、03×4、04×4、05×4、06×4、07×3、08×3 = **38**。

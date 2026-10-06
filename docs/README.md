@@ -31,7 +31,7 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 | [`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md) | Commands, domain events, and how LangGraph state relates to (and is *not*) domain state | 35 KB |
 | [`model-provider-contract.md`](model-provider-contract.md) | The provider contract: bounded invocation, structured output, typed failures, fail-closed behaviour | 14 KB |
 | [`investigation-workspace.md`](investigation-workspace.md) | The analyst workspace projection contract | 9 KB |
-| [`architecture-analysis/README.md`](architecture-analysis/README.md) | **Code-level evidence layer** (9 documents): per-subsystem `file:line` forensics, the counter-intuitive shapes, and the boundaries as they actually are | — |
+| [`evidence/architecture-analysis/README.md`](evidence/architecture-analysis/README.md) | **Code-level evidence layer** (9 documents): per-subsystem `file:line` forensics, the counter-intuitive shapes, and the boundaries as they actually are | — |
 
 > The evidence layer is **not** authority. It answers "is the code really like this?" —
 > the contracts above answer "what must the code be?". When they disagree, the contracts
@@ -53,17 +53,17 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 | Document | Read it for |
 |---|---|
-| [`p3/knowledge-domain.md`](p3/knowledge-domain.md) | The knowledge domain: documents, versions, immutable content chunks |
-| [`p3/retrieval-contract.md`](p3/retrieval-contract.md) | The typed retrieval surface: queries, hits, ranking, the mandatory tenant scope |
-| [`p3/security-boundary.md`](p3/security-boundary.md) | The knowledge security boundary and the model-reachable surface |
-| [`p3/evaluation-contract.md`](p3/evaluation-contract.md) | The `KB-GOLDEN-V1` baseline: corpus, modes, scoring, preconditions |
-| [`p3/p3-a-operations.md`](p3/p3-a-operations.md) | Operator procedure: provisioning, pgvector, ingest, search, evaluation |
+| [`knowledge/domain.md`](knowledge/domain.md) | The knowledge domain: documents, versions, immutable content chunks |
+| [`knowledge/retrieval-contract.md`](knowledge/retrieval-contract.md) | The typed retrieval surface: queries, hits, ranking, the mandatory tenant scope |
+| [`knowledge/security-boundary.md`](knowledge/security-boundary.md) | The knowledge security boundary and the model-reachable surface |
+| [`evaluation/knowledge-evaluation-contract.md`](evaluation/knowledge-evaluation-contract.md) | The `KB-GOLDEN-V1` baseline: corpus, modes, scoring, preconditions |
+| [`knowledge/operations.md`](knowledge/operations.md) | Operator procedure: provisioning, pgvector, ingest, search, evaluation |
 
 > **Read the honest gap first:** no embedding provider is configured in this repository, so
 > the semantic half of the hybrid gate has never been exercised. What the hybrid evaluation
 > proves is *wiring* — fusion, ranking, tie-breaking, citation resolution and scoring — not
 > retrieval quality. Artifacts are labelled `PLUMBING_ONLY`.
-> See [`p3/evaluation-contract.md`](p3/evaluation-contract.md).
+> See [`evaluation/knowledge-evaluation-contract.md`](evaluation/knowledge-evaluation-contract.md).
 
 ---
 
@@ -100,11 +100,11 @@ the collector mid-run produces an identical persisted business outcome.
 | [`evaluation/gp-01-dataset-materializer.md`](evaluation/gp-01-dataset-materializer.md) | How the GP-01 scenario becomes real HISIEM resources |
 | [`evaluation/gp-01-manifest-sealer.md`](evaluation/gp-01-manifest-sealer.md) | Manifest sealing — the pinned, reproducible evaluation input |
 | [`evaluation/evaluation-closure-contract.md`](evaluation/evaluation-closure-contract.md) | The closure: deterministic scorer, bounded repeatability, suite aggregation |
-| [`p3/evaluation-contract.md`](p3/evaluation-contract.md) | `KB-GOLDEN-V1` — the knowledge baseline |
+| [`evaluation/knowledge-evaluation-contract.md`](evaluation/knowledge-evaluation-contract.md) | `KB-GOLDEN-V1` — the knowledge baseline |
 
 **Cross-plane acceptance (XP-01)** — 29 scenarios, 13 non-compensating hard gates, one
 deterministic aggregate — is described in the [README §12](../README.md#12-evaluation) and
-evidenced in [`stage-reports/`](stage-reports/).
+evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/).
 
 ---
 
@@ -120,12 +120,12 @@ evidenced in [`stage-reports/`](stage-reports/).
 
 | Document | Read it for |
 |---|---|
-| [`stage-contracts/README.md`](stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
-| [`stage-reports/index.md`](stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
-| [`stage-reports/`](stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
+| [`archive/engineering-history/stage-contracts/README.md`](archive/engineering-history/stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
+| [`archive/engineering-history/stage-reports/index.md`](archive/engineering-history/stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
+| [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
 
 > Stage terminology is internal engineering history, not the product model. Read it for the
-> evidence behind a claim, not as an introduction. The same applies to `stage-contracts/`:
+> evidence behind a claim, not as an introduction. The same applies to the archived specs:
 > where its frozen 2026-09-14 baseline disagrees with the code, **the code wins**.
 
 ---

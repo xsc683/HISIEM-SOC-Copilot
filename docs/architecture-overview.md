@@ -396,8 +396,8 @@ flowchart LR
 | Layer boundaries and their enforcement | [`python-package-boundary.md`](python-package-boundary.md) |
 | Tool contract | [`investigation-tool-contract.md`](investigation-tool-contract.md) |
 | Model provider contract | [`model-provider-contract.md`](model-provider-contract.md) |
-| Knowledge plane | [`p3/`](p3/) |
+| Knowledge plane | [`knowledge/`](knowledge/) |
 | Evaluation contracts | [`evaluation/`](evaluation/) |
 | Observability | [`observability.md`](observability.md) |
 | Local integrated runtime | [`local-integrated-runtime.md`](local-integrated-runtime.md) |
-| Engineering process and acceptance evidence | [`stage-reports/`](stage-reports/) |
+| Engineering process and acceptance evidence | [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/) |

@@ -184,7 +184,7 @@ this closure:
 knowledge doctor: NOT_READY
   database: postgresql+psycopg://copilot:***@127.0.0.1:5433/copilot
   [OK] database: connected
-  [FAIL] vector_extension: the vector extension is not installed in this database; see docs/p3/p3-a-operations.md for the one-time prerequisite
+  [FAIL] vector_extension: the vector extension is not installed in this database; see docs/knowledge/operations.md for the one-time prerequisite
   [FAIL] knowledge_schema: missing tables: attack_release, attack_technique, embedding_profile, knowledge_chunk_embedding, knowledge_content_chunk, knowledge_document, knowledge_document_version (run: alembic upgrade head)
   [FAIL] active_embedding_profile: not checked: the knowledge schema is missing (run: alembic upgrade head)
   [WARN] embedding_provider: no embedding provider configured (EMBEDDING_PROVIDER=unconfigured): lexical retrieval only
@@ -902,7 +902,7 @@ expect this line among the corpus progress lines:
 `--skip-ingest` is the stronger form: it reuses the corpus already in the
 database and ingests nothing at all.
 
-See [evaluation-contract.md](evaluation-contract.md) for the metrics, the gate
+See [evaluation-contract.md](../evaluation/knowledge-evaluation-contract.md) for the metrics, the gate
 rule, and the artifact schema.
 
 ## 12. Verifying the deployment

@@ -31,7 +31,8 @@ Stage C and D may overlap only after the relevant frozen contracts are stable an
 
 > **The list above was incomplete as inherited.** This README originally listed only six
 > files: it omitted `06_Stage-E_Detailed_Design.md` and the eight `execution-prompts/` files
-> it shipped alongside. `06` is now listed above; the prompts are linked below.
+> it shipped alongside. `06` is now listed above. The eight prompts were deleted in the
+> 2026-10-06 documentation-architecture pass — see the note at the end of this file.
 
 ---
 
@@ -47,37 +48,25 @@ yet anyone cloning this repository could not open a single one of them.
 They now live here, so the record's **inputs and outputs sit in the same repository**:
 
 ```text
-docs/stage-contracts/                          ← 输入：specified what to build
+docs/archive/engineering-history/stage-contracts/   ← 输入：specified what to build
 ├── 00_Four-Plane_Architecture_Contract_Freeze.md    (FROZEN BASELINE v1.0, 2026-09-14)
 ├── 01 … 05   Stage A–E implementation specs
-├── 06_Stage-E_Detailed_Design.md
-└── execution-prompts/                          ← 输入：how it was executed
-    ├── Stage-E_E0_Current-State_Gap-Audit_VibeCoding_Prompt.md
-    ├── Stage-E_E1_XP01-Contract-Gate-Model_VibeCoding_Prompt.md
-    ├── Stage-E_E2_Knowledge-Capability-Security_VibeCoding_Prompt.md
-    ├── Stage-E_E3_Authority-Reliability_VibeCoding_Prompt.md
-    ├── Stage-E_E4_Observability-Acceptance_VibeCoding_Prompt.md
-    ├── Stage-E_E5-E7_Finalization_VibeCoding_Prompt_Commit-Push.md
-    ├── HISIEM_Copilot_Full_Runtime_E2E_ClaudeCode_Prompt.md
-    └── FULL_RUNTIME_E2E_TEST_REPORT_TEMPLATE.md
+└── 06_Stage-E_Detailed_Design.md
 
-docs/stage-reports/                            ← 输出：what was built, run and passed
+docs/archive/engineering-history/stage-reports/      ← 输出：what was built, run and passed
 ```
-
-The eight prompts in full:
-
-- [`Stage-E_E0_Current-State_Gap-Audit_VibeCoding_Prompt.md`](execution-prompts/Stage-E_E0_Current-State_Gap-Audit_VibeCoding_Prompt.md)
-- [`Stage-E_E1_XP01-Contract-Gate-Model_VibeCoding_Prompt.md`](execution-prompts/Stage-E_E1_XP01-Contract-Gate-Model_VibeCoding_Prompt.md)
-- [`Stage-E_E2_Knowledge-Capability-Security_VibeCoding_Prompt.md`](execution-prompts/Stage-E_E2_Knowledge-Capability-Security_VibeCoding_Prompt.md)
-- [`Stage-E_E3_Authority-Reliability_VibeCoding_Prompt.md`](execution-prompts/Stage-E_E3_Authority-Reliability_VibeCoding_Prompt.md)
-- [`Stage-E_E4_Observability-Acceptance_VibeCoding_Prompt.md`](execution-prompts/Stage-E_E4_Observability-Acceptance_VibeCoding_Prompt.md)
-- [`Stage-E_E5-E7_Finalization_VibeCoding_Prompt_Commit-Push.md`](execution-prompts/Stage-E_E5-E7_Finalization_VibeCoding_Prompt_Commit-Push.md)
-- [`HISIEM_Copilot_Full_Runtime_E2E_ClaudeCode_Prompt.md`](execution-prompts/HISIEM_Copilot_Full_Runtime_E2E_ClaudeCode_Prompt.md)
-- [`FULL_RUNTIME_E2E_TEST_REPORT_TEMPLATE.md`](execution-prompts/FULL_RUNTIME_E2E_TEST_REPORT_TEMPLATE.md)
 
 **Move history** — 2026-09-23, per documentation-governance decision. File contents are
 **byte-identical** to the originals (verified by hash); only this README and the two path
 references (`stage-reports/STAGE_E_E0`, the SIEM UX brief) were updated.
+
+**The eight execution prompts were deleted** — 2026-10-06, documentation-architecture pass.
+They were one-time execution instructions to a coding agent, not specifications or design
+records: their outcome is what `../stage-reports/` measures and records. They also still
+pointed at `D:\Project\four-plane\`, a directory that stopped existing when the frozen
+inputs were moved into this repository on 2026-09-23. Keeping them would have preserved a
+set of instructions whose paths no longer resolve and whose work is already accounted for.
+The reports they produced remain the traceable record.
 
 ## Status: frozen engineering history, not the product model
 

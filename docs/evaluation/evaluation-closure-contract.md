@@ -5,7 +5,7 @@
 > and **E1-C6** (suite aggregation). Those codes are engineering-history labels; this
 > document names each piece by what it does, and shows a code only where it is the
 > provenance of a concrete artifact. For the numbering systems themselves see
-> [`../architecture-analysis/08-评估体系.md`](../architecture-analysis/08-评估体系.md).
+> [`../evidence/architecture-analysis/08-评估体系.md`](../evidence/architecture-analysis/08-评估体系.md).
 
 ## 1. Scope
 

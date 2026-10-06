@@ -178,6 +178,6 @@ REQUIRE_APPROVAL   → 人工决定
 - ⬅️ 想看这些边界在时间轴上的位置：读 [`02-一次调查的完整旅程.md`](02-一次调查的完整旅程.md) 第 6、11、12、13 步。
 - ➡️ 想按主题找到权威契约：读 [`04-想深入读哪一篇.md`](04-想深入读哪一篇.md)。
 - 📖 工具面的权威规矩：`docs/investigation-tool-contract.md` §3（风险边界）、§4（工具分类）、§30（明确禁止的工具）；根 `README.md` §7（工具 / MCP 治理）。
-- 📖 知识边界：`docs/p3/security-boundary.md`（每条声明都有对应测试文件）；根 `README.md` §8。
+- 📖 知识边界：`docs/knowledge/security-boundary.md`（每条声明都有对应测试文件）；根 `README.md` §8。
 - 📖 租户与安全边界总表：根 `README.md` §13；工作区信任边界：`docs/investigation-workspace.md` §2。
 - 📖 权限与审批的对象定义：`docs/domain-model.md` §25（策略取值）、§26–§27（审批请求与决策）。本节提到的「九条区分」在根 `README.md` §5。

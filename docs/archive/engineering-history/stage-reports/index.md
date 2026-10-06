@@ -6,8 +6,8 @@ what was run, what passed, and what was left open.
 
 > **Stage terminology is internal engineering history, not the product model.**
 > If you are new to this repository, start with the
-> [README](../../README.md) and
-> [`docs/architecture-overview.md`](../architecture-overview.md). Come back here when you
+> [README](../../../../README.md) and
+> [`docs/architecture-overview.md`](../../../architecture-overview.md). Come back here when you
 > want the evidence behind a specific claim.
 
 ---
@@ -31,7 +31,7 @@ Stage C and Stage D could overlap only once the relevant frozen contracts were s
 shared boundaries had single ownership.
 
 **Stage E** is the one that produced the cross-plane acceptance pack described in the
-[README §12](../../README.md#12-evaluation): 29 scenarios, 13 non-compensating hard gates,
+[README §12](../../../../README.md#12-evaluation): 29 scenarios, 13 non-compensating hard gates,
 9 families, aggregated into one deterministic `cross-plane-suite-results/v1` artifact. It
 was implemented without changing any HISIEM production code and without changing this
 repository's production layers — the invariants were made testable *without* touching the
@@ -101,10 +101,10 @@ each has a stated justification.
 ## Scope note
 
 These reports describe the **engineering process**. The product architecture is described in
-the [README](../../README.md) and
-[`docs/architecture-overview.md`](../architecture-overview.md); the domain and persistence
-contracts are in [`docs/domain-model.md`](../domain-model.md) and
-[`docs/persistence-schema.md`](../persistence-schema.md).
+the [README](../../../../README.md) and
+[`docs/architecture-overview.md`](../../../architecture-overview.md); the domain and persistence
+contracts are in [`docs/domain-model.md`](../../../domain-model.md) and
+[`docs/persistence-schema.md`](../../../persistence-schema.md).
 
 **What these reports were written against** — the frozen Four-Plane contract, the Stage A–E
 implementation specs and the execution prompts these reports' predecessors were given — is

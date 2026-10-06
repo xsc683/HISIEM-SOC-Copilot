@@ -264,7 +264,7 @@ reproducible and testable without a database.
 > hybrid evaluation therefore proves that fusion, ranking, tie-breaking, citation
 > resolution and scoring are wired correctly end to end — it does **not** establish
 > semantic retrieval quality. That gap is documented and labelled `PLUMBING_ONLY` in
-> [`docs/p3/evaluation-contract.md`](docs/p3/evaluation-contract.md).
+> [`docs/evaluation/knowledge-evaluation-contract.md`](docs/evaluation/knowledge-evaluation-contract.md).
 
 ---
 
@@ -600,11 +600,11 @@ None of these is blocking, and none is hidden — each is recorded with its just
 | Package/layer boundaries | [`docs/python-package-boundary.md`](docs/python-package-boundary.md) |
 | Tool contract | [`docs/investigation-tool-contract.md`](docs/investigation-tool-contract.md) |
 | Model provider contract | [`docs/model-provider-contract.md`](docs/model-provider-contract.md) |
-| Knowledge plane (P3) | [`docs/p3/`](docs/p3/) |
+| Knowledge plane | [`docs/knowledge/`](docs/knowledge/) |
 | Evaluation contracts | [`docs/evaluation/`](docs/evaluation/) |
 | Observability | [`docs/observability.md`](docs/observability.md) |
 | Local integrated runtime | [`docs/local-integrated-runtime.md`](docs/local-integrated-runtime.md) |
-| Engineering process & acceptance history | [`docs/stage-reports/`](docs/stage-reports/) |
+| Engineering process & acceptance history | [`docs/archive/engineering-history/stage-reports/`](docs/archive/engineering-history/stage-reports/) |
 | Interview review material | [`docs/interview/INTERVIEW_GUIDE.md`](docs/interview/INTERVIEW_GUIDE.md) |
 
 **On Stage A–E.** The engineering process was organised into stages (A through E), and the
@@ -652,4 +652,4 @@ python -m hisiem_soc_copilot.main
 Full local bring-up, including the HISIEM side and the two-process worker topology, is in
 [`docs/local-integrated-runtime.md`](docs/local-integrated-runtime.md). Knowledge subsystem
 operations (provisioning, ingest, search, evaluation) are in
-[`docs/p3/p3-a-operations.md`](docs/p3/p3-a-operations.md).
+[`docs/knowledge/operations.md`](docs/knowledge/operations.md).
