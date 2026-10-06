@@ -23,7 +23,6 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 | [`guide/`](guide/) | project-first introduction | you are new to the project |
 | [`evidence/`](evidence/) | **code-level forensics**: every claim carries a `file:line` | you want to check "is the code really like this?" |
 | [`interview/`](interview/) | interview review material | — |
-| [`archive/`](archive/) | history, **not on the default reading path** | only when tracing something back |
 
 ## Start here
 
@@ -33,7 +32,7 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 | [`architecture-overview.md`](status/architecture-overview.md) | The visual model — investigation/authority chain, tool & evidence path, MCP admission, knowledge path, durable execution, truth boundaries, evaluation, cross-repository boundary | 8 figures |
 | [`architecture-diagrams.md`](status/architecture-diagrams.md) | The two canonical full-size diagrams — plane-oriented architecture graph, and the end-to-end investigation data flow | 2 diagrams |
 | [`product-positioning.md`](status/product-positioning.md) | What the product is and is not; target users and boundaries *(Chinese)* | 11 KB |
-| [`v1-user-flow-and-scope.md`](contracts/v1-user-flow-and-scope.md) | The user journey and what was in scope | 18 KB |
+| [`product-scope.md`](contracts/product-scope.md) | The user journey, scope and non-goals, and the definition of done | 17 KB |
 | [`interview/INTERVIEW_GUIDE.md`](interview/INTERVIEW_GUIDE.md) | Review material: from a 30-second introduction down to deep follow-ups | large |
 
 ---
@@ -119,7 +118,7 @@ the collector mid-run produces an identical persisted business outcome.
 
 **Cross-plane acceptance (XP-01)** — 29 scenarios, 13 non-compensating hard gates, one
 deterministic aggregate — is described in the [README §12](../README.md#12-evaluation) and
-evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/).
+evidenced by the gates themselves in `tests/`.
 
 ---
 
@@ -131,17 +130,18 @@ evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-
 
 ---
 
-## Stage & Engineering History
+## Engineering History
 
-| Document | Read it for |
-|---|---|
-| [`archive/engineering-history/stage-contracts/README.md`](archive/engineering-history/stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](status/architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
-| [`archive/engineering-history/stage-reports/index.md`](archive/engineering-history/stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
-| [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
+The engineering-process record — stage specs, acceptance reports, execution prompts — was
+**deleted on 2026-10-06**. It recorded how the work was sequenced (what was tried, in what
+order, what passed), not the designs themselves, and had no independent reader value.
+Nothing was lost: the current rules are in `contracts/`, the current state and risks are in
+`status/`, and the acceptance evidence is the gates themselves in `tests/`. Use git when you
+need a historical version.
 
-> Stage terminology is internal engineering history, not the product model. Read it for the
-> evidence behind a claim, not as an introduction. The same applies to the archived specs:
-> where its frozen 2026-09-14 baseline disagrees with the code, **the code wins**.
+Stage terminology ("Stage A–E", "E1-C2") therefore no longer appears anywhere in this
+documentation; if you meet it in code comments, it is internal engineering history, not the
+product model.
 
 ---
 

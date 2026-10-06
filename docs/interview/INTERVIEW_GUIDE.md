@@ -933,7 +933,7 @@ Fail-closed matters because partial sanitization leaves the forbidden value in p
 correlation is preserved (ids, statuses, durations) without content.
 
 **Reference.** `infrastructure/observability/`, `XP-OBS-002`, `XP-SEC-003` (gate
-`SECRET_LEAK`), and the observability foundation stage report under [`../archive/engineering-history/stage-reports/`](../archive/engineering-history/stage-reports/).
+`SECRET_LEAK`), and `tests/`.
 
 **Follow-up:** *"Why fail-closed rather than dropping the bad key?"* → Dropping the key keeps
 the observation but silently discards a field the caller believed was recorded. Rejecting the
@@ -1110,7 +1110,7 @@ paragraph.
 without changing this repository's production layers. The invariants were made testable
 without touching the systems under test — which is the part I would emphasize.
 
-**Reference.** [README §12](../../README.md#12-evaluation), `docs/archive/engineering-history/stage-reports/`.
+**Reference.** [README §12](../../README.md#12-evaluation), `docs/evaluation/`.
 
 ---
 

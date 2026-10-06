@@ -604,7 +604,6 @@ None of these is blocking, and none is hidden — each is recorded with its just
 | Evaluation contracts | [`docs/evaluation/`](docs/evaluation/) |
 | Observability | [`docs/contracts/observability.md`](docs/contracts/observability.md) |
 | Local integrated runtime | [`docs/operations/local-integrated-runtime.md`](docs/operations/local-integrated-runtime.md) |
-| Engineering process & acceptance history | [`docs/archive/engineering-history/stage-reports/`](docs/archive/engineering-history/stage-reports/) |
 | Interview review material | [`docs/interview/INTERVIEW_GUIDE.md`](docs/interview/INTERVIEW_GUIDE.md) |
 
 **On Stage A–E.** The engineering process was organised into stages (A through E), and the

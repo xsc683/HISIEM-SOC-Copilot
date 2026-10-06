@@ -7,7 +7,7 @@
 本文建立在以下规范之上：
 
 - `product-positioning.md`
-- `v1-user-flow-and-scope.md`
+- `product-scope.md`
 - `domain-model.md`
 - `persistence-schema.md`
 - `python-package-boundary.md`

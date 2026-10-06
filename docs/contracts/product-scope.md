@@ -1,4 +1,4 @@
-# HISIEM SOC Copilot — V1 核心用户流程与功能边界
+# HISIEM SOC Copilot — 核心用户流程与功能边界
 
 ## 1. 文档目的
 
@@ -6,7 +6,7 @@
 
 本文作为后续领域模型、API 契约、交互设计和系统架构的产品基线。
 
-## 2. V1 核心业务目标
+## 2. 核心业务目标
 
 V1 仅解决一个完整业务场景：**Security Alert Investigation**。
 
@@ -115,7 +115,7 @@ SOAR 负责执行确定性的安全响应流程。
 
 SOC Copilot 不替代 SOAR 执行引擎。
 
-## 4. V1 主入口
+## 4. 主入口
 
 V1 唯一主入口：
 
@@ -330,7 +330,7 @@ Response Proposal 必须引用支持其必要性的 Evidence。
 
 浏览器提交只接受有界提案契约：`action_key`、`evidence_ids`、`parameters`、`reason`；执行目标由服务端依据已持久化的 Investigation source-alert reference 推导，浏览器不得提交 `provider` / `resource_type` / `address_id` / `business_id` / `tenant_id` / `actor` 等越界字段；越界字段必须显式拒绝（HISIEM BFF 返回 400，Copilot 返回 422），不得静默丢弃。SOAR Playbook 只能从已发布且启用的 Playbook 下拉列表中选择，不接受自由文本。
 
-## 9. V1 响应安全边界
+## 9. 响应安全边界
 
 V1 固定规则：
 
@@ -552,7 +552,7 @@ Result
 
 Proposal 处于 `APPROVED` 且执行引用为空时，响应区域只展示「已批准 / 等待提交」；此时不得展示任何外部执行编号，也不得用 `proposal_id` 顶替执行编号（执行引用只在 HISIEM 返回真实非空 execution id 之后才存在）。
 
-## 17. V1 用户操作
+## 17. 用户操作
 
 ```text
 Start Investigation
@@ -569,7 +569,7 @@ Reject Response
 View Response Execution
 ```
 
-## 18. V1 In Scope
+## 18. In Scope
 
 ### Investigation
 
@@ -664,7 +664,7 @@ investigation cancelled
 investigation failed
 ```
 
-## 19. V1 Out of Scope
+## 19. Out of Scope
 
 ```text
 General Chat
@@ -702,7 +702,7 @@ Complex Multi-Agent SOC
 - Approval Reject：不执行 Side Effect，Investigation Result 保留。
 - SOAR Failure：Investigation 仍可 `COMPLETED`，Response Execution 单独记录 `FAILED`。
 
-## 21. V1 代表性验收场景
+## 21. 代表性验收场景
 
 首个端到端代表性场景：
 
@@ -758,7 +758,7 @@ Evidence 在哪里？
 SOAR 最终执行结果是什么？
 ```
 
-## 22. V1 Definition of Done
+## 22. Definition of Done
 
 V1 只有同时满足以下条件才视为完成：
 
@@ -781,7 +781,7 @@ V1 只有同时满足以下条件才视为完成：
 17. SSH Brute Force → Account Compromise 场景能够端到端运行。
 18. 整个闭环能够被审计和复现。
 
-## 23. V1 核心约束
+## 23. 核心约束
 
 ```text
 Investigate

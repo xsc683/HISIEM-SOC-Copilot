@@ -400,4 +400,3 @@ flowchart LR
 | Evaluation contracts | [`evaluation/`](../evaluation/) |
 | Observability | [`observability.md`](../contracts/observability.md) |
 | Local integrated runtime | [`local-integrated-runtime.md`](../operations/local-integrated-runtime.md) |
-| Engineering process and acceptance evidence | [`archive/engineering-history/stage-reports/`](../archive/engineering-history/stage-reports/) |
