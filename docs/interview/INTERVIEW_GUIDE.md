@@ -153,8 +153,8 @@ response progress and make "reopen the proposal" mutate a closed investigation.
 **Trade-off.** Two lifecycles means two things to reason about, and the workspace has to
 compose them. That composition is exactly what the workspace projection does.
 
-**Reference.** `domain/investigation/`, `domain/response/`, `docs/domain-model.md`,
-`docs/persistence-schema.md`.
+**Reference.** `domain/investigation/`, `domain/response/`, `docs/contracts/domain-model.md`,
+`docs/contracts/persistence-schema.md`.
 
 **Follow-up:** *"How do you prevent two concurrent starts for the same alert?"* → The partial
 unique index; the second insert fails and the handler returns the existing investigation.
@@ -178,7 +178,7 @@ transport-coupled.
 ORM. The return is that the persistence model and the domain model can evolve independently
 (e.g. a `jsonb` column shape is not the aggregate shape).
 
-**Reference.** `docs/domain-model.md`, `docs/python-package-boundary.md`,
+**Reference.** `docs/contracts/domain-model.md`, `docs/contracts/python-package-boundary.md`,
 `tests/architecture/test_import_boundaries.py`.
 
 **Follow-up:** *"How is purity actually enforced?"* → An architecture test walks imports and
@@ -204,7 +204,7 @@ whatever the domain aggregates persisted.
 **Trade-off.** Resuming a graph requires re-deriving domain context rather than reading it out
 of the checkpoint — slightly more work at resume, in exchange for a single truth source.
 
-**Reference.** `agent/graph/`, `docs/application-commands-domain-events-langgraph-state.md`.
+**Reference.** `agent/graph/`, `docs/contracts/application-commands-domain-events-langgraph-state.md`.
 
 **Follow-up:** *"What if the checkpoint and the domain disagree?"* → The domain wins. The
 checkpoint is working memory; it influences what the graph does next, not what the
@@ -368,7 +368,7 @@ from an MCP tool and a native tool have the same shape and the same guarantees.
 which is the point, but it means a new source is a deliberate integration rather than a
 passthrough.
 
-**Reference.** `agent/evidence/normalizer.py`, `docs/investigation-tool-contract.md`.
+**Reference.** `agent/evidence/normalizer.py`, `docs/contracts/investigation-tool-contract.md`.
 
 ---
 
@@ -710,7 +710,7 @@ the command a durable fact rather than an in-flight function call.
 **Trade-off.** All the machinery of a dispatcher (leases, retries, dead-lettering) instead of a
 function call.
 
-**Reference.** `infrastructure/durable/`, `docs/application-commands-domain-events-langgraph-state.md`.
+**Reference.** `infrastructure/durable/`, `docs/contracts/application-commands-domain-events-langgraph-state.md`.
 
 ---
 
@@ -902,7 +902,7 @@ pretending to be the same span — which would be a lie about causality.
 **Trade-off.** Two linked traces instead of one continuous trace, which is the honest shape of
 an asynchronous boundary.
 
-**Reference.** `infrastructure/observability/`, `docs/observability.md`, migration
+**Reference.** `infrastructure/observability/`, `docs/contracts/observability.md`, migration
 `b6c2a4d19f30_outbox_trace_context`.
 
 **Follow-up:** *"Why not propagate the parent context directly?"* → Because the worker is not a
@@ -959,7 +959,7 @@ scenario proves the decoupling rather than asserting it.
 **Trade-off.** None worth stating — the whole point is that telemetry is optional by
 construction.
 
-**Reference.** `XP-REL-005`, `docs/observability.md`.
+**Reference.** `XP-REL-005`, `docs/contracts/observability.md`.
 
 **Follow-up:** *"How did you make this testable?"* → By comparing the *persisted business
 outcome* across collector-up and collector-down runs of the same work, in real processes.
@@ -994,7 +994,7 @@ coherent choice — and it is worth stating explicitly, because it looks like an
 **Trade-off.** A cross-repository boundary for one feature. Mitigated by executing the real
 frontend module from the acceptance harness so evaluation and UI cannot drift.
 
-**Reference.** `docs/investigation-workspace.md`, `XP-UX-001`.
+**Reference.** `docs/contracts/investigation-workspace.md`, `XP-UX-001`.
 
 ---
 
@@ -1131,7 +1131,7 @@ failing — which is exactly the property you want on a security-relevant surfac
 **Trade-off.** Architecture tests are occasionally inconvenient when a legitimate dependency
 is needed — which is the point, since it forces the boundary discussion to happen explicitly.
 
-**Reference.** `tests/architecture/`, `docs/python-package-boundary.md`.
+**Reference.** `tests/architecture/`, `docs/contracts/python-package-boundary.md`.
 
 **Follow-up:** *"Give an example of a boundary test catching something."* → The model-selectable
 surface test pins it to exactly four tools, so adding a fifth tool without registering it (or

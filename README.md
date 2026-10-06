@@ -124,7 +124,7 @@ Infrastructure (PostgreSQL, HISIEM HTTP, MCP, LLM, OTel)  ← Bootstrap (composi
 These boundaries are **enforced by tests**, not by convention — `tests/architecture/`
 fails the build if a layer imports something it should not. See [§16](#16-verification).
 
-Visual model: [`docs/architecture-overview.md`](docs/architecture-overview.md).
+Visual model: [`docs/status/architecture-overview.md`](docs/status/architecture-overview.md).
 
 ---
 
@@ -186,7 +186,7 @@ Durable Execution Plane, Human Authority Plane, HISIEM Integration Plane, Evalua
 > The four planes above are the ones this repository **closes**; the frozen contract names
 > **eleven** (the rest are reused, not re-architected), and the acceptance gates classify by
 > that eleven-member `Plane` enum. The two counts are **not a 1:1 mapping** and neither side
-> should be changed to make them agree — see [`docs/architecture-diagrams.md`](docs/architecture-diagrams.md) §1.
+> should be changed to make them agree — see [`docs/status/architecture-diagrams.md`](docs/status/architecture-diagrams.md) §1.
 
 Four global principles govern all of them:
 
@@ -222,7 +222,7 @@ calls it directly and it is never offered to the model.
 Everything normative about this surface — the admission entry's fields, the fail-closed
 rules (unknown server, write capability, unadmitted dynamic tool, schema drift,
 protocol downgrade, tenant), the fixed result-processing order and the typed failure
-categories — belongs to [`docs/investigation-tool-contract.md`](docs/investigation-tool-contract.md)
+categories — belongs to [`docs/contracts/investigation-tool-contract.md`](docs/contracts/investigation-tool-contract.md)
 §3, not to this file. See it for the rules.
 
 **`MCP V1 is read-only and model-selectable writes do not exist.`** That is a deliberate
@@ -585,25 +585,25 @@ None of these is blocking, and none is hidden — each is recorded with its just
 
 **If you have 3 minutes:** this file, plus the authority model in [§5](#5-authority-model).
 
-**If you have 30 minutes:** add [`docs/architecture-overview.md`](docs/architecture-overview.md)
-(the figure set) and [`docs/domain-model.md`](docs/domain-model.md).
+**If you have 30 minutes:** add [`docs/status/architecture-overview.md`](docs/status/architecture-overview.md)
+(the figure set) and [`docs/contracts/domain-model.md`](docs/contracts/domain-model.md).
 
 **If you want the engineering depth:**
 
 | Goal | Document |
 |---|---|
 | Full reading map for `docs/` | [`docs/README.md`](docs/README.md) |
-| Visual architecture (8 figures) | [`docs/architecture-overview.md`](docs/architecture-overview.md) |
-| Domain model and invariants | [`docs/domain-model.md`](docs/domain-model.md) |
-| Commands, events, LangGraph state | [`docs/application-commands-domain-events-langgraph-state.md`](docs/application-commands-domain-events-langgraph-state.md) |
-| Persistence schema and constraints | [`docs/persistence-schema.md`](docs/persistence-schema.md) |
-| Package/layer boundaries | [`docs/python-package-boundary.md`](docs/python-package-boundary.md) |
-| Tool contract | [`docs/investigation-tool-contract.md`](docs/investigation-tool-contract.md) |
-| Model provider contract | [`docs/model-provider-contract.md`](docs/model-provider-contract.md) |
+| Visual architecture (8 figures) | [`docs/status/architecture-overview.md`](docs/status/architecture-overview.md) |
+| Domain model and invariants | [`docs/contracts/domain-model.md`](docs/contracts/domain-model.md) |
+| Commands, events, LangGraph state | [`docs/contracts/application-commands-domain-events-langgraph-state.md`](docs/contracts/application-commands-domain-events-langgraph-state.md) |
+| Persistence schema and constraints | [`docs/contracts/persistence-schema.md`](docs/contracts/persistence-schema.md) |
+| Package/layer boundaries | [`docs/contracts/python-package-boundary.md`](docs/contracts/python-package-boundary.md) |
+| Tool contract | [`docs/contracts/investigation-tool-contract.md`](docs/contracts/investigation-tool-contract.md) |
+| Model provider contract | [`docs/contracts/model-provider-contract.md`](docs/contracts/model-provider-contract.md) |
 | Knowledge plane | [`docs/knowledge/`](docs/knowledge/) |
 | Evaluation contracts | [`docs/evaluation/`](docs/evaluation/) |
-| Observability | [`docs/observability.md`](docs/observability.md) |
-| Local integrated runtime | [`docs/local-integrated-runtime.md`](docs/local-integrated-runtime.md) |
+| Observability | [`docs/contracts/observability.md`](docs/contracts/observability.md) |
+| Local integrated runtime | [`docs/operations/local-integrated-runtime.md`](docs/operations/local-integrated-runtime.md) |
 | Engineering process & acceptance history | [`docs/archive/engineering-history/stage-reports/`](docs/archive/engineering-history/stage-reports/) |
 | Interview review material | [`docs/interview/INTERVIEW_GUIDE.md`](docs/interview/INTERVIEW_GUIDE.md) |
 
@@ -650,6 +650,6 @@ python -m hisiem_soc_copilot.main
 > knowledge document in the deployment.
 
 Full local bring-up, including the HISIEM side and the two-process worker topology, is in
-[`docs/local-integrated-runtime.md`](docs/local-integrated-runtime.md). Knowledge subsystem
+[`docs/operations/local-integrated-runtime.md`](docs/operations/local-integrated-runtime.md). Knowledge subsystem
 operations (provisioning, ingest, search, evaluation) are in
 [`docs/knowledge/operations.md`](docs/knowledge/operations.md).

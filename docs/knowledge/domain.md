@@ -8,8 +8,8 @@ It answers one question and refuses every other:
 
 It is not part of the Investigation aggregate, it is not a permission model, and
 it cannot authorize anything. The reasoning behind that split is in
-[product-positioning.md](../product-positioning.md) and
-[domain-model.md](../domain-model.md); this document is the concrete contract.
+[product-positioning.md](../status/product-positioning.md) and
+[domain-model.md](../contracts/domain-model.md); this document is the concrete contract.
 
 ## 1. Why a separate bounded context
 

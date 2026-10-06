@@ -7,7 +7,7 @@ what was run, what passed, and what was left open.
 > **Stage terminology is internal engineering history, not the product model.**
 > If you are new to this repository, start with the
 > [README](../../../../README.md) and
-> [`docs/architecture-overview.md`](../../../architecture-overview.md). Come back here when you
+> [`docs/architecture-overview.md`](../../../status/architecture-overview.md). Come back here when you
 > want the evidence behind a specific claim.
 
 ---
@@ -102,9 +102,9 @@ each has a stated justification.
 
 These reports describe the **engineering process**. The product architecture is described in
 the [README](../../../../README.md) and
-[`docs/architecture-overview.md`](../../../architecture-overview.md); the domain and persistence
-contracts are in [`docs/domain-model.md`](../../../domain-model.md) and
-[`docs/persistence-schema.md`](../../../persistence-schema.md).
+[`docs/architecture-overview.md`](../../../status/architecture-overview.md); the domain and persistence
+contracts are in [`docs/domain-model.md`](../../../contracts/domain-model.md) and
+[`docs/persistence-schema.md`](../../../contracts/persistence-schema.md).
 
 **What these reports were written against** — the frozen Four-Plane contract, the Stage A–E
 implementation specs and the execution prompts these reports' predecessors were given — is

@@ -1,10 +1,10 @@
 # HISIEM SOC Copilot — Architecture Overview
 
 A concise, diagram-first model of the system. This document is visual navigation only; the
-authoritative detail is in [`domain-model.md`](domain-model.md),
-[`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md),
-[`persistence-schema.md`](persistence-schema.md) and
-[`python-package-boundary.md`](python-package-boundary.md).
+authoritative detail is in [`domain-model.md`](../contracts/domain-model.md),
+[`application-commands-domain-events-langgraph-state.md`](../contracts/application-commands-domain-events-langgraph-state.md),
+[`persistence-schema.md`](../contracts/persistence-schema.md) and
+[`python-package-boundary.md`](../contracts/python-package-boundary.md).
 
 For the two canonical full-size diagrams (plane architecture + end-to-end data flow),
 see [`architecture-diagrams.md`](architecture-diagrams.md).
@@ -390,14 +390,14 @@ flowchart LR
 
 | Topic | Document |
 |---|---|
-| Domain model and invariants | [`domain-model.md`](domain-model.md) |
-| Commands, events, LangGraph state | [`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md) |
-| Persistence schema and constraints | [`persistence-schema.md`](persistence-schema.md) |
-| Layer boundaries and their enforcement | [`python-package-boundary.md`](python-package-boundary.md) |
-| Tool contract | [`investigation-tool-contract.md`](investigation-tool-contract.md) |
-| Model provider contract | [`model-provider-contract.md`](model-provider-contract.md) |
-| Knowledge plane | [`knowledge/`](knowledge/) |
-| Evaluation contracts | [`evaluation/`](evaluation/) |
-| Observability | [`observability.md`](observability.md) |
-| Local integrated runtime | [`local-integrated-runtime.md`](local-integrated-runtime.md) |
-| Engineering process and acceptance evidence | [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/) |
+| Domain model and invariants | [`domain-model.md`](../contracts/domain-model.md) |
+| Commands, events, LangGraph state | [`application-commands-domain-events-langgraph-state.md`](../contracts/application-commands-domain-events-langgraph-state.md) |
+| Persistence schema and constraints | [`persistence-schema.md`](../contracts/persistence-schema.md) |
+| Layer boundaries and their enforcement | [`python-package-boundary.md`](../contracts/python-package-boundary.md) |
+| Tool contract | [`investigation-tool-contract.md`](../contracts/investigation-tool-contract.md) |
+| Model provider contract | [`model-provider-contract.md`](../contracts/model-provider-contract.md) |
+| Knowledge plane | [`knowledge/`](../knowledge/) |
+| Evaluation contracts | [`evaluation/`](../evaluation/) |
+| Observability | [`observability.md`](../contracts/observability.md) |
+| Local integrated runtime | [`local-integrated-runtime.md`](../operations/local-integrated-runtime.md) |
+| Engineering process and acceptance evidence | [`archive/engineering-history/stage-reports/`](../archive/engineering-history/stage-reports/) |

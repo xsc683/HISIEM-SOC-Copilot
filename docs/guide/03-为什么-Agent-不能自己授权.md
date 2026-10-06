@@ -34,7 +34,7 @@ hisiem.get_alert_context              取权威告警上下文
 
 这个工具是**系统控制的**：图的「水合」节点**直接调用**它，它**从不提供给模型**。模型既看不到它，也选不了它。
 
-> **一处需要如实说明的出入。** 工具契约文档 `docs/investigation-tool-contract.md` §4 的「Agent 可选读工具」清单列了 6 个名字（比上面多 `hisiem.get_entity_activity` 与 `threat_intel.lookup_ip`）。我核对了实现：`src/hisiem_soc_copilot/agent/tools/registry.py` 里，实际注册的模型可选集合**只有上表那 4 个**；多出来的两个被放在一个**仅作文档目录、永不注册**的集合里，注释写明了理由——**模型永远不能选到一个没有执行器、没有 schema、没有策略支撑的工具**。所以：**以代码为准，模型可达面是 4 个**；根 `README.md` §7 的表述与代码一致。
+> **一处需要如实说明的出入。** 工具契约文档 `docs/contracts/investigation-tool-contract.md` §4 的「Agent 可选读工具」清单列了 6 个名字（比上面多 `hisiem.get_entity_activity` 与 `threat_intel.lookup_ip`）。我核对了实现：`src/hisiem_soc_copilot/agent/tools/registry.py` 里，实际注册的模型可选集合**只有上表那 4 个**；多出来的两个被放在一个**仅作文档目录、永不注册**的集合里，注释写明了理由——**模型永远不能选到一个没有执行器、没有 schema、没有策略支撑的工具**。所以：**以代码为准，模型可达面是 4 个**；根 `README.md` §7 的表述与代码一致。
 
 **为什么要把面做这么小？** 因为工具面就是权限面。每多一个工具，就多一条「模型的选择会变成对外部系统的真实请求」的路径。把面收敛到 4 个只读工具，意味着模型的所有影响力都被限制在「读」这一个方向上。
 
@@ -177,7 +177,7 @@ REQUIRE_APPROVAL   → 人工决定
 
 - ⬅️ 想看这些边界在时间轴上的位置：读 [`02-一次调查的完整旅程.md`](02-一次调查的完整旅程.md) 第 6、11、12、13 步。
 - ➡️ 想按主题找到权威契约：读 [`04-想深入读哪一篇.md`](04-想深入读哪一篇.md)。
-- 📖 工具面的权威规矩：`docs/investigation-tool-contract.md` §3（风险边界）、§4（工具分类）、§30（明确禁止的工具）；根 `README.md` §7（工具 / MCP 治理）。
+- 📖 工具面的权威规矩：`docs/contracts/investigation-tool-contract.md` §3（风险边界）、§4（工具分类）、§30（明确禁止的工具）；根 `README.md` §7（工具 / MCP 治理）。
 - 📖 知识边界：`docs/knowledge/security-boundary.md`（每条声明都有对应测试文件）；根 `README.md` §8。
-- 📖 租户与安全边界总表：根 `README.md` §13；工作区信任边界：`docs/investigation-workspace.md` §2。
-- 📖 权限与审批的对象定义：`docs/domain-model.md` §25（策略取值）、§26–§27（审批请求与决策）。本节提到的「九条区分」在根 `README.md` §5。
+- 📖 租户与安全边界总表：根 `README.md` §13；工作区信任边界：`docs/contracts/investigation-workspace.md` §2。
+- 📖 权限与审批的对象定义：`docs/contracts/domain-model.md` §25（策略取值）、§26–§27（审批请求与决策）。本节提到的「九条区分」在根 `README.md` §5。

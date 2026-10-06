@@ -6,8 +6,8 @@ Two canonical diagrams for the system:
 2. **[Data flow diagram](#2-data-flow-diagram)** — *what happens across one investigation lifecycle*
 
 Companion documents: [`architecture-overview.md`](architecture-overview.md) (eight-figure visual
-model), [`domain-model.md`](domain-model.md), [`python-package-boundary.md`](python-package-boundary.md),
-[`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md).
+model), [`domain-model.md`](../contracts/domain-model.md), [`python-package-boundary.md`](../contracts/python-package-boundary.md),
+[`application-commands-domain-events-langgraph-state.md`](../contracts/application-commands-domain-events-langgraph-state.md).
 
 > **Scope.** These diagrams describe **this repository**. The security platform it runs on —
 > ingestion, streaming detection, alerts, cases and deterministic SOAR execution — is the sibling

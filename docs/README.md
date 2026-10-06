@@ -5,20 +5,35 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 > **New here?** Read the [README](../README.md) first, then [`guide/`](guide/) — a
 > project-first walkthrough in four documents. Come back to
-> [`architecture-overview.md`](architecture-overview.md) (eight figures) for the visual
+> [`architecture-overview.md`](status/architecture-overview.md) (eight figures) for the visual
 > model, and to this page when you want the detail behind one specific area.
 
 ---
+
+## Directory map
+
+| Directory | What it holds | Read it when |
+| --- | --- | --- |
+| `README.md` | this map | first visit |
+| [`status/`](status/) | **what is true now**: product positioning, the architecture overview and the two canonical diagrams | you want the current picture |
+| [`contracts/`](contracts/) | **what must hold**: domain model, persistence schema, package boundaries, the tool/MCP contract, the provider contract, the upstream integration boundary, the workspace projection, observability, and V1 scope | you are changing behaviour or an interface |
+| [`operations/`](operations/) | how to bring the local runtime up | you need to run it |
+| [`knowledge/`](knowledge/) | the knowledge subsystem: domain, retrieval contract, security boundary, operator procedure | you are working on knowledge |
+| [`evaluation/`](evaluation/) | the four evaluation responsibilities: closure, knowledge baseline, dataset materialisation, manifest sealing | you are working on evaluation |
+| [`guide/`](guide/) | project-first introduction | you are new to the project |
+| [`evidence/`](evidence/) | **code-level forensics**: every claim carries a `file:line` | you want to check "is the code really like this?" |
+| [`interview/`](interview/) | interview review material | — |
+| [`archive/`](archive/) | history, **not on the default reading path** | only when tracing something back |
 
 ## Start here
 
 | Document | Read it for | Size |
 |---|---|---|
 | [`guide/`](guide/) | **New here? Start with this.** Project-first walkthrough: what problem this decision layer solves, one investigation end to end, and why the agent cannot authorize itself. Four documents | 4 docs |
-| [`architecture-overview.md`](architecture-overview.md) | The visual model — investigation/authority chain, tool & evidence path, MCP admission, knowledge path, durable execution, truth boundaries, evaluation, cross-repository boundary | 8 figures |
-| [`architecture-diagrams.md`](architecture-diagrams.md) | The two canonical full-size diagrams — plane-oriented architecture graph, and the end-to-end investigation data flow | 2 diagrams |
-| [`product-positioning.md`](product-positioning.md) | What the product is and is not; target users and boundaries *(Chinese)* | 11 KB |
-| [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) | The user journey and what was in scope | 18 KB |
+| [`architecture-overview.md`](status/architecture-overview.md) | The visual model — investigation/authority chain, tool & evidence path, MCP admission, knowledge path, durable execution, truth boundaries, evaluation, cross-repository boundary | 8 figures |
+| [`architecture-diagrams.md`](status/architecture-diagrams.md) | The two canonical full-size diagrams — plane-oriented architecture graph, and the end-to-end investigation data flow | 2 diagrams |
+| [`product-positioning.md`](status/product-positioning.md) | What the product is and is not; target users and boundaries *(Chinese)* | 11 KB |
+| [`v1-user-flow-and-scope.md`](contracts/v1-user-flow-and-scope.md) | The user journey and what was in scope | 18 KB |
 | [`interview/INTERVIEW_GUIDE.md`](interview/INTERVIEW_GUIDE.md) | Review material: from a 30-second introduction down to deep follow-ups | large |
 
 ---
@@ -27,10 +42,10 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 | Document | Read it for | Size |
 |---|---|---|
-| [`python-package-boundary.md`](python-package-boundary.md) | The layer model — domain purity, application ports/UoW, agent orchestration, transport-only API — and the dependency direction rules | 22 KB |
-| [`application-commands-domain-events-langgraph-state.md`](application-commands-domain-events-langgraph-state.md) | Commands, domain events, and how LangGraph state relates to (and is *not*) domain state | 35 KB |
-| [`model-provider-contract.md`](model-provider-contract.md) | The provider contract: bounded invocation, structured output, typed failures, fail-closed behaviour | 14 KB |
-| [`investigation-workspace.md`](investigation-workspace.md) | The analyst workspace projection contract | 9 KB |
+| [`python-package-boundary.md`](contracts/python-package-boundary.md) | The layer model — domain purity, application ports/UoW, agent orchestration, transport-only API — and the dependency direction rules | 22 KB |
+| [`application-commands-domain-events-langgraph-state.md`](contracts/application-commands-domain-events-langgraph-state.md) | Commands, domain events, and how LangGraph state relates to (and is *not*) domain state | 35 KB |
+| [`model-provider-contract.md`](contracts/model-provider-contract.md) | The provider contract: bounded invocation, structured output, typed failures, fail-closed behaviour | 14 KB |
+| [`investigation-workspace.md`](contracts/investigation-workspace.md) | The analyst workspace projection contract | 9 KB |
 | [`evidence/architecture-analysis/README.md`](evidence/architecture-analysis/README.md) | **Code-level evidence layer** (9 documents): per-subsystem `file:line` forensics, the counter-intuitive shapes, and the boundaries as they actually are | — |
 
 > The evidence layer is **not** authority. It answers "is the code really like this?" —
@@ -44,8 +59,8 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 | Document | Read it for | Size |
 |---|---|---|
-| [`domain-model.md`](domain-model.md) | Aggregates, entities, value objects, invariants — the pure core | 28 KB |
-| [`persistence-schema.md`](persistence-schema.md) | Tables, constraints, indexes, and the ORM↔domain mapping; optimistic locking | 38 KB |
+| [`domain-model.md`](contracts/domain-model.md) | Aggregates, entities, value objects, invariants — the pure core | 28 KB |
+| [`persistence-schema.md`](contracts/persistence-schema.md) | Tables, constraints, indexes, and the ORM↔domain mapping; optimistic locking | 38 KB |
 
 ---
 
@@ -71,13 +86,13 @@ This directory holds the authoritative technical documentation for HISIEM SOC Co
 
 | Document | Read it for |
 |---|---|
-| [`investigation-tool-contract.md`](investigation-tool-contract.md) | The tool contract: the model-selectable surface, argument and result contracts, typed failures |
-| [`hisiem-integration-contract.md`](hisiem-integration-contract.md) | The boundary to HISIEM: what is read, how, and under what tenant/authority rules |
+| [`investigation-tool-contract.md`](contracts/investigation-tool-contract.md) | The tool contract: the model-selectable surface, argument and result contracts, typed failures |
+| [`hisiem-integration-contract.md`](contracts/hisiem-integration-contract.md) | The boundary to HISIEM: what is read, how, and under what tenant/authority rules |
 
 **The model-selectable tool surface is exactly four read-only tools**, plus one
 system-controlled tool the model can never call. Unknown servers, unadmitted dynamic tools,
 write capabilities and schema drift all fail closed. Exact set and rules:
-[`investigation-tool-contract.md`](investigation-tool-contract.md) §3–§4 — the contract is the authority; the root README
+[`investigation-tool-contract.md`](contracts/investigation-tool-contract.md) §3–§4 — the contract is the authority; the root README
 only summarises it.
 
 ---
@@ -86,7 +101,7 @@ only summarises it.
 
 | Document | Read it for |
 |---|---|
-| [`observability.md`](observability.md) | Spans, context propagation across the durable boundary, metric label safety, and the telemetry data policy |
+| [`observability.md`](contracts/observability.md) | Spans, context propagation across the durable boundary, metric label safety, and the telemetry data policy |
 
 **The truth boundary:** no business path reads spans, trace ids or collector state. Stopping
 the collector mid-run produces an identical persisted business outcome.
@@ -112,7 +127,7 @@ evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-
 
 | Document | Read it for |
 |---|---|
-| [`local-integrated-runtime.md`](local-integrated-runtime.md) | Bringing up the full local topology: ports, profiles, launchers, the two-process worker setup |
+| [`local-integrated-runtime.md`](operations/local-integrated-runtime.md) | Bringing up the full local topology: ports, profiles, launchers, the two-process worker setup |
 
 ---
 
@@ -120,7 +135,7 @@ evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-
 
 | Document | Read it for |
 |---|---|
-| [`archive/engineering-history/stage-contracts/README.md`](archive/engineering-history/stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
+| [`archive/engineering-history/stage-contracts/README.md`](archive/engineering-history/stage-contracts/README.md) | **The inputs** — the frozen v1.0 architecture contract (it names the eleven planes; "four-plane" is the closure framing — see [`architecture-diagrams.md`](status/architecture-diagrams.md) §1), the Stage A–E implementation specs, and the execution prompts, now in-repo |
 | [`archive/engineering-history/stage-reports/index.md`](archive/engineering-history/stage-reports/index.md) | **Start here for process context** — what the stages were, the reading order, and the consolidated known-items register |
 | [`archive/engineering-history/stage-reports/`](archive/engineering-history/stage-reports/) | The full acceptance evidence: E0 gap audit → E7 final seal, plus the full runtime E2E report |
 
@@ -140,7 +155,7 @@ evidenced in [`archive/engineering-history/stage-reports/`](archive/engineering-
   `tests/architecture/` enforces the layer rules mechanically. **A recorded divergence does
   not make the document wrong** — the norm stands, and the gap is filed as an Implementation
   Gap in the affected document instead of being smoothed over. See
-  [`persistence-schema.md`](persistence-schema.md) §4 for the one currently open case
+  [`persistence-schema.md`](contracts/persistence-schema.md) §4 for the one currently open case
   (the spec requires timezone-aware `TIMESTAMPTZ`; the ORM layer is naive throughout).
 - Acceptance artifacts are machine-readable and produced by real runs; nothing is
   transcribed from a narrative.

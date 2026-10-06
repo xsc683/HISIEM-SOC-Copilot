@@ -344,7 +344,7 @@ Agent 可以调查、建议和解释，高风险安全响应必须保留人工�
 
 ## 12. V1 不解决什么
 
-**权威清单在 [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) §19「V1 Out of Scope」**——那份清单归它维护，本文不再维护第二份。
+**权威清单在 [`v1-user-flow-and-scope.md`](../contracts/v1-user-flow-and-scope.md) §19「V1 Out of Scope」**——那份清单归它维护，本文不再维护第二份。
 
 这里只保留一条**定位级判据**：
 
@@ -354,7 +354,7 @@ Agent 可以调查、建议和解释，高风险安全响应必须保留人工�
 
 ## 13. 什么算完成
 
-**可判定的验收清单在 [`v1-user-flow-and-scope.md`](v1-user-flow-and-scope.md) §22「V1 Definition of Done」**（18 条条件）——那份清单归它维护。
+**可判定的验收清单在 [`v1-user-flow-and-scope.md`](../contracts/v1-user-flow-and-scope.md) §22「V1 Definition of Done」**（18 条条件）——那份清单归它维护。
 
 定位层面的判据只有一句：V1 的完成**不以页面数量、模型数量或代码量判断**，而以「一条真实告警能否被独立调查、得出有证据支撑的结论、并在人工授权后交由 HISIEM 执行，且全程可追溯、可复现」判断。
 
