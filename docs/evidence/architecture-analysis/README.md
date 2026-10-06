@@ -7,9 +7,6 @@
 >
 > 取证锚点：分支 `capability-mcp` @ `1e567be`。其后全部提交均为文档改动（`git diff --stat 1e567be..HEAD -- '*.py' '*.sql'` 为空），**代码未变**，故本集结论仍然现行。
 
-
-
-
 > **分析对象**：`D:\Project\HISIEM-SOC-Copilot`（Hatchling `src/` layout，包根 `src/hisiem_soc_copilot/`；Python 3.12+ · FastAPI · LangGraph + langgraph-checkpoint-postgres · SQLAlchemy 2 async + psycopg 3 + pgvector · Alembic · OpenTelemetry · MCP SDK）
 > **分析方式**：按子系统边界拆分，对**实际源码**取证——关键结论均附 `file:line` 相对路径证据。
 > **取证工具链**：本仓**无 `.codegraph/` 索引**，采用**源码直读 + AST 边界测试直读 + grep 统计**；每个 `file:line` 都对应真实代码，不凭空编造行号。**部分论断在项目 venv 中实跑验证**（见 §2）。
@@ -406,14 +403,6 @@ $ ./.venv/Scripts/python.exe -m pytest \
 | 知识检索 | `06` §1 |
 | 可靠性与恢复 | `01` §2 + `07` §2 |
 | 评估运行 | `08` §2 |
-
----
-
-## 修订记录
-
-| 版本 | 日期 | 变更 | 作者 |
-| --- | --- | --- | --- |
-| 1.0 | 2026-09-22 | 首版。9 篇，**6571 行（该数字为 v1.0 时点统计，非当前规模）**，38 个 mermaid 块全部经 `mermaid@11.10.1` 校验通过。核查修正 **13 处**（其中 7 处为 `config.py` 行号锚点，同一根因），记录 **17 条**反直觉真实形态，**96 条**待核实。MCP 测试实跑 **24 passed**（唯一非静态取证）。**archify 交互图未产出**（本环境无该工具，如实标注）。 | code-level-architecture-docs skill |
 
 ---
 

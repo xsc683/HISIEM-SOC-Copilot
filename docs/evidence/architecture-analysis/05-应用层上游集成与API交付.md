@@ -576,9 +576,3 @@ sequenceDiagram
 > **本节 12 条待核实项均已解答**：8 个端点的完整路径表；`/lookup` 的 3 个必填 Query 参数 + DB 局部唯一索引保证至多一条 active；`durable_support.py` 提供 exactly-once 命令；`queries/workspace.py` 是纯数据层而 `services/workspace_service.py` 是执行层；`api/errors.py` 5 个 handler + 完整映射表；`HeaderTrustedContextProvider` **无签名或令牌校验**（dev/test only）；`ClockPort` 只有 3 个生产消费点。
 
 ---
-
-## 修订记录
-
-| 版本 | 日期 | 变更 | 作者 |
-| --- | --- | --- | --- |
-| 1.0 | 2026-09-22 | 首版。基于 `capability-mcp` @ `1e567be` 取证，覆盖 `application/` 38 + `infrastructure/hisiem` 3 + `infrastructure/auth` 3 + `api/` 10 文件。 | code-level-architecture-docs skill |

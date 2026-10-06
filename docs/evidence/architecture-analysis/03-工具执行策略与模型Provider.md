@@ -890,9 +890,3 @@ flowchart LR
 > **本节 12 条待核实项均已解答**：`_FAILURE_CODES` 与 `ProviderFailureCode` 逐值一致；`external_schema_fingerprint` 用 `sort_keys` 紧凑 JSON 取 SHA-256；`max_depth` 与 `max_items` 同点执行；`InputRequiredRoundsExceededError` 只在 `invoke()` 捕获；`executor.execute` 有 8 个分支；`scripted` 是**有状态调用游标**；`schemas.py` 是严格 wire 边界；`contracts/llm/errors.py` 是 7 类单继承链。
 
 ---
-
-## 修订记录
-
-| 版本 | 日期 | 变更 | 作者 |
-| --- | --- | --- | --- |
-| 1.0 | 2026-09-22 | 首版。基于 `capability-mcp` @ `1e567be` 取证，覆盖 `agent/tools` 8 + `contracts` 5 + `infrastructure/llm` 11 + `infrastructure/mcp` 2 文件。**MCP 测试在项目 venv 中实跑 24 passed（本篇是少数经过执行的论断）。** | code-level-architecture-docs skill |
