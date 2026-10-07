@@ -1,11 +1,11 @@
-# GP-01 Manifest Sealer Contract
+# GP-01 清单封存器契约
 
-## 1. Scope
+## 1. 范围
 
-This document defines the GP-01 Manifest Sealer contract. (Provenance: delivered as
-working step `E1-B.4`; that code is engineering history, not the name of anything here.)
+本文档定义 GP-01 Manifest Sealer 契约。（来源：作为工作步骤 `E1-B.4` 交付；那个代号是工程史，不是
+这里任何东西的名字。）
 
-The Sealer converts a verified materialized dataset into an immutable evaluation manifest that can be consumed by the Golden Path evaluation harness and scorer.
+封存器把一份已校验的物化数据集转换成一成不变的评估清单，供 Golden Path 评估 harness 与评分器消费。
 
 ```text
 VerifiedDataset
@@ -19,25 +19,24 @@ ManifestSealer
 Immutable SealedManifest
 ```
 
-The Sealer does not ingest logs, resolve HISIEM resources, run the Copilot investigation, invoke an LLM, or determine the investigation result.
+封存器不摄取日志、不解析 HISIEM 资源、不跑 Copilot 调查、不调 LLM，也不决定调查结果。
 
-The materializer (`E1-B.3`) is the only step responsible for proving that provider resources
-exist and satisfy the GP-01 materialization invariants.
+物化器（`E1-B.3`）是唯一负责证明「provider 资源存在且满足 GP-01 物化不变式」的那一步。
 
-## 2. Input authority
+## 2. 输入权威
 
-The Sealer MUST accept only a `VerifiedDataset` produced by the Dataset Materializer verification boundary.
+封存器必须只接受由数据集物化器校验边界产出的 `VerifiedDataset`。
 
-It MUST reject:
+它必须拒绝：
 
-- an unverified `MaterializationDraft`;
-- partially resolved provider resources;
-- an unstable source alert;
-- an ambiguous source alert;
-- locally inferred provider identifiers;
-- a dataset whose required scenario invariants failed.
+- 未校验的 `MaterializationDraft`；
+- 部分解析的 provider 资源；
+- 不稳定的来源告警；
+- 有歧义的来源告警；
+- 本地推断出来的 provider 标识符；
+- 场景必需不变式失败过的数据集。
 
-The API SHOULD make invalid construction difficult by separating types:
+API 应当通过类型分离让非法构造难以发生：
 
 ```text
 MaterializationDraft
@@ -47,23 +46,23 @@ VerifiedDataset
 SealedManifest
 ```
 
-`seal(unverified_dataset)` is not a supported operation.
+`seal(unverified_dataset)` 不是一个受支持的操作。
 
-## 3. Sealer purity boundary
+## 3. 封存器纯净边界
 
-`ManifestSealer` MUST NOT perform provider or model I/O.
+`ManifestSealer` 不得执行 provider 或模型 IO。
 
-It MUST NOT:
+它不得：
 
-- call HISIEM;
-- call the ModelProvider;
-- run LangGraph;
-- create or update Copilot domain state;
-- query Elasticsearch directly;
-- execute detection logic;
-- mutate the materialized dataset.
+- 调 HISIEM；
+- 调 ModelProvider；
+- 跑 LangGraph；
+- 创建或更新 Copilot 领域状态；
+- 直接查询 Elasticsearch；
+- 执行检测逻辑；
+- 改动已物化的数据集。
 
-The expected split is:
+期望的切分是：
 
 ```text
 MaterializationVerifier
@@ -79,23 +78,23 @@ ManifestSealer
 filesystem persistence
 ```
 
-`ManifestBuilder` and `ManifestSealer` SHOULD be deterministic for the same explicit input values.
+对同样的显式输入值，`ManifestBuilder` 与 `ManifestSealer` 应当是确定性的。
 
-## 4. Manifest purpose
+## 4. 清单的用途
 
-The sealed manifest has three responsibilities:
+封存清单有三项职责：
 
-1. identify the exact real HISIEM resources used by one GP-01 evaluation run;
-2. carry the private evaluation oracle required by the scorer;
-3. cryptographically detect mutation of the evaluation record after sealing.
+1. 标识一次 GP-01 评估运行所用的那些确切真实 HISIEM 资源；
+2. 携带评分器所需的私有评估 oracle；
+3. 以密码学方式检出封存之后评估记录的改动。
 
-It is not an operational Copilot payload and MUST NOT be treated as investigation context.
+它不是可运行的 Copilot 载荷，且不得被当作调查上下文。
 
-## 5. Manifest schema
+## 5. 清单 schema
 
-The manifest MUST be versioned.
+清单必须带版本。
 
-Recommended top-level schema:
+推荐的顶层 schema：
 
 ```json
 {
@@ -113,13 +112,13 @@ Recommended top-level schema:
 }
 ```
 
-A schema version change is required for a non-backward-compatible change to canonical meaning.
+对规范含义做非向后兼容的改动时，必须升 schema 版本。
 
-## 6. Scenario identity
+## 6. 场景身份
 
-The manifest MUST identify the exact scenario definition used to materialize the run.
+清单必须标识物化这次运行时所用的确切场景定义。
 
-Required fields:
+必需字段：
 
 ```text
 scenario.id
@@ -128,18 +127,18 @@ scenario.source_file_sha256
 scenario.semantic_sha256
 ```
 
-`source_file_sha256` is the SHA-256 of the exact committed scenario source bytes.
+`source_file_sha256` 是已提交场景源文件那串确切字节的 SHA-256。
 
-`semantic_sha256` is the SHA-256 of a canonical parsed `ScenarioSpec` representation.
+`semantic_sha256` 是规范解析后 `ScenarioSpec` 表示的 SHA-256。
 
-These hashes have different meanings and MUST NOT be conflated:
+这两个哈希含义不同，不得混为一谈：
 
-- source hash detects byte-level edits;
-- semantic hash detects scenario meaning changes independent of irrelevant source formatting.
+- 源哈希检出字节级编辑；
+- 语义哈希检出与无关源格式无关的场景含义变化。
 
-## 7. Run identity
+## 7. 运行身份
 
-The manifest MUST record:
+清单必须记录：
 
 ```text
 run.run_id
@@ -147,22 +146,22 @@ run.materialized_at
 run.sealed_at
 ```
 
-Timestamps MUST use one canonical RFC 3339 UTC representation before hashing.
+时间戳在哈希之前必须使用同一种规范的 RFC 3339 UTC 表示。
 
-The manifest MAY contain additional bounded runtime metadata necessary to reproduce or diagnose an evaluation, but MUST NOT contain credentials or process environment dumps.
+清单可以包含复现或诊断一次评估所必需的其他有界运行期元数据，但不得包含凭据或进程环境转储。
 
-## 8. Scope and entities
+## 8. 作用域与实体
 
-The manifest MUST preserve the evaluation scope used to resolve provider resources.
+清单必须保留解析 provider 资源所用的评估作用域。
 
-At minimum:
+至少：
 
 ```text
 scope.provider = hisiem
 scope.tenant_id
 ```
 
-The GP-01 entity block SHOULD include the normalized attack entity used for semantic scoring:
+GP-01 实体块应当包含用于语义打分的归一化攻击实体：
 
 ```text
 entities.source_ip
@@ -170,13 +169,13 @@ entities.user_name
 entities.host_name
 ```
 
-These values are evaluation facts, not authorization claims. They MUST NOT be used to establish tenant or actor authority inside the Copilot runtime.
+这些值是评估事实，不是授权声明。它们不得被用来在 Copilot 运行时内部确立租户或行为者权威。
 
-## 9. Event references
+## 9. 事件引用
 
-Every semantic event stored in the manifest MUST originate from the verified provider dataset.
+清单里存储的每个语义事件都必须源自那份已校验的 provider 数据集。
 
-A semantic event entry SHOULD contain:
+一条语义事件条目应当包含：
 
 ```text
 role
@@ -193,17 +192,18 @@ host_name
 payload_sha256
 ```
 
-Only bounded normalized facts required for evaluation and correlation SHOULD be stored.
+只应当存储评估与关联所需的、有界的归一化事实。
 
-The manifest MUST NOT copy complete raw Elasticsearch documents as its normal representation.
+清单不得把完整的原始 Elasticsearch 文档复制成它的常规表示。
 
-Provider references MUST be the exact `_index` and `_id` values resolved from HISIEM. They MUST NOT be regenerated from logical roles or hashes.
+provider 引用必须是从 HISIEM 解析到的确切 `_index` 与 `_id` 值。它们不得由逻辑 role 或哈希重新
+生成。
 
-## 10. Control event isolation
+## 10. 控制事件隔离
 
-The watermark/control event MUST be stored separately from semantic ground-truth events.
+watermark/控制事件必须与语义 ground-truth 事件分开存储。
 
-Example representation:
+示例表示：
 
 ```json
 {
@@ -218,20 +218,20 @@ Example representation:
 }
 ```
 
-Control events MUST NOT:
+控制事件不得：
 
-- appear in `oracle.required_evidence_roles`;
-- satisfy semantic evidence requirements;
-- be injected into Copilot prompts or graph state merely because they appear in the manifest;
-- be counted as compromise evidence by the scorer.
+- 出现在 `oracle.required_evidence_roles` 里；
+- 满足语义证据要求；
+- 仅仅因为出现在清单里就被注入 Copilot prompt 或图状态；
+- 被评分器计入失陷证据。
 
-The scorer MUST understand the distinction between `GROUND_TRUTH` and `WATERMARK_CONTROL`.
+评分器必须理解 `GROUND_TRUTH` 与 `WATERMARK_CONTROL` 之间的区别。
 
-## 11. Source alert reference
+## 11. 来源告警引用
 
-The manifest MUST bind the exact source alert used to start the investigation.
+清单必须绑定用来启动调查的那个确切来源告警。
 
-Required representation:
+必需表示：
 
 ```text
 source_alert.provider = hisiem
@@ -242,19 +242,19 @@ source_alert.rule_id
 source_alert.event_count
 ```
 
-`source_alert.address_id` MUST be the real identifier accepted by the HISIEM alert detail API.
+`source_alert.address_id` 必须是 HISIEM 告警详情 API 实际接受的标识符。
 
-For the current HISIEM alert implementation this is the Elasticsearch alert document `_id`.
+对当前 HISIEM 告警实现来说，这就是 Elasticsearch 告警文档的 `_id`。
 
-The Sealer MUST NOT derive `address_id` from `alert.id`, scenario ids, hashes, or event ids.
+封存器不得从 `alert.id`、场景 id、哈希或事件 id 推 `address_id`。
 
-The business alert id may be retained as optional display/correlation metadata only.
+业务告警 id 可以只作为可选的展示/关联元数据保留。
 
-## 12. Oracle
+## 12. oracle
 
-The manifest may contain the private GP-01 oracle required for deterministic scoring.
+清单可以包含确定性打分所需的私有 GP-01 oracle。
 
-Minimum oracle:
+最小 oracle：
 
 ```text
 oracle.expected_verdict = MALICIOUS
@@ -262,7 +262,7 @@ oracle.facts[]
 oracle.required_evidence_roles[]
 ```
 
-Recommended GP-01 semantic facts:
+推荐的 GP-01 语义事实：
 
 ```text
 FAILURE_SEQUENCE
@@ -279,19 +279,19 @@ POST_FAILURE_SUCCESS
   success occurs after the failure sequence
 ```
 
-The oracle SHOULD describe facts and evidence requirements, not prescribe model wording.
+oracle 应当描述事实与证据要求，而不是规定模型的措辞。
 
-Scoring MUST NOT require an exact generated sentence such as a fixed Finding string.
+打分不得要求某个确切生成的句子，例如某个固定的 Finding 字符串。
 
-This keeps GP-01 a grounded investigation evaluation rather than a prompt memorization benchmark.
+这才让 GP-01 成为一次有据可依的调查评估，而不是一场 prompt 背诵测验。
 
-## 13. Oracle isolation
+## 13. oracle 隔离
 
-Oracle isolation is a hard architecture invariant.
+oracle 隔离是一条硬架构不变式。
 
-The evaluation harness may read the sealed manifest, but the Copilot investigation may receive only the production-safe launch information required to identify the real source resource.
+评估 harness 可以读封存清单，但 Copilot 调查只能收到标识真实来源资源所需的那点生产安全启动信息。
 
-Expected flow:
+期望的流：
 
 ```text
 SealedManifest
@@ -308,7 +308,7 @@ ExternalResourceRef(
 Copilot Investigation
 ```
 
-Forbidden flows:
+禁止的流：
 
 ```text
 oracle → ModelProvider
@@ -320,9 +320,9 @@ oracle → Finding candidate
 oracle → InvestigationResult
 ```
 
-The production application MUST NOT import the evaluation oracle package.
+生产应用不得导入评估 oracle 包。
 
-A repository architecture test SHOULD enforce a one-way dependency:
+仓库架构测试应当强制一条单向依赖：
 
 ```text
 evaluation
@@ -330,7 +330,7 @@ evaluation
 production public contracts
 ```
 
-and prohibit:
+并禁止：
 
 ```text
 production domain/application/agent/infrastructure/api
@@ -338,11 +338,11 @@ production domain/application/agent/infrastructure/api
 evaluation oracle
 ```
 
-## 14. Evaluation launch view
+## 14. 评估启动视图
 
-The harness SHOULD expose a dedicated projection of `SealedManifest` for investigation launch so accidental oracle propagation is structurally difficult.
+harness 应当为调查启动暴露一个 `SealedManifest` 的专用投影，让意外的 oracle 传播在结构上难以发生。
 
-Equivalent type:
+等价类型：
 
 ```text
 EvaluationLaunchRef
@@ -352,13 +352,13 @@ EvaluationLaunchRef
   business_id?
 ```
 
-The launcher MUST NOT pass the full manifest object to production investigation code.
+启动器不得把完整的清单对象传给生产调查代码。
 
-## 15. Canonicalization
+## 15. 规范化
 
-Manifest integrity depends on a project-owned versioned canonical representation.
+清单完整性依赖一份项目自有的、带版本的规范表示。
 
-`gp-eval-manifest/v1` canonicalization MUST define at least:
+`gp-eval-manifest/v1` 的规范化必须至少定义：
 
 ```text
 encoding: UTF-8
@@ -371,7 +371,7 @@ list ordering: deterministic by schema meaning
 Unicode: no implementation-dependent re-encoding
 ```
 
-A suitable Python serialization primitive is equivalent to:
+一个合适的 Python 序列化原语等价于：
 
 ```python
 json.dumps(
@@ -383,9 +383,9 @@ json.dumps(
 )
 ```
 
-List ordering MUST be established before serialization. `sort_keys=True` does not make array order deterministic.
+列表顺序必须在序列化之前就确定。`sort_keys=True` 不会让数组顺序变成确定性的。
 
-Recommended deterministic ordering:
+推荐的确定性排序：
 
 ```text
 events           → logical role order F1..F5,S1
@@ -395,11 +395,11 @@ required roles   → declared ScenarioSpec order
 related refs     → stable provider-reference order where semantic order is irrelevant
 ```
 
-## 16. Integrity hash
+## 16. 完整性哈希
 
-The manifest MUST carry a SHA-256 integrity digest.
+清单必须携带一个 SHA-256 完整性摘要。
 
-Hash rule:
+哈希规则：
 
 ```text
 manifest_sha256 =
@@ -410,53 +410,53 @@ SHA256(
 )
 ```
 
-The hash MUST NOT include itself.
+哈希不得包含它自己。
 
-The canonicalization identifier MUST be included in the hashed payload, for example:
+规范化标识符必须被纳入被哈希的载荷，例如：
 
 ```text
 integrity.canonicalization = json-sort-keys-v1
 ```
 
-A verifier MUST recompute the digest using the schema-version canonicalization rules and reject a mismatch.
+校验器必须按该 schema 版本的规范化规则重算摘要，并在不匹配时拒绝。
 
-## 17. Code revision
+## 17. 代码修订
 
-A sealed benchmark record SHOULD identify the code revision under which it was generated.
+一份封存基准记录应当标识它生成时所处的代码修订。
 
-Recommended fields:
+推荐字段：
 
 ```text
 code.git_commit
 code.dirty
 ```
 
-A manifest intended to be an authoritative evaluation record SHOULD require:
+一份意在作为权威评估记录的清单应当要求：
 
 ```text
 code.dirty = false
 ```
 
-A dirty worktree may produce an explicitly non-authoritative development artifact, but it MUST NOT be labeled equivalent to a clean sealed benchmark record.
+脏工作树可以产出一份被显式标为非权威的开发产物，但它不得被标成与一份干净的封存基准记录等价。
 
-## 18. Secret exclusion
+## 18. 密钥排除
 
-The manifest, materialization draft, canonical payload, seal logs, and diagnostics MUST NOT contain:
+清单、物化草稿、规范载荷、封存日志与诊断都不得包含：
 
-- `HISIEM_BEARER_TOKEN`;
-- `CMD_API_KEY`;
-- `Authorization` headers;
-- connection secrets;
-- raw environment dumps;
-- provider request secrets.
+- `HISIEM_BEARER_TOKEN`；
+- `CMD_API_KEY`；
+- `Authorization` 头；
+- 连接密钥；
+- 原始环境转储；
+- provider 请求密钥。
 
-The generated local manifest may contain evaluation-scoping values such as tenant id and synthetic entities where required for deterministic evaluation.
+生成出的本地清单可以包含评估作用域取值，例如 tenant id 与合成实体，前提是确定性评估需要它们。
 
-Generated evaluation run artifacts SHOULD not be committed to Git.
+生成出的评估运行产物不应被提交进 Git。
 
-## 19. Persistence
+## 19. 持久化
 
-Recommended generated layout:
+推荐的生成布局：
 
 ```text
 .eval-runs/
@@ -466,15 +466,15 @@ Recommended generated layout:
       manifest.json
 ```
 
-`.eval-runs/` SHOULD be Git-ignored.
+`.eval-runs/` 应当被 Git 忽略。
 
-The committed repository contains the scenario and contract, not generated provider datasets or runtime manifests.
+已提交的仓库包含的是场景与契约，不是生成出的 provider 数据集或运行期清单。
 
-## 20. Atomic sealing
+## 20. 原子封存
 
-Sealing MUST be atomic at the filesystem boundary.
+封存必须在文件系统边界上原子。
 
-Required sequence:
+必需顺序：
 
 ```text
 build canonical manifest bytes
@@ -488,11 +488,11 @@ atomic rename/replace into manifest.json when target is absent
 optionally fsync containing directory where supported
 ```
 
-The final sealed file MUST never be observed as a partially written JSON document.
+最终封存文件绝不能被观测成一份部分写出的 JSON 文档。
 
-## 21. Immutability and idempotency
+## 21. 不可变性与幂等
 
-After a manifest exists for a run:
+一次运行已有清单之后：
 
 ```text
 existing bytes == newly computed bytes
@@ -502,13 +502,14 @@ existing bytes != newly computed bytes
 → SEAL_CONFLICT
 ```
 
-The Sealer MUST NOT silently overwrite a different sealed manifest.
+封存器不得静默覆盖一份不同的封存清单。
 
-Changing the verified dataset, oracle, scenario identity, source alert reference, code revision, canonicalization version, or any other hashed field requires a new valid seal result and, where it represents a different evaluation execution, a new run identity.
+改动已校验数据集、oracle、场景身份、来源告警引用、代码修订、规范化版本，或任何其他被哈希的字段，
+都需要一个新的有效封存结果；而当它代表的是一次不同的评估执行时，还需要一个新的运行身份。
 
-## 22. Verification API
+## 22. 校验 API
 
-The evaluation package SHOULD provide explicit operations equivalent to:
+评估包应当提供与下列等价的操作：
 
 ```text
 build_manifest(VerifiedDataset, ScenarioOracle, CodeRevision)
@@ -518,11 +519,11 @@ seal_manifest(manifest, path)
 verify_sealed_manifest(path)
 ```
 
-`verify_sealed_manifest` MUST validate both schema invariants and integrity hash before returning a trusted sealed object.
+`verify_sealed_manifest` 必须在返回可信封存对象之前，同时校验 schema 不变式与完整性哈希。
 
-## 23. Error taxonomy
+## 23. 错误分类
 
-The implementation SHOULD expose typed failures equivalent to:
+实现应当暴露与下列等价的类型化失败：
 
 ```text
 ManifestNotVerifiedError
@@ -534,11 +535,11 @@ ManifestPersistenceError
 OracleIsolationViolation
 ```
 
-These errors SHOULD carry bounded diagnostic context and MUST NOT expose secrets.
+这些错误应当携带有界的诊断上下文，且不得暴露密钥。
 
-## 24. Package boundary
+## 24. 包边界
 
-Recommended additions:
+推荐新增：
 
 ```text
 src/hisiem_soc_copilot/evaluation/
@@ -548,24 +549,24 @@ src/hisiem_soc_copilot/evaluation/
 └── launch_projection.py
 ```
 
-The evaluation package may call production public interfaces for execution. Production packages MUST remain unaware of the oracle and sealed-manifest representation.
+评估包可以为执行调用生产的公开接口。生产包必须对 oracle 与封存清单表示保持无感知。
 
-## 25. CLI contract
+## 25. CLI 契约
 
-Suggested commands:
+建议命令：
 
 ```text
 python -m hisiem_soc_copilot.evaluation.cli seal <run_id>
 python -m hisiem_soc_copilot.evaluation.cli verify-manifest <run_id>
 ```
 
-A convenience preparation command may compose B.3 and B.4:
+一条便利的准备命令可以组合 B.3 与 B.4：
 
 ```text
 python -m hisiem_soc_copilot.evaluation.cli prepare GP-01
 ```
 
-Its internal semantics remain:
+它的内部语义仍是：
 
 ```text
 preflight
@@ -575,26 +576,26 @@ preflight
 → seal manifest
 ```
 
-Materialization and sealing MUST remain separate internal contracts even when exposed through one convenience command.
+物化与封存即使被一条便利命令一起暴露，也必须在内部保持为两个分开的契约。
 
-## 26. Test contract
+## 26. 测试契约
 
-Unit tests MUST cover at least:
+单元测试必须至少覆盖：
 
-1. an unverified draft cannot be sealed;
-2. the same explicit verified input produces byte-identical canonical payload bytes;
-3. manifest tampering changes or invalidates `manifest_sha256`;
-4. an existing different manifest cannot be overwritten;
-5. `W1` is absent from semantic oracle requirements;
-6. all event provider references originate from `VerifiedDataset`;
-7. source alert `address_id` is copied from the resolved provider reference and never derived from business id;
-8. canonical list ordering is deterministic;
-9. NaN/Infinity are rejected;
-10. secret fields cannot be serialized through the typed manifest model;
-11. the launch projection contains no oracle data;
-12. production packages do not import evaluation oracle modules.
+1. 未校验的草稿不能被封存；
+2. 同样的显式已校验输入产出逐字节相同的规范载荷；
+3. 篡改清单会改变或使 `manifest_sha256` 失效；
+4. 一份已存在的不同清单不能被覆盖；
+5. `W1` 不出现在语义 oracle 要求里；
+6. 所有事件 provider 引用都源自 `VerifiedDataset`；
+7. 来源告警 `address_id` 从已解析的 provider 引用复制，永不从业务 id 派生；
+8. 规范列表顺序是确定性的；
+9. NaN/Infinity 被拒绝；
+10. 密钥字段无法经类型化清单模型被序列化；
+11. 启动投影不含任何 oracle 数据；
+12. 生产包不导入评估 oracle 模块。
 
-A live end-to-end evaluation preparation test MUST prove:
+一次活的端到端评估准备测试必须证明：
 
 ```text
 real GP-01 materialization
@@ -604,11 +605,11 @@ real GP-01 materialization
 → source alert launch projection contains exact real HISIEM address_id
 ```
 
-The live preparation test does not by itself score model quality; scoring belongs to the subsequent Golden Path Evaluation stage.
+活的准备测试本身不给模型质量打分；打分属于后续的 Golden Path 评估阶段。
 
-## 27. Completion gate
+## 27. 完成闸门
 
-The sealer is complete only when:
+只有当下列全部成立时，封存器才算完成：
 
 ```text
 VerifiedDataset
@@ -619,7 +620,7 @@ VerifiedDataset
 → deterministic launch projection
 ```
 
-The resulting architecture is:
+由此得到的架构是：
 
 ```text
 GP-01 Scenario
@@ -633,4 +634,5 @@ SealedManifest
       └─ private oracle ────→ Evaluation Scorer
 ```
 
-Only after this boundary is proven may the sealed GP-01 dataset be used as an authoritative Real HISIEM + Real ModelProvider Golden Path evaluation input.
+只有在这条边界被证明之后，封存的 GP-01 数据集才可以作为权威的「真实 HISIEM + 真实 ModelProvider」
+Golden Path 评估输入使用。
