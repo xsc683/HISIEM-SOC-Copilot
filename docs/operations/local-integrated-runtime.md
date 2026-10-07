@@ -1,110 +1,97 @@
-# Local Integrated Runtime
+# 本地一体化运行时
 
-> **Provenance.** This baseline was delivered as working step **E1-C0**. The code is
-> engineering history; this document is named after the runtime it describes.
+> **来源。** 这份基线是作为工作步骤 **E1-C0** 交付的。代号是工程史；本文档以它所描述的运行时命名。
 
-Normative reference for running the **HISIEM SOC Copilot** agent-evaluation
-runtime locally on a Windows dev machine, together with the **HISIEM** platform
-it reads from. This document defines deployment profiles, a fixed port
-contract, the HISIEM auth automation, the Copilot database guard + migration,
-the launcher/status/down scripts, health contracts, model readiness, secrets
-handling, and the smoke-validation sequence. It intentionally contains no
-narrative or learning history.
+在 Windows 开发机上本地运行 **HISIEM SOC Copilot** 智能体评估运行时的规范参考，连同它所读取的
+**HISIEM** 平台一并说明。本文档定义部署 profile、固定的端口契约、HISIEM 认证自动化、Copilot 数据库
+守卫 + 迁移、启动/状态/停止脚本、健康契约、模型就绪、密钥处理，以及冒烟验证序列。它刻意不含任何
+叙述或学习史。
 
-> **Repo paths (as-built):** HISIEM platform lives at `D:\Project\SIEM`
-> (branch `add_frame`, **read-only default** here), NOT `D:\Project\HISIEM`.
-> The main project is `D:\Project\HISIEM-SOC-Copilot` (branch `main`). All
-> edits and scripts below live in the Copilot repo.
+> **仓库路径（按实际）：** HISIEM 平台在 `D:\Project\SIEM`（分支 `add_frame`，此处**默认只读**），
+> **不**是 `D:\Project\HISIEM`。主项目是 `D:\Project\HISIEM-SOC-Copilot`（分支 `main`）。下面所有
+> 编辑与脚本都落在 Copilot 仓。
 
 ---
 
-## 1. Repo boundaries & git discipline
+## 1. 仓库边界与 git 纪律
 
-- **SIEM (`D:\Project\SIEM`)** — reference platform. May be read, executed, and
-  health-checked, but **never modified** (source, config, or docs) as part of
-  this work. Its `infra/docker-compose.yml` (compose project `infra`) owns the
-  HISIEM containers. If a real HISIEM change is ever required, stop and report —
-  do not self-modify.
-- **HISIEM-SOC-Copilot (`D:\Project\HISIEM-SOC-Copilot`)** — where all changes
-  land: source, `infra/docker-compose.yml`, scripts, docs, tests.
-- Before any work: confirm `git status` is clean enough to proceed; never
-  overwrite another actor's uncommitted files.
-- Never commit: `.env.local`, real secrets/tokens, `.eval-runs/`, sealed
-  manifests, or any generated artifacts.
+- **SIEM（`D:\Project\SIEM`）** —— 参考平台。可以读、可以执行、可以做健康检查，但作为这项工作的一部分
+  **绝不修改**（源码、配置或文档都不改）。它的 `infra/docker-compose.yml`（compose 项目 `infra`）
+  拥有 HISIEM 的那些容器。如果哪天真需要改 HISIEM，停下并报告——不要自行修改。
+- **HISIEM-SOC-Copilot（`D:\Project\HISIEM-SOC-Copilot`）** —— 所有改动落地的地方：源码、
+  `infra/docker-compose.yml`、脚本、文档、测试。
+- 动手之前：确认 `git status` 干净到足以开工；绝不覆盖别人未提交的文件。
+- 绝不提交：`.env.local`、真实密钥/token、`.eval-runs/`、封存清单，或任何生成产物。
 
 ---
 
-## 2. Deployment inventory (as-built)
+## 2. 部署清单（按实际）
 
-### HISIEM — infra compose (`D:\Project\SIEM\infra\docker-compose.yml`, project `infra`)
+### HISIEM —— infra compose（`D:\Project\SIEM\infra\docker-compose.yml`，项目 `infra`）
 
-| Container | Host port | Role |
+| 容器 | 宿主端口 | 角色 |
 |---|---|---|
-| `siem-postgres` | 5432 | Platform control-plane PostgreSQL |
-| `siem-elasticsearch` | 9200 | Event/alert store (data plane) |
-| `siem-kibana` | 5601 | Web console (full profile only) |
-| `siem-logstash` | 5000–5007, 9600 | Ingest pipeline (full profile only) |
-| `siem-kafka` | 9092 (9094 internal) | Event bus (full profile only) |
-| `siem-flink-jobmanager` | 8081 | Detection job driver (full profile only) |
-| `siem-flink-taskmanager` | — | Detection job worker (full profile only) |
+| `siem-postgres` | 5432 | 平台控制面 PostgreSQL |
+| `siem-elasticsearch` | 9200 | 事件/告警存储（数据面） |
+| `siem-kibana` | 5601 | Web 控制台（仅 full profile） |
+| `siem-logstash` | 5000–5007、9600 | 摄取管线（仅 full profile） |
+| `siem-kafka` | 9092（内部 9094） | 事件总线（仅 full profile） |
+| `siem-flink-jobmanager` | 8081 | 检测作业驱动（仅 full profile） |
+| `siem-flink-taskmanager` | — | 检测作业 worker（仅 full profile） |
 
-### HISIEM — host processes (NOT in compose)
+### HISIEM —— 宿主进程（不在 compose 里）
 
-| Process | How it runs | Health |
+| 进程 | 怎么跑 | 健康 |
 |---|---|---|
-| **control-api** (Spring Boot, host 8080) | `java -jar applications/control-api/target/hsiem-platform.jar` from `D:\Project\SIEM` (may pass `--app.rules-dir=...`) | `GET /actuator/health` → `{"status":"UP"}` |
-| web (Vue/Vite, host 5173) | `npm --prefix web run dev` | (operator-managed; not part of Agent profile) |
-| detection-controller / soar-worker | optional separate JVMs | (not part of Agent profile) |
+| **control-api**（Spring Boot，宿主 8080） | 在 `D:\Project\SIEM` 下 `java -jar applications/control-api/target/hsiem-platform.jar`（可传 `--app.rules-dir=...`） | `GET /actuator/health` → `{"status":"UP"}` |
+| web（Vue/Vite，宿主 5173） | `npm --prefix web run dev` | （运维管理；不属于 Agent profile） |
+| detection-controller / soar-worker | 可选的独立 JVM | （不属于 Agent profile） |
 
-### Copilot — HISIEM-SOC-Copilot repo
+### Copilot —— HISIEM-SOC-Copilot 仓
 
-| Component | How it runs | Health |
+| 组件 | 怎么跑 | 健康 |
 |---|---|---|
-| `copilot-postgres` (postgres:16, docker) | `docker compose -p copilot -f infra/docker-compose.yml up -d` | `pg_isready`, host **5433** |
-| **Copilot API** (FastAPI/uvicorn, host 8000) | `python -m hisiem_soc_copilot.main` | `GET /healthz` → 200 |
+| `copilot-postgres`（postgres:16，docker） | `docker compose -p copilot -f infra/docker-compose.yml up -d` | `pg_isready`，宿主 **5433** |
+| **Copilot API**（FastAPI/uvicorn，宿主 8000） | `python -m hisiem_soc_copilot.main` | `GET /healthz` → 200 |
 
-Schema ownership: `copilot` is **Alembic-owned**; `langgraph_checkpoint` is
-**LangGraph-owned** (never migrated here).
+schema 归属：`copilot` 归 **Alembic**；`langgraph_checkpoint` 归 **LangGraph**（此处永不迁移）。
 
 ---
 
-## 3. Deployment profiles (frozen)
+## 3. 部署 profile（冻结）
 
-- **A — Full HISIEM (dataset generation, GP-01 materialization):** everything in the infra
-  compose including the data pipeline (Logstash, Kafka, Flink, Kibana) plus
-  control-api. Launched by `scripts/dev/up-full.ps1`.
-- **B — Agent Evaluation (default):** siem-postgres (5432), Elasticsearch
-  (9200), control-api (8080), copilot-postgres (5433), Copilot API (8000).
-  **Excludes** Kafka, Logstash, Flink, Kibana, SOAR, and the web console.
-  Launched by `scripts/dev/up-agent.ps1`.
+- **A —— 完整 HISIEM（数据集生成、GP-01 物化）：** infra compose 里的全部内容，包括数据管线
+  （Logstash、Kafka、Flink、Kibana）外加 control-api。由 `scripts/dev/up-full.ps1` 启动。
+- **B —— Agent 评估（默认）：** siem-postgres（5432）、Elasticsearch（9200）、control-api
+  （8080）、copilot-postgres（5433）、Copilot API（8000）。**不含** Kafka、Logstash、Flink、
+  Kibana、SOAR 与 web 控制台。由 `scripts/dev/up-agent.ps1` 启动。
 
 ---
 
-## 4. Port contract (frozen)
+## 4. 端口契约（冻结）
 
-| Port | Owner |
+| 端口 | 归属 |
 |---|---|
 | 5432 | HISIEM siem-postgres |
 | 5433 | Copilot copilot-postgres |
 | 8080 | HISIEM control-api |
 | 8000 | Copilot API |
 | 9200 | Elasticsearch |
-| 9092 | Kafka (full profile) |
-| 8081 | Flink jobmanager (full profile) |
-| 5601 | Kibana (full profile) |
+| 9092 | Kafka（full profile） |
+| 8081 | Flink jobmanager（full profile） |
+| 5601 | Kibana（full profile） |
 
-The Copilot compose maps host `5433` → container `5432`. Neither database ever
-shares a host port. Do not start another postgres on 5432/5433.
+Copilot 的 compose 把宿主 `5433` 映射到容器 `5432`。两个数据库永不共用宿主端口。不要在 5432/5433 上
+再起一个 postgres。
 
 ---
 
-## 5. HISIEM authentication automation
+## 5. HISIEM 认证自动化
 
-**Principle: API-only. No DB bypass.** Forbidden: direct `UPDATE users`,
-password-hash editing, clearing `passwordChangeRequired`, disabling auth,
-RBAC bypass, hardcoding/committing tokens, logging secrets.
+**原则：只用 API。不绕数据库。** 禁止：直接 `UPDATE users`、改密码哈希、清
+`passwordChangeRequired`、关认证、绕 RBAC、硬编码或提交 token、把密钥写进日志。
 
-Official flow driven by `scripts/dev/hisiem_auth.py`:
+由 `scripts/dev/hisiem_auth.py` 驱动的官方流程：
 
 ```
 GET  /actuator/health            (health gate)
@@ -112,115 +99,104 @@ POST /api/auth/login             {username, password}
 POST /api/auth/password          {currentPassword, newPassword}   (rotate, first-run)
 ```
 
-- Login response includes `token`, `role`, `expiresAt`, `passwordChangeRequired`.
-- If `passwordChangeRequired` is true the helper rotates **bootstrap→dev**
-  password via `/api/auth/password` (policy: ≥12 chars, new≠current), then logs
-  in again with the dev password.
-- Only a genuinely first-run control-api (empty user store) needs
-  `HISIEM_BOOTSTRAP_PASSWORD`; when the legacy `users.yaml` users were already
-  imported they start with `passwordChangeRequired=true` and the rotation path
-  applies instead.
-- Session tokens are single-return, SHA-256-hashed in the store, 8h TTL,
-  5-fail lockout for 15m.
+- 登录响应包含 `token`、`role`、`expiresAt`、`passwordChangeRequired`。
+- 若 `passwordChangeRequired` 为 true，辅助脚本经 `/api/auth/password` 把
+  **bootstrap→dev** 密码轮换掉（策略：≥12 字符、新≠旧），然后用 dev 密码重新登录。
+- 只有真正首次运行的 control-api（用户表为空）才需要 `HISIEM_BOOTSTRAP_PASSWORD`；当遗留
+  `users.yaml` 里的用户已经被导入时，他们起手就是 `passwordChangeRequired=true`，适用的是轮换
+  路径。
+- 会话 token 单次返回、在存储里以 SHA-256 哈希保存、TTL 8 小时、连续 5 次失败锁定 15 分钟。
 
-`.env.local` (gitignored) holds `HISIEM_DEV_USERNAME`, `HISIEM_DEV_PASSWORD`,
-`HISIEM_BOOTSTRAP_PASSWORD` (only for genuine first-run), `HISIEM_TENANT_ID`,
-and `CMD_API_KEY`. `.env.example` = variable names + safe placeholders only.
+`.env.local`（被 gitignore）存放 `HISIEM_DEV_USERNAME`、`HISIEM_DEV_PASSWORD`、
+`HISIEM_BOOTSTRAP_PASSWORD`（仅真正首次运行用）、`HISIEM_TENANT_ID` 与 `CMD_API_KEY`。
+`.env.example` 只有变量名 + 安全占位符。
 
 ---
 
-## 6. Bearer token handling (runtime-only)
+## 6. Bearer token 处理（仅运行期）
 
-The HISIEM Bearer token is obtained by `up-agent.ps1` at launch and injected
-into the **Copilot child process environment** as `HISIEM_BEARER_TOKEN`. It is
-never written to git, logs, `.env.local`, manifests, agent state, or
-checkpoints; never printed. The `scripts/dev/hisiem_auth.py` CLI prints the
-token to stdout only (consumed by the launcher).
+HISIEM Bearer token 由 `up-agent.ps1` 在启动时取得，并作为 `HISIEM_BEARER_TOKEN` 注入 **Copilot
+子进程环境**。它永不被写入 git、日志、`.env.local`、清单、agent 状态或 checkpoint，也永不被打印。
+`scripts/dev/hisiem_auth.py` 这个 CLI 只把 token 打到 stdout（由启动器消费）。
 
 ---
 
-## 7. Copilot PostgreSQL & migration guard
+## 7. Copilot PostgreSQL 与迁移守卫
 
-`scripts/dev/copilot_db.py` enforces a **fail-closed target guard** before any
-Alembic run:
+`scripts/dev/copilot_db.py` 在任何 Alembic 运行之前强制一道 **fail-closed 目标守卫**：
 
-- Host must be local loopback (`127.0.0.1`/`localhost`/`::1`).
-- Port must be **5433** (Copilot's reserved port). A URL pointing at HISIEM's
-  **5432**, or any other port, is refused.
-- Database must be **`copilot`**.
+- 主机必须是本地回环（`127.0.0.1`/`localhost`/`::1`）。
+- 端口必须是 **5433**（Copilot 保留端口）。指向 HISIEM **5432** 或其他任何端口的 URL 都会被拒绝。
+- 数据库必须是 **`copilot`**。
 
-Then it runs `alembic current`, `alembic upgrade head`, and `alembic check`
-(drift). Schema ownership is respected: only the `copilot` schema is migrated;
-`langgraph_checkpoint` belongs to LangGraph at runtime.
+然后它依次运行 `alembic current`、`alembic upgrade head` 与 `alembic check`（漂移）。schema 归属被
+尊重：只迁移 `copilot` schema；`langgraph_checkpoint` 在运行时归 LangGraph。
 
-`up-agent.ps1` guarantees the two schemas exist (`CREATE SCHEMA IF NOT EXISTS`)
-before migrating. Project validation always runs Alembic against Copilot 5433,
-never HISIEM 5432.
+`up-agent.ps1` 在迁移之前保证两个 schema 存在（`CREATE SCHEMA IF NOT EXISTS`）。项目验证永远对
+Copilot 5433 跑 Alembic，永不对 HISIEM 5432。
 
 ---
 
-## 8. Launcher scripts
+## 8. 启动脚本
 
-Run from the Copilot repo root.
+从 Copilot 仓根目录运行。
 
-| Script | Purpose | Notes |
+| 脚本 | 用途 | 说明 |
 |---|---|---|
-| `scripts/dev/up-agent.ps1` | Agent Evaluation core up | Validate config → ensure containers (siem-postgres, ES, copilot-postgres) → health-check control-api → obtain Bearer token → ensure schemas → guarded migrate → start Copilot API (token in child env) → readiness → sanitized status. **Does not auto-spawn control-api JVM**; if it is down it prints a `BLOCKED` status and the exact start command. Idempotent. |
-| `scripts/dev/up-full.ps1` | Agent core + full HISIEM data stack | Calls up-agent, then `docker compose up -d kafka logstash flink-jobmanager flink-taskmanager kibana`. |
-| `scripts/dev/status.ps1` | Machine-readable status | `READY`/`DOWN`/`FAILED`/`HEAD`/`DRIFT`/`MISSING_URL`/`SET`/`MISSING` per service. Exit **0** = Agent profile fully ready; non-zero otherwise. Never prints secrets. |
-| `scripts/dev/down.ps1` | Stop the runtime | STOP preserves volumes. `-Reset` is explicit + requires typing `RESET`; only then are volumes removed. `-SkipHisiem` stops only Copilot containers. |
+| `scripts/dev/up-agent.ps1` | 拉起 Agent 评估核心 | 校验配置 → 确保容器（siem-postgres、ES、copilot-postgres）→ 健康检查 control-api → 取得 Bearer token → 确保 schema → 有守卫地迁移 → 启动 Copilot API（token 在子进程环境里）→ 就绪 → 脱敏状态。**不会自动拉起 control-api JVM**；如果它是 down，就打印一个 `BLOCKED` 状态和确切的启动命令。幂等。 |
+| `scripts/dev/up-full.ps1` | Agent 核心 + 完整 HISIEM 数据栈 | 调 up-agent，然后 `docker compose up -d kafka logstash flink-jobmanager flink-taskmanager kibana`。 |
+| `scripts/dev/status.ps1` | 机器可读状态 | 每个服务报 `READY`/`DOWN`/`FAILED`/`HEAD`/`DRIFT`/`MISSING_URL`/`SET`/`MISSING`。退出 **0** = Agent profile 完全就绪；否则非零。永不打印密钥。 |
+| `scripts/dev/down.ps1` | 停掉运行时 | STOP 保留数据卷。`-Reset` 是显式的，且要求手输 `RESET`；只有那时才删除数据卷。`-SkipHisiem` 只停 Copilot 容器。 |
 
-The `up-agent.ps1` profile **detects** (does not start) the control-api host
-JVM. If 8080 is not UP it reports `BLOCKED` with:
+`up-agent.ps1` 这个 profile 对 control-api 宿主 JVM 只**探测**（不启动）。如果 8080 不是 UP，它会
+带着下列内容报 `BLOCKED`：
 
 ```
 cd D:\Project\SIEM
 java -jar applications/control-api/target/hsiem-platform.jar
 ```
 
-(re-run up-agent once control-api reports UP).
+（等 control-api 报 UP 之后再跑一次 up-agent。）
 
 ---
 
-## 9. Health contract
+## 9. 健康契约
 
-Never judge readiness by "port is listening" alone.
+绝不要只凭「端口在监听」判定就绪。
 
-- **HISIEM control-api:** `GET /actuator/health` → HTTP 200, body
-  `{"status":"UP"}`. Not `/`, not `/api/health`.
-- **HISIEM auth liveness:** an empty `POST /api/auth/login` (permitAll) returns
-  400/401 when the endpoint is live — no credentials are sent.
-- **Copilot API:** `GET /healthz` → HTTP 200, body `{"status":"ok", ...}`.
-- **Elasticsearch:** `GET :9200/_cluster/health` → HTTP 200.
-- **Postgres containers:** `pg_isready` / `docker ps` running filter.
-
----
-
-## 10. Model readiness
-
-`scripts/dev/status.ps1` reports `Model Configuration` as `READY` when:
-
-- provider is `scripted` (deterministic, offline — no key needed), or
-- provider is `openai_compatible` and the env var named by `LLM_API_KEY_ENV`
-  (default `CMD_API_KEY`) is set.
-
-Secrets are only read from that named environment variable — never from config
-defaults, prompts, state, or logs.
+- **HISIEM control-api：** `GET /actuator/health` → HTTP 200，正文 `{"status":"UP"}`。不是 `/`，也
+  不是 `/api/health`。
+- **HISIEM 认证存活：** 一次空的 `POST /api/auth/login`（permitAll）在端点活着时返回 400/401——不
+  发送任何凭据。
+- **Copilot API：** `GET /healthz` → HTTP 200，正文 `{"status":"ok", ...}`。
+- **Elasticsearch：** `GET :9200/_cluster/health` → HTTP 200。
+- **Postgres 容器：** `pg_isready` / `docker ps` 的运行状态过滤。
 
 ---
 
-## 11. Dev secrets contract
+## 10. 模型就绪
 
-`.env.local` is gitignored and holds: `HISIEM_DEV_USERNAME`,
-`HISIEM_DEV_PASSWORD`, `HISIEM_BOOTSTRAP_PASSWORD` (first-run only),
-`HISIEM_TENANT_ID`, `CMD_API_KEY`. `.env.example` carries only variable names
-and safe placeholders. Trusted-context provider `COPILOT_AUTH_TRUSTED_CONTEXT_PROVIDER`
-is set to `header` **only** by the local launcher (X-Tenant-ID / X-Actor-Subject
-adapter) and is never a production default (`none` fails closed).
+`scripts/dev/status.ps1` 在下列情形把 `Model Configuration` 报成 `READY`：
+
+- provider 是 `scripted`（确定性、离线——不需要 key），或
+- provider 是 `openai_compatible` 且由 `LLM_API_KEY_ENV`（默认 `CMD_API_KEY`）命名的环境变量已
+  设置。
+
+密钥只从那个具名的环境变量读取——永不从配置默认值、prompt、状态或日志里读。
 
 ---
 
-## 12. Smoke validation sequence
+## 11. 开发密钥契约
+
+`.env.local` 被 gitignore，存放：`HISIEM_DEV_USERNAME`、`HISIEM_DEV_PASSWORD`、
+`HISIEM_BOOTSTRAP_PASSWORD`（仅首次运行）、`HISIEM_TENANT_ID`、`CMD_API_KEY`。`.env.example`
+只带变量名与安全占位符。可信上下文 provider `COPILOT_AUTH_TRUSTED_CONTEXT_PROVIDER` **只**由本地
+启动器设为 `header`（X-Tenant-ID / X-Actor-Subject 适配器），永不是生产默认值（`none` fail
+closed）。
+
+---
+
+## 12. 冒烟验证序列
 
 ```
 scripts/dev/status.ps1      # expect exit != 0 (DOWN) before first up
@@ -230,19 +206,15 @@ scripts/dev/up-agent.ps1    # idempotent re-up
 scripts/dev/status.ps1      # expect exit 0 (READY)
 ```
 
-No manual bootstrap, no manual token, no DB-URL or port judgment is required in
-the smoke sequence. Real first-run may require supplying `HISIEM_DEV_PASSWORD`
-(and, on a genuinely empty store, `HISIEM_BOOTSTRAP_PASSWORD`) in `.env.local`
-— the outstanding issue below.
+冒烟序列里不需要手工 bootstrap、不需要手工 token，也不需要判断 DB-URL 或端口。真正的首次运行可能
+需要在 `.env.local` 里提供 `HISIEM_DEV_PASSWORD`（在真正空的存储上还需要
+`HISIEM_BOOTSTRAP_PASSWORD`）——即下面那条未结事项。
 
 ---
 
-## 13. Outstanding issue (recorded)
+## 13. 未结事项（已记录）
 
-During the earlier GP-01 real gate, the SIEM admin password was reset via a
-direct PostgreSQL `UPDATE users`. That was effective then (the DB is the live
-store) but is **forbidden** under this baseline. The current admin plaintext is
-unknown; the runtime must instead drive the official HTTP auth flow
-(§5). The operator must provide the working dev password in `.env.local`
-(`HISIEM_DEV_PASSWORD`), or a fresh bootstrap path must be exercised. No DB
-mutation is permitted to resolve this.
+在早先的 GP-01 真实闸门期间，SIEM 管理员密码是通过直接对 PostgreSQL 执行 `UPDATE users` 重置的。
+那在当时是有效的（数据库就是活的存储），但在这份基线之下是**禁止**的。当前管理员的明文未知；运行时
+必须改为驱动官方 HTTP 认证流程（§5）。运维必须在 `.env.local` 里提供可用的 dev 密码
+（`HISIEM_DEV_PASSWORD`），或者走一条全新的 bootstrap 路径。不允许用任何数据库改动来解决这件事。
