@@ -953,7 +953,7 @@ Reliability 5、Security 3、Tenant 2、Workspace 2）。13 道硬闸门。3 个
 **还值得说的一点：** 它是在**不改动任何 HISIEM 生产代码**、也不改动本仓生产层的前提下建起来的。不变式
 变得可测，而没有被测系统被改动——这是我最想强调的部分。
 
-**参考。** [README §12](../../README.md#12-evaluation)、`docs/evaluation/`。
+**参考。** [README §12](../../README.md#12-评估)、`docs/evaluation/`。
 
 ---
 

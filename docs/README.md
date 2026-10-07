@@ -105,7 +105,7 @@
 | [`evaluation/evaluation-closure-contract.md`](evaluation/evaluation-closure-contract.md) | closure：确定性评分器、有界可重复性、套件聚合 |
 | [`evaluation/knowledge-evaluation-contract.md`](evaluation/knowledge-evaluation-contract.md) | `KB-GOLDEN-V1`——知识基线 |
 
-**跨平面验收（XP-01）**——29 个场景、13 道不可补偿的硬闸门、一个确定性聚合——写在[根 README §12](../README.md#12-evaluation) 里，并由 `tests/` 里的闸门本身作为证据。
+**跨平面验收（XP-01）**——29 个场景、13 道不可补偿的硬闸门、一个确定性聚合——写在[根 README §12](../README.md#12-评估) 里，并由 `tests/` 里的闸门本身作为证据。
 
 ---
 
