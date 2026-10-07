@@ -15,6 +15,6 @@
 -- Scope: `docker-entrypoint-initdb.d` runs ONLY when the data directory is
 -- empty, i.e. exactly once, for a fresh `copilot_pgdata` volume. An EXISTING
 -- volume never re-runs it, so the existing-volume upgrade path in
--- docs/p3/p3-a-operations.md issues the same statement by hand.
+-- docs/knowledge/operations.md issues the same statement by hand.
 
 CREATE SCHEMA IF NOT EXISTS copilot;

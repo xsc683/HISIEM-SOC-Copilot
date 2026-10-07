@@ -16,7 +16,7 @@
 # Shipping the binary is NOT the same as having the extension: the first
 # `alembic upgrade head` still issues `CREATE EXTENSION IF NOT EXISTS vector`,
 # because an extension is created per DATABASE, not per image. See
-# docs/p3/p3-a-operations.md for the safe upgrade of an existing volume.
+# docs/knowledge/operations.md for the safe upgrade of an existing volume.
 #
 # The mounted init script creates the `copilot` SCHEMA (the namespace, not any
 # table). Every connection pins `search_path=copilot`, so without it a fresh

@@ -153,7 +153,7 @@ def _rows(sql: str, *, database: str) -> list[tuple[object, ...]]:
 def _alembic(*args: str, database_url: str) -> subprocess.CompletedProcess[str]:
     """Run the operator's command, in the operator's environment.
 
-    The URL is passed exactly the way ``docs/p3/p3-a-operations.md`` documents it,
+    The URL is passed exactly the way ``docs/knowledge/operations.md`` documents it,
     and the environment is inherited rather than rebuilt, so a run here fails for
     the same reasons a real one would.
     """

@@ -235,7 +235,7 @@ async def _check_vector_extension(engine: AsyncEngine) -> DiagnosticCheck:
         "vector_extension",
         FAIL,
         "the vector extension is not installed in this database; see "
-        "docs/p3/p3-a-operations.md for the one-time prerequisite",
+        "docs/knowledge/operations.md for the one-time prerequisite",
     )
 
 
@@ -330,7 +330,7 @@ async def _check_attack_release_projection(
             "normal retrieval disagree: "
             + "; ".join(diverged)
             + ". Re-import the release with --activate to stage and cut over "
-            "atomically (see docs/p3/p3-a-operations.md)",
+            "atomically (see docs/knowledge/operations.md)",
         )
     if not active:
         return DiagnosticCheck(
@@ -358,7 +358,7 @@ async def _check_attack_release_authority(
     who restores a dump, or applies a migration set out of order, can end up with
     the index missing, and then the rows are the only witness left. It is also the
     surface where the ambiguity the upgrade deliberately refused to resolve (see
-    the migration and ``docs/p3/p3-a-operations.md``) becomes visible.
+    the migration and ``docs/knowledge/operations.md``) becomes visible.
     """
     async with unit_of_work_factory() as uow:
         active = await uow.attack_releases.list_active()
@@ -383,7 +383,7 @@ async def _check_attack_release_authority(
             f"ATTACK_RELEASE_AUTHORITY_AMBIGUOUS - more than one ACTIVE release for "
             f"{detail}. Exactly one release per framework may be authoritative; "
             "reactivate the intended release and leave the others inactive, then "
-            "re-run this check (see docs/p3/p3-a-operations.md)",
+            "re-run this check (see docs/knowledge/operations.md)",
         )
     if not active:
         return DiagnosticCheck(
@@ -395,7 +395,7 @@ async def _check_attack_release_authority(
             "pre-existing rows claimed more than one release of a framework and "
             "it therefore refused to choose; the other is simply that nothing has "
             "been imported yet. Either way the fix is the same -- import the "
-            "intended release with --activate (see docs/p3/p3-a-operations.md)",
+            "intended release with --activate (see docs/knowledge/operations.md)",
         )
     return DiagnosticCheck(
         "attack_release_authority",
