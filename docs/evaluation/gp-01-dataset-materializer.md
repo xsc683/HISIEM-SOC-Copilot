@@ -1,11 +1,12 @@
-# GP-01 Dataset Materializer Contract
+# GP-01 数据集物化器契约
 
-## 1. Scope
+## 1. 范围
 
-This document defines the GP-01 Dataset Materializer contract. (Provenance: delivered as
-working step `E1-B.3`; that code is engineering history, not the name of anything here.)
+本文档定义 GP-01 Dataset Materializer 契约。（来源：作为工作步骤 `E1-B.3` 交付；那个代号是工程史，
+不是这里任何东西的名字。）
 
-The Materializer turns the committed logical GP-01 scenario into real HISIEM resources and resolves their provider identities for later evaluation.
+物化器把已提交的逻辑 GP-01 场景变成真实的 HISIEM 资源，并解析出它们的 provider 身份以供后续评估
+使用。
 
 ```text
 Committed GP-01 Scenario
@@ -23,22 +24,22 @@ Dataset verification
 VerifiedDataset
 ```
 
-The Materializer does not run the Copilot investigation, decide the verdict, score the result, or seal the evaluation manifest.
+物化器不跑 Copilot 调查、不决定判定、不给结果打分、也不封存评估清单。
 
-## 2. Authority boundaries
+## 2. 权威边界
 
-The Materializer MUST use HISIEM as the source of truth for materialized resources.
+物化器必须以 HISIEM 作为已物化资源的真相来源。
 
-It MUST NOT:
+它不得：
 
-- write directly to Elasticsearch;
-- produce directly to Kafka;
-- write directly to `siem-alerts`;
-- write Copilot domain state;
-- derive provider addressing identifiers locally;
-- expose evaluation oracle facts to the Copilot runtime.
+- 直接写 Elasticsearch；
+- 直接向 Kafka 生产；
+- 直接写 `siem-alerts`；
+- 写 Copilot 领域状态；
+- 在本地推导 provider 寻址标识符；
+- 把评估 oracle 事实暴露给 Copilot 运行时。
 
-GP-01 event injection MUST enter through the real SSH log ingestion path used by HISIEM. The intended path is:
+GP-01 事件注入必须经由 HISIEM 所用的真实 SSH 日志摄取路径进入。预定路径是：
 
 ```text
 TCP SSH log input
@@ -48,61 +49,63 @@ TCP SSH log input
 → siem-alerts
 ```
 
-Provider resources are considered materialized only after they are resolvable through HISIEM-supported read interfaces.
+只有当 provider 资源能通过 HISIEM 支持的读接口解析到时，才被认为已物化。
 
-## 3. GP-01 logical dataset
+## 3. GP-01 逻辑数据集
 
-GP-01 contains six semantic events and one control event.
+GP-01 含六个语义事件和一个控制事件。
 
-Semantic events:
+语义事件：
 
-- `F1` — SSH authentication failure
-- `F2` — SSH authentication failure
-- `F3` — SSH authentication failure
-- `F4` — SSH authentication failure
-- `F5` — SSH authentication failure
-- `S1` — SSH authentication success after the failure sequence
+- `F1` —— SSH 认证失败
+- `F2` —— SSH 认证失败
+- `F3` —— SSH 认证失败
+- `F4` —— SSH 认证失败
+- `F5` —— SSH 认证失败
+- `S1` —— 失败序列之后的 SSH 认证成功
 
-`F1` through `F5` MUST share:
+`F1` 到 `F5` 必须共享：
 
-- `source.ip`;
-- `user.name`;
-- `host.name`;
-- `event.category = authentication`;
-- `event.action = authentication_failure`;
-- `event.outcome = failure`.
+- `source.ip`；
+- `user.name`；
+- `host.name`；
+- `event.category = authentication`；
+- `event.action = authentication_failure`；
+- `event.outcome = failure`。
 
-`S1` MUST share the same source, account, and host and MUST satisfy:
+`S1` 必须共享同样的来源、账号与主机，并且必须满足：
 
-- `event.category = authentication`;
-- `event.action = authentication_success`;
-- `event.outcome = success`;
-- `S1.timestamp > max(F1..F5.timestamp)`.
+- `event.category = authentication`；
+- `event.action = authentication_success`；
+- `event.outcome = success`；
+- `S1.timestamp > max(F1..F5.timestamp)`。
 
-The scenario ground truth is that a brute-force sequence is followed by a successful authentication for the same entity. Expected verdict data belongs to the evaluation oracle and MUST NOT be passed to the investigation runtime.
+场景的 ground truth 是：一次暴力破解序列之后，同一个实体出现了一次成功认证。预期判定数据属于评估
+oracle，不得传给调查运行时。
 
-## 4. Watermark control event
+## 4. watermark 控制事件
 
-The Materializer MUST generate one control event `W1` when the deployed detection runtime requires event-time advancement for the relevant window to close.
+当所部署的检测运行时需要推进事件时间才能让相关窗口关闭时，物化器必须生成一个控制事件 `W1`。
 
-`W1` exists only to advance detection processing. It MUST:
+`W1` 存在的唯一目的是推进检测处理。它必须：
 
-- be classified as `WATERMARK_CONTROL`;
-- use an entity distinct from the GP-01 attack entity;
-- use a distinct `source.ip`;
-- not satisfy any GP-01 evidence requirement;
-- not be included in semantic ground truth;
-- not be injected into Copilot graph state or prompts.
+- 被归类为 `WATERMARK_CONTROL`；
+- 使用一个与 GP-01 攻击实体不同的实体；
+- 使用一个不同的 `source.ip`；
+- 不满足任何 GP-01 证据要求；
+- 不被纳入语义 ground truth；
+- 不被注入 Copilot 图状态或 prompt。
 
-The event remains a real HISIEM event and therefore may be observable if an investigation performs an intentionally broad search. Evaluation scoring MUST classify it as control data and MUST NOT allow it to satisfy GP-01 evidence requirements.
+该事件仍然是一个真实的 HISIEM 事件，因此如果某次调查做了刻意宽泛的检索，它可能被观测到。评估打分
+必须把它归类为控制数据，且不得允许它满足 GP-01 证据要求。
 
-## 5. Runtime identity
+## 5. 运行身份
 
-Each materialization creates a unique `run_id` and a deterministic short `run_tag` derived from it.
+每次物化都创建一个唯一的 `run_id` 以及由它派生的确定性短 `run_tag`。
 
-Runtime-specific entities MUST be derived from `run_id` so concurrent or repeated evaluation runs do not share the same detection identity.
+运行期特定的实体必须从 `run_id` 派生，好让并发或重复的评估运行不会共用同一个检测身份。
 
-At minimum the bound scenario MUST contain:
+至少，绑定后的场景必须包含：
 
 ```text
 run_id
@@ -115,19 +118,19 @@ event timestamps
 rendered SSH log lines
 ```
 
-Required invariant:
+必需不变式：
 
 ```text
 attack_source_ip != watermark_source_ip
 ```
 
-Different run identities SHOULD derive different attack entities so prior detection suppression state cannot contaminate a new run.
+不同的运行身份应当派生出不同的攻击实体，好让此前的检测抑制状态无法污染一次新的运行。
 
-## 6. Time plan
+## 6. 时间计划
 
-The logical scenario MUST be bound to past timestamps at materialization time. It MUST NOT generate future events.
+逻辑场景必须在物化时绑定到过去的时刻。它不得生成未来事件。
 
-Recommended plan:
+推荐计划：
 
 ```text
 anchor = floor(now - safe_history_offset)
@@ -141,30 +144,31 @@ S1 = anchor + 70s
 W1 = anchor + 7m
 ```
 
-The exact offsets may be configuration constants, but the following invariants are mandatory:
+确切偏移量可以是配置常量，但下列不变式是强制的：
 
-- all failure events are inside the configured brute-force detection interval;
-- `S1` occurs after all failure events;
-- `W1` occurs after the relevant detection-window close boundary;
-- all generated timestamps are in the past when injection starts.
+- 所有失败事件都在所配置的暴力破解检测区间内；
+- `S1` 发生在所有失败事件之后；
+- `W1` 发生在相关检测窗口关闭边界之后；
+- 在注入开始时，所有生成的时刻都已过去。
 
-SSH syslog rendering MUST use the timezone expected by the deployed HISIEM parser. For the current GP-01 environment this is `Asia/Shanghai`.
+SSH syslog 渲染必须使用所部署 HISIEM 解析器预期的时区。对当前 GP-01 环境，这是 `Asia/Shanghai`。
 
-Because the SSH syslog form does not carry a year, the Materializer MUST reject a time plan that crosses a natural-year boundary rather than guess parser year-completion behavior.
+由于 SSH syslog 形式不携带年份，物化器必须拒绝任何跨越自然年边界的时间计划，而不是去猜解析器的
+年份补全行为。
 
-Failure code:
+失败码：
 
 ```text
 EVENT_PLAN_CROSSES_YEAR_BOUNDARY
 ```
 
-## 7. Logical and provider identities
+## 7. 逻辑身份与 provider 身份
 
-Scenario identities and HISIEM provider identities are different concepts.
+场景身份与 HISIEM provider 身份是两个不同的概念。
 
-A logical event identity such as `F1` MUST NOT be treated as an Elasticsearch document id.
+像 `F1` 这样的逻辑事件身份不得被当作 Elasticsearch 文档 id。
 
-A resolved event reference MUST use the values returned by HISIEM:
+一条已解析的事件引用必须使用 HISIEM 返回的值：
 
 ```text
 provider = hisiem
@@ -172,7 +176,7 @@ index = real _index
 document_id = real _id
 ```
 
-The source alert reference MUST use the actual identifier accepted by the HISIEM alert detail API:
+来源告警引用必须使用 HISIEM 告警详情 API 实际接受的标识符：
 
 ```text
 provider = hisiem
@@ -181,11 +185,12 @@ address_id = real HISIEM alert addressing id
 business_id = optional business alert id
 ```
 
-For the current HISIEM implementation, alert addressing uses the Elasticsearch document `_id`. The Materializer MUST resolve it from HISIEM and MUST NOT infer it from `alert.id`, `run_id`, event ids, timestamps, or hashes.
+对当前 HISIEM 实现，告警寻址用的是 Elasticsearch 文档 `_id`。物化器必须从 HISIEM 解析它，且不得从
+`alert.id`、`run_id`、事件 id、时间戳或哈希推断它。
 
-## 8. Materializer model
+## 8. 物化器模型
 
-The evaluation package SHOULD expose provider-neutral types equivalent to:
+评估包应当暴露与下列等价的 provider 中立类型：
 
 ```text
 ScenarioSpec
@@ -200,7 +205,7 @@ MaterializationDraft
 VerifiedDataset
 ```
 
-`ResolvedEvent` MUST contain only bounded normalized fields needed to prove scenario identity and later scoring, including:
+`ResolvedEvent` 必须只包含用来证明场景身份与供后续打分所需的、有界的归一化字段，包括：
 
 ```text
 logical_role
@@ -217,9 +222,9 @@ host_name
 message_fingerprint
 ```
 
-It MUST NOT persist complete Elasticsearch documents as the normal evaluation representation.
+它不得把完整的 Elasticsearch 文档持久化成常规评估表示。
 
-`ResolvedAlert` SHOULD contain:
+`ResolvedAlert` 应当包含：
 
 ```text
 provider
@@ -234,9 +239,9 @@ status
 related_event_refs[]
 ```
 
-## 9. State machine
+## 9. 状态机
 
-Materialization MUST use an explicit state machine:
+物化必须使用一个显式状态机：
 
 ```text
 NEW
@@ -256,55 +261,56 @@ VERIFIED
 MATERIALIZED
 ```
 
-Failure states:
+失败状态：
 
 ```text
 FAILED
 INDETERMINATE
 ```
 
-`INDETERMINATE` is required for non-idempotent injection whose server-side outcome cannot be proven.
+对于无法证明服务端结果的非幂等注入，必须有 `INDETERMINATE`。
 
-## 10. Preflight
+## 10. 预检
 
-No write may occur before all preflight checks pass.
+在所有预检通过之前，不得发生任何写入。
 
-Required checks:
+必需检查：
 
-### 10.1 HISIEM reachability
+### 10.1 HISIEM 可达性
 
-The configured HISIEM control/read surface MUST be reachable.
+所配置的 HISIEM 控制/读表面必须可达。
 
-### 10.2 Tenant validity
+### 10.2 租户有效性
 
-The evaluation tenant MUST be readable using the configured trusted test credentials.
+评估租户必须能用所配置的可信测试凭据读取。
 
-### 10.3 Detection-rule contract
+### 10.3 检测规则契约
 
-The deployed SSH brute-force rule MUST match the scenario assumptions required by GP-01. At minimum verify the effective rule identity, enabled state, key field, failure predicate, threshold, and detection window.
+所部署的 SSH 暴力破解规则必须匹配 GP-01 所需的场景假设。至少核验生效的规则身份、启用状态、关键
+字段、失败谓词、阈值与检测窗口。
 
-A material semantic mismatch MUST fail with:
+任何实质性的语义不匹配都必须以如下失败：
 
 ```text
 RULE_CONTRACT_MISMATCH
 ```
 
-Evaluation MUST NOT silently adapt GP-01 to a changed detection rule.
+评估不得为了让 GP-01 适配一条变过的检测规则而静默调整它。
 
-### 10.4 Run collision
+### 10.4 运行冲突
 
-Before injection, search the bounded GP-01 time/entity scope.
+在注入之前，检索有界的 GP-01 时间/实体作用域。
 
-- resources already belonging to the same `run_id` enter reconciliation/resume;
-- resources colliding with a different run identity fail with `RUN_IDENTITY_COLLISION`.
+- 已经属于同一个 `run_id` 的资源进入对账/续跑；
+- 与另一个运行身份冲突的资源以 `RUN_IDENTITY_COLLISION` 失败。
 
-### 10.5 Time validity
+### 10.5 时间有效性
 
-The time plan MUST pass the past-time, detection-window, and year-boundary invariants.
+时间计划必须通过过去时刻、检测窗口与年边界这三组不变式。
 
-## 11. Injection protocol
+## 11. 注入协议
 
-Injection order is fixed:
+注入顺序是固定的：
 
 ```text
 F1
@@ -316,9 +322,9 @@ S1
 W1
 ```
 
-The caller MUST NOT reorder events.
+调用方不得重排事件。
 
-Each attempted injection MUST record bounded audit data:
+每次尝试注入都必须记录有界的审计数据：
 
 ```text
 logical_role
@@ -328,31 +334,33 @@ socket_target
 write_status
 ```
 
-Secrets and authorization material MUST NOT be recorded.
+密钥与授权材料不得记录。
 
-The rendered log line SHOULD carry a materializer-only correlation fingerprint using fields that survive in the HISIEM event representation, such as host, timestamp, source address, process id, and action. This fingerprint is a resolver aid only; it does not become provider identity.
+渲染出的日志行应当携带一个只属于物化器的关联指纹，使用那些在 HISIEM 事件表示里能存活下来的字段，
+例如 host、timestamp、来源地址、进程 id 与 action。这个指纹只是解析辅助；它不会变成 provider 身份。
 
-## 12. Non-idempotent TCP rule
+## 12. 非幂等 TCP 规则
 
-TCP injection MUST NOT be blindly retried after an ambiguous outcome.
+TCP 注入在结果有歧义之后不得盲目重试。
 
-If the client cannot determine whether a rendered event was accepted after a write attempt:
+如果客户端在一次写入尝试之后无法确定某个渲染事件是否被接受：
 
 ```text
 state = INDETERMINATE
 ```
 
-A rerun with the same `run_id` MUST default to reconciliation and resolution. It MUST NOT resend an already-attempted event automatically.
+用同一个 `run_id` 重跑必须默认为对账与解析。它不得自动重发一个已经尝试过的事件。
 
-If the existing run cannot be reconciled to one unambiguous provider dataset, the run is abandoned and a new `run_id` is required.
+如果既有运行无法对账到一个无歧义的 provider 数据集，该运行作废，并且需要一个新 `run_id`。
 
-This rule prevents an uncertain retry from changing a five-event failure sequence into a six-event sequence.
+这条规则防止一次不确定的重试，把五事件的失败序列变成六事件序列。
 
-## 13. Event resolution
+## 13. 事件解析
 
-After injection, events MUST be resolved through the HISIEM structured log-search API. Direct Elasticsearch queries are prohibited for normal Materializer behavior.
+注入之后，事件必须经由 HISIEM 结构化日志检索 API 解析。常规物化器行为禁止直接查询
+Elasticsearch。
 
-For each of `F1..F5`, `S1`, and `W1`:
+对 `F1..F5`、`S1` 与 `W1` 各一次：
 
 ```text
 0 valid matches  → continue bounded polling
@@ -360,29 +368,30 @@ For each of `F1..F5`, `S1`, and `W1`:
 >1 valid matches → AMBIGUOUS_EVENT
 ```
 
-Resolution MUST validate at least:
+解析必须至少校验：
 
-- `_index`;
-- `_id`;
-- `@timestamp`;
-- `event.category`;
-- `event.action`;
-- `event.outcome` when present;
-- `source.ip`;
-- `user.name`;
-- `host.name`;
-- `log.source_id` when present;
-- correlation fingerprint fields when present.
+- `_index`；
+- `_id`；
+- `@timestamp`；
+- `event.category`；
+- `event.action`；
+- `event.outcome`（若存在）；
+- `source.ip`；
+- `user.name`；
+- `host.name`；
+- `log.source_id`（若存在）；
+- 关联指纹字段（若存在）。
 
-All seven events MUST resolve before alert sealing can proceed.
+七个事件必须全部解析成功，才能开始封存告警。
 
-## 14. Alert resolution
+## 14. 告警解析
 
-Alert resolution starts only after event resolution succeeds.
+告警解析只在事件解析成功之后开始。
 
-The Materializer MUST use HISIEM alert APIs and MUST validate candidate alerts against the current run. Candidate selection MUST include the expected detection rule and attack entity and SHOULD include current-run time and related-event constraints where available.
+物化器必须使用 HISIEM 告警 API，并且必须把候选告警与当前运行对照校验。候选筛选必须包含预期的检测
+规则与攻击实体，并且在可用时应当包含当前运行的时间与关联事件约束。
 
-Resolution semantics:
+解析语义：
 
 ```text
 0 valid candidates  → continue bounded polling
@@ -390,17 +399,18 @@ Resolution semantics:
 >1 valid candidates → AMBIGUOUS_SOURCE_ALERT
 ```
 
-The Materializer MUST NOT resolve ambiguity by selecting the newest alert, the highest risk score, or an arbitrary first result.
+物化器不得通过挑最新告警、最高风险分或任意第一条结果来解决歧义。
 
-After selecting a candidate, it MUST read the alert detail using the resolved addressing identifier and verify the same invariants again.
+选定候选之后，它必须用已解析的寻址标识符读取该告警详情，并再次核验同样的那些不变式。
 
-## 15. Alert stability barrier
+## 15. 告警稳定屏障
 
-The first visible alert is not necessarily stable when the detection pipeline may continue updating the same logical alert.
+当检测管线可能继续更新同一条逻辑告警时，第一条可见告警不一定是稳定的。
 
-Before verification, the Materializer MUST establish a bounded stability barrier. A suitable implementation is repeated reads until a stable fingerprint is observed for a configured number of consecutive observations.
+在校验之前，物化器必须建立一个有界的稳定屏障。一个合适的实现是重复读取，直到在连续配置次数次观测
+中看到同一个稳定指纹。
 
-The fingerprint SHOULD contain:
+指纹应当包含：
 
 ```text
 address_id
@@ -411,19 +421,19 @@ related-event identity set
 status
 ```
 
-If stability cannot be established before the configured deadline:
+如果在配置的截止时间之前无法建立稳定：
 
 ```text
 ALERT_NOT_STABLE
 ```
 
-The dataset MUST NOT be verified or sealed.
+数据集不得被校验或封存。
 
-## 16. Dataset verification
+## 16. 数据集校验
 
-The Materializer MUST produce `VerifiedDataset` only when all mandatory invariants hold.
+只有当所有强制不变式都成立时，物化器才能产出 `VerifiedDataset`。
 
-### 16.1 Event invariants
+### 16.1 事件不变式
 
 ```text
 count(F1..F5) = 5
@@ -446,7 +456,7 @@ W1:
   source != attack source
 ```
 
-### 16.2 Detection invariants
+### 16.2 检测不变式
 
 ```text
 source alert exists
@@ -455,21 +465,21 @@ source alert entity matches attack entity
 source alert represents the required failure threshold
 ```
 
-If HISIEM exposes related-event references, the verifier SHOULD cross-check them against the resolved failure event references.
+如果 HISIEM 暴露了关联事件引用，校验器应当把它们与已解析的失败事件引用交叉核对。
 
-### 16.3 Addressing invariant
+### 16.3 寻址不变式
 
 ```text
 source_alert.address_id == actual HISIEM alert API addressing id
 ```
 
-### 16.4 Isolation invariant
+### 16.4 隔离不变式
 
-Resolved provider resources MUST belong unambiguously to the current materialization identity and MUST NOT mix events from another run.
+已解析的 provider 资源必须无歧义地属于当前物化身份，且不得混入另一次运行的事件。
 
-## 17. Materialization draft
+## 17. 物化草稿
 
-The current run SHOULD maintain a mutable local run ledger:
+当前运行应当维护一份可变的本地运行账本：
 
 ```text
 .eval-runs/
@@ -478,27 +488,27 @@ The current run SHOULD maintain a mutable local run ledger:
       materialization.json
 ```
 
-The draft records state, attempted injections, resolution progress, and failure diagnostics required for resume/reconciliation.
+草稿记录状态、已尝试的注入、解析进度，以及续跑/对账所需的失败诊断。
 
-It is not an evaluation manifest and MUST NOT be consumed by the scorer as ground truth.
+它不是评估清单，且不得被评分器当作 ground truth 消费。
 
-Generated `.eval-runs/` artifacts SHOULD be excluded from Git.
+生成的 `.eval-runs/` 产物应当排除在 Git 之外。
 
-## 18. Resume semantics
+## 18. 续跑语义
 
-A resume operation may:
+一次续跑操作可以：
 
-- read `materialization.json`;
-- query HISIEM for already-attempted resources;
-- complete missing event resolution;
-- complete alert resolution;
-- re-run dataset verification.
+- 读 `materialization.json`；
+- 向 HISIEM 查询已经尝试过的资源；
+- 完成缺失的事件解析；
+- 完成告警解析；
+- 重跑数据集校验。
 
-A resume operation MUST NOT automatically re-inject previously attempted events.
+一次续跑操作不得自动重新注入此前已尝试过的事件。
 
-## 19. Error taxonomy
+## 19. 错误分类
 
-The implementation SHOULD expose typed failures equivalent to:
+实现应当暴露与下列等价的类型化失败：
 
 ```text
 PreflightError
@@ -514,11 +524,11 @@ AlertNotStableError
 DatasetInvariantViolation
 ```
 
-Evaluation failures MUST preserve enough bounded structured context for diagnosis without persisting secrets or raw credential material.
+评估失败必须保留足够的有界结构化上下文以供诊断，同时不持久化密钥或原始凭据材料。
 
-## 20. Package boundary
+## 20. 包边界
 
-Recommended package shape:
+推荐的包形状：
 
 ```text
 src/hisiem_soc_copilot/evaluation/
@@ -533,47 +543,48 @@ src/hisiem_soc_copilot/evaluation/
 └── cli.py
 ```
 
-The evaluation package may depend on production public contracts and adapters. Production domain, application, graph, and provider packages MUST NOT depend on evaluation oracle code.
+评估包可以依赖生产的公开契约与 adapter。生产领域、application、图与 provider 包不得依赖评估 oracle
+代码。
 
-## 21. Test contract
+## 21. 测试契约
 
-Default unit and integration tests MUST NOT mutate a real HISIEM deployment.
+默认的单元测试与集成测试不得改动真实的 HISIEM 部署。
 
-Real materialization tests MUST be explicitly enabled, for example with:
+真实物化测试必须被显式启用，例如：
 
 ```text
 RUN_HISIEM_DATASET_EVAL=1
 ```
 
-The live GP-01 Materializer test MUST prove:
+活的 GP-01 物化器测试必须证明：
 
-1. `F1..F5` resolve to real HISIEM event documents;
-2. `S1` resolves to a real success event;
-3. `W1` resolves as an independent control event;
-4. the real SSH brute-force alert appears;
-5. the alert reference uses the actual HISIEM addressing `_id`;
-6. the alert correlates unambiguously to the current run;
-7. `DatasetVerifier` returns `VerifiedDataset`.
+1. `F1..F5` 解析到真实的 HISIEM 事件文档；
+2. `S1` 解析到一个真实的成功事件；
+3. `W1` 作为一个独立的控制事件解析到位；
+4. 真实的 SSH 暴力破解告警出现；
+5. 告警引用使用实际的 HISIEM 寻址 `_id`；
+6. 告警无歧义地与当前运行关联；
+7. `DatasetVerifier` 返回 `VerifiedDataset`。
 
-Unit tests MUST cover at least:
+单元测试必须至少覆盖：
 
-- deterministic time planning;
-- failure-window invariants;
-- `S1` ordering;
-- `W1` entity separation;
-- year-boundary rejection;
-- deterministic identity binding per `run_id`;
-- fixed injection order;
-- no retry after indeterminate TCP outcome;
-- resume without injection;
-- ambiguous event rejection;
-- ambiguous alert rejection;
-- prohibition on deriving `address_id` from `alert.id`;
-- verification failure when `S1` does not match the attack entity.
+- 确定性时间计划；
+- 失败窗口不变式；
+- `S1` 的次序；
+- `W1` 的实体分离；
+- 年边界拒绝；
+- 按 `run_id` 的确定性身份绑定；
+- 固定的注入顺序；
+- 不确定 TCP 结果之后不重试；
+- 不注入的续跑；
+- 歧义事件拒绝；
+- 歧义告警拒绝；
+- 禁止从 `alert.id` 推 `address_id`；
+- `S1` 不匹配攻击实体时的校验失败。
 
-## 22. Completion gate
+## 22. 完成闸门
 
-The materializer is complete only when the real environment demonstrates:
+只有当真实环境证明下列全部时，物化器才算完成：
 
 ```text
 Logical GP-01
@@ -585,4 +596,4 @@ Logical GP-01
 → VerifiedDataset
 ```
 
-A script completing without these proofs is not sufficient to declare the stage complete.
+一个没有这些证明就跑完的脚本，不足以宣称这个阶段完成。
