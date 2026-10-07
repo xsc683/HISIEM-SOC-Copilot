@@ -360,7 +360,8 @@ release_fingerprint(framework, source_release, techniques) -> "<64 hex>"
 守卫的降级仍然成功。从该修订的头开始，`downgrade -1` 只移除新增的可空 outbox trace-context 列；
 `downgrade -2` 会碰到这道守卫。一道挡住干净路径的守卫本身才是 bug。
 
-**诚实的残留。** 守卫住在新修订里，因为 `c41f7b2e9d08` 是冻结的、不得编辑。因此它会拦下任何跨过这个
+**诚实的残留。** 守卫住在新修订里，因为 `c41f7b2e9d08` 已发布：它的 revision id 与 schema 操作不得
+更改（可以改的只有注释与人类可读的消息文本）。因此它会拦下任何跨过这个
 修订的降级——从该修订的头开始，`downgrade -2` 与 `downgrade <更早修订>` 都会先跑它——但一个在本
 修订存在之前就停在 `c41f7b2e9d08` 的数据库**不**在覆盖范围内。处于那种位置的运维必须先跑
 `alembic upgrade head`（免费：升级是纯追加的），然后才能降级。

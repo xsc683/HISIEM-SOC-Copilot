@@ -90,7 +90,7 @@ _CK_RELEASE_COUNT = "ck_attack_release_attack_release_technique_count_valid"
 #: first and only chunking of its version.
 _BACKFILL_GENERATION = 1
 
-#: Reported by the upgrade, and greppable in ``docs/p3/p3-a-operations.md`` and in
+#: Reported by the upgrade, and greppable in ``docs/knowledge/operations.md`` and in
 #: the ``knowledge doctor`` output, so an operator who sees it once can find the
 #: remediation without re-running the migration.
 _AMBIGUOUS_CODE = "ATTACK_RELEASE_AUTHORITY_AMBIGUOUS"
@@ -482,7 +482,7 @@ def _report_ambiguous(ambiguous: Sequence[Row[Any]]) -> None:
     lines.append(
         "  Re-run `knowledge doctor` afterwards: it reports the same code until "
         "exactly one release per framework is ACTIVE. See "
-        "docs/p3/p3-a-operations.md."
+        "docs/knowledge/operations.md."
     )
     lines.append("")
     print("\n".join(lines))
