@@ -1,63 +1,52 @@
-# P3-A Operations
+# 知识子系统运维
 
-How to provision, verify, ingest, search, and evaluate the knowledge subsystem.
+如何供给、验证、摄取、检索与评估知识子系统。
 
-**Nothing in this document requires dropping a volume, resetting a database, or
-re-sealing GP-01.** The P3-A migrations only ever add their own tables; they remove
-nothing that existed before them. The closure revision copies every pre-existing
-chunk forward **preserving its `id`**, so neither an upgrade nor a rollback
-discards knowledge that was already stored.
+**本文档中的任何步骤都不需要删数据卷、重置数据库或重新封存 GP-01。** 知识子系统的迁移只添加自己
+的表；它们不删除任何先于它们存在的东西。闭合版迁移把每一个既有内容块向前复制，并**保留它的 `id`**，
+所以无论升级还是回滚，都不会丢弃已经存下的知识。
 
-> **The knowledge Agent tools are live.** `knowledge.retrieve_security_guidance` and
-> `knowledge.resolve_attack_technique` **are registered and model-selectable** — the model
-> can read this subsystem through those two bounded, read-only tools (see
-> [security-boundary.md](security-boundary.md) §7).
+> **知识 Agent 工具是活的。** `knowledge.retrieve_security_guidance` 与
+> `knowledge.resolve_attack_technique` **已注册且模型可选**——模型能通过这两个有界、只读的工具读取
+> 这个子系统（见 [security-boundary.md](security-boundary.md) §7）。
 >
-> What follows is nevertheless an **operator procedure**: provisioning, ingest, release
-> cutover and evaluation are not reachable from the model, which can only query.
+> 但下面这些依然是**运维流程**：供给、摄取、发布切换与评估对模型不可达，模型只能查询。
 
-## 1. Prerequisites
+## 1. 前置条件
 
-| Requirement | Notes |
+| 要求 | 说明 |
 |---|---|
-| PostgreSQL 16 **with pgvector** | Shipped by `infra/docker-compose.yml` as **`pgvector/pgvector:pg16`** — a pinned tag, not `postgres:16` and not `latest`. See §2.1. |
-| The `copilot` schema | Created for you on a fresh volume by `infra/postgres-init/01-copilot-schema.sql`. On an existing volume it may need one statement by hand — see §2.3. |
-| Python env | `.venv/Scripts/python.exe` on Windows |
-| `COPILOT_DATABASE_URL` | Defaults to `postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot` |
+| PostgreSQL 16 **带 pgvector** | 由 `infra/docker-compose.yml` 提供，镜像是 **`pgvector/pgvector:pg16`**——一个钉住的 tag，不是 `postgres:16`，也不是 `latest`。见 §2.1。 |
+| `copilot` schema | 在全新数据卷上由 `infra/postgres-init/01-copilot-schema.sql` 为你创建。在既有数据卷上可能需要手工执行一条语句——见 §2.3。 |
+| Python 环境 | Windows 上是 `.venv/Scripts/python.exe` |
+| `COPILOT_DATABASE_URL` | 默认 `postgresql+psycopg://copilot:copilot@127.0.0.1:5433/copilot` |
 
-The connection is pinned to the `copilot` schema via `search_path`, which is why
-the schema has to **exist** before Alembic can record anything in it. That detail
-is the source of both confusing failure modes in §2.
+连接通过 `search_path` 钉在 `copilot` schema 上，所以该 schema 必须**先存在**，Alembic 才能在里
+面记录任何东西。这个细节正是 §2 里两种令人困惑的失效模式的来源。
 
-**Never `docker compose down -v`.** The volume is `copilot_pgdata`; it holds every
-investigation, evidence row, and knowledge document in the deployment. Every
-procedure in this document works against the volume that already exists.
+**永远不要 `docker compose down -v`。** 数据卷是 `copilot_pgdata`；它装着这套部署里的每一次调查、
+每一行证据、每一份知识文档。本文档里的每个流程都是针对**已经存在**的那个数据卷的。
 
-## 2. pgvector and the `copilot` schema
+## 2. pgvector 与 `copilot` schema
 
-pgvector is an **infrastructure prerequisite**. It is a PostgreSQL extension, not
-a Python dependency the application can install for you, and it cannot be added to
-a server image that does not ship it.
+pgvector 是一个**基础设施前置条件**。它是 PostgreSQL 扩展，不是应用能替你装的 Python 依赖，也无法
+加到一个不自带它的服务器镜像上。
 
-### 2.1 The shipped image
+### 2.1 随仓提供的镜像
 
-`infra/docker-compose.yml` runs **`pgvector/pgvector:pg16`** — upstream PostgreSQL
-16 with the pgvector extension added, on a **pinned** tag rather than `latest`.
-The plain `postgres:16` image does **not** ship pgvector, so a fresh clone on that
-image dies at the first migration with `type "vector" does not exist`, and no
-amount of configuration recovers it. That is why the default compose file is the
-pgvector image. Nothing else about the service changed: same `container_name`, same
-`5433:5432` port mapping, same `POSTGRES_USER`/`POSTGRES_DB`, same `copilot_pgdata`
-volume. HISIEM's own PostgreSQL on `5432` is untouched.
+`infra/docker-compose.yml` 跑的是 **`pgvector/pgvector:pg16`**——上游 PostgreSQL 16 加上 pgvector
+扩展，而且 tag 是**钉住的**，不是 `latest`。朴素的 `postgres:16` 镜像**不**自带 pgvector，所以在那个
+镜像上做一次全新克隆，会在第一个迁移处就死于 `type "vector" does not exist`，再怎么配置也救不回来。
+这就是默认 compose 文件用 pgvector 镜像的原因。这个服务的其他部分都没变：同样的
+`container_name`、同样的 `5433:5432` 端口映射、同样的 `POSTGRES_USER`/`POSTGRES_DB`、同样的
+`copilot_pgdata` 数据卷。HISIEM 自己在 `5432` 上的 PostgreSQL 不受影响。
 
-Shipping the binary is **not** the same as having the extension. An extension is
-created **per database**, not per image, so the first `alembic upgrade head` still
-issues `CREATE EXTENSION IF NOT EXISTS vector`. Nothing here assumes a superuser:
-the migration verifies the extension is present, attempts to create it if the role
-is permitted to, and otherwise fails explicitly with an actionable message *before
-any table exists*.
+自带二进制**不**等于扩展已经可用。扩展是**按数据库**创建的，不是按镜像创建的，所以第一次
+`alembic upgrade head` 依然会发出 `CREATE EXTENSION IF NOT EXISTS vector`。这里没有任何地方假定
+超级用户：迁移会先确认扩展是否存在，若角色被允许则尝试创建，否则**在任何表存在之前**就带着一条可
+据以行动的消息显式失败。
 
-### 2.2 A fresh clone
+### 2.2 全新克隆
 
 ```bash
 docker compose -f infra/docker-compose.yml up -d
@@ -65,49 +54,46 @@ docker compose -f infra/docker-compose.yml up -d
 .venv/Scripts/python.exe -m alembic upgrade head
 ```
 
-Two things make that work end to end, and neither is automatic on a deployment
-that already exists:
+有两件事让这条路径端到端可用，而它们在已经存在的部署上都不是自动的：
 
-- `infra/postgres-init/01-copilot-schema.sql` creates the `copilot` **schema**
-  during cluster initialisation — but only for an empty data directory (§2.3).
-- the first `alembic upgrade head` creates the `vector` extension **in that
-  schema**, so the type resolves under the pinned `search_path` (§2.4).
+- `infra/postgres-init/01-copilot-schema.sql` 在集群初始化期间创建 `copilot` **schema**——但只对
+  空数据目录生效（§2.3）。
+- 第一次 `alembic upgrade head` 在该 schema **里**创建 `vector` 扩展，于是这个类型在钉住的
+  `search_path` 下能解析（§2.4）。
 
-### 2.3 The `copilot` schema on an existing volume
+### 2.3 既有数据卷上的 `copilot` schema
 
-`docker-entrypoint-initdb.d` runs **only** when the data directory is empty —
-exactly once, for a fresh `copilot_pgdata`. An existing volume never re-runs it, so
-an existing deployment can have the `copilot` database without the `copilot`
-schema. The symptom appears before any migration runs:
+`docker-entrypoint-initdb.d` **只在**数据目录为空时运行——对全新的 `copilot_pgdata` 恰好一次。既有
+数据卷永远不会重跑它，所以既有部署可能是「有 `copilot` 数据库、没有 `copilot` schema」。症状在任何
+迁移跑起来之前就出现：
 
 ```
 psycopg.errors.InvalidSchemaName: no schema has been selected to create in
 [SQL: CREATE TABLE alembic_version (...)]
 ```
 
-Fix it once, as a database administrator:
+以数据库管理员身份修一次：
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS copilot;
 ```
 
-Alembic still owns every object inside it. This creates the empty namespace, which
-is the one thing Alembic cannot do for itself — it needs the namespace to exist
-before it can record its own version table.
+它里面的每一个对象依然归 Alembic 所有。这里创建的只是一个空命名空间，而那恰恰是 Alembic 无法替
+自己做的事——它需要这个命名空间先存在，才能记录自己的版本表。
 
-### 2.4 The extension on an EXISTING database
+### 2.4 既有数据库上的扩展
 
-Run this **once**, as a database administrator:
+以数据库管理员身份执行**一次**：
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector SCHEMA copilot;
 ```
 
-Then `alembic upgrade head` proceeds normally. No data is touched.
+然后 `alembic upgrade head` 正常继续。不触碰任何数据。
 
-### 2.5 Upgrading an existing volume to the pgvector image
+### 2.5 把既有数据卷升级到 pgvector 镜像
 
-This is the safe path, and it touches no data:
+这是安全路径，且不触碰任何数据：
 
 ```bash
 docker compose -f infra/docker-compose.yml stop postgres
@@ -120,35 +106,31 @@ docker compose -f infra/docker-compose.yml up -d
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli doctor
 ```
 
-The new container mounts the **same** `copilot_pgdata` volume, so every existing
-row is still there — no `down -v`, no reset, no re-seal. `pgvector/pgvector:pg16`
-is upstream PostgreSQL 16 with the extension added, so it is the same server the
-previous image ran: the on-disk format does not change and no data-directory
-upgrade step is involved. `docker-entrypoint-initdb.d` does not re-run on a
-non-empty volume, which is exactly why 2.3 and 2.4 are issued by hand.
+新容器挂载的是**同一个** `copilot_pgdata` 数据卷，所以既有的每一行都还在——没有 `down -v`，没有
+重置，没有重新封存。`pgvector/pgvector:pg16` 就是上游 PostgreSQL 16 加上扩展，所以它和上一个镜像
+跑的是同一套服务器：磁盘格式不变，也不涉及数据目录升级步骤。`docker-entrypoint-initdb.d` 在非空
+数据卷上不会重跑，这正是 2.3 与 2.4 要手工执行的原因。
 
-### 2.6 If pgvector is already installed in `public`
+### 2.6 如果 pgvector 已经装在 `public`
 
-This is the failure that produces a bare, unhelpful
-`type "vector" does not exist`, because a `search_path=copilot` connection cannot
-see it. `doctor` detects this case specifically and reports:
+这就是那个会产出干巴巴、毫无帮助的 `type "vector" does not exist` 的失效模式，因为一个
+`search_path=copilot` 的连接看不到它。`doctor` 会专门检出这种情况并报告：
 
 ```
 [FAIL] vector_extension: the vector extension is installed but not visible on
        this connection's search_path; run: ALTER EXTENSION vector SET SCHEMA copilot;
 ```
 
-Fix it once with:
+修一次：
 
 ```sql
 ALTER EXTENSION vector SET SCHEMA copilot;
 ```
 
-Then re-run the migration — or point the connection at a `search_path` that
-includes `public`, if your deployment prefers that. Both work; the first is
-recommended because it keeps the type resolved by the pinned search path.
+然后重跑迁移——或者把连接指到一个包含 `public` 的 `search_path`，如果你的部署更偏好那样。两种都
+可行；推荐前者，因为它让类型由钉住的 search path 解析。
 
-### 2.7 What the migration says when it cannot proceed
+### 2.7 迁移无法继续时会说什么
 
 ```
 The PostgreSQL 'vector' extension (pgvector) is required by this migration and is
@@ -157,28 +139,25 @@ not installed, and this role may not create it. Ask a database administrator to 
 re-run `alembic upgrade head`. Nothing was changed by this failed run.
 ```
 
-A failed run is atomic: the check runs before any `CREATE TABLE`.
+失败的一轮是原子的：检查跑在任何 `CREATE TABLE` 之前。
 
-### 2.8 Observed state of this workstation's existing databases
+### 2.8 本机既有数据库的实测状态
 
-Two databases are relevant here, and they are **not** interchangeable.
+这里有两个相关数据库，它们**不可互换**。
 
-| Database | State | Use |
+| 数据库 | 状态 | 用途 |
 |---|---|---|
-| `127.0.0.1:5433` | The operator's Copilot database. PostgreSQL 16.15. Revision `979070495d4f` (P2) — **four** revisions behind the current head (`ed6af82d9b13`, `c41f7b2e9d08`, `a5e93c07fd21`, `b6c2a4d19f30`). `pg_available_extensions` lists neither `vector` nor any pgvector package, so `CREATE EXTENSION vector` **cannot** succeed on this server as packaged. | **READ-ONLY.** Safe for `doctor`, which only reads. Never run `alembic upgrade`/`downgrade` or any DDL against it until its server image carries pgvector (§2.5). |
-| `127.0.0.1:5434` | The pgvector-capable test database used by the P3-A integration suite. | Migrated, exercised, and cycled by tests. |
+| `127.0.0.1:5433` | 运维的 Copilot 数据库。PostgreSQL 16.15。修订 `979070495d4f`（P2）——落后当前 head（`ed6af82d9b13`、`c41f7b2e9d08`、`a5e93c07fd21`、`b6c2a4d19f30`）**四个**修订。`pg_available_extensions` 里既没有 `vector` 也没有任何 pgvector 包，所以在这个按现有打包的服务器上 `CREATE EXTENSION vector` **不可能**成功。 | **只读。** 对只做读取的 `doctor` 是安全的。在它的服务器镜像带上 pgvector 之前（§2.5），绝不要对它跑 `alembic upgrade`/`downgrade` 或任何 DDL。 |
+| `127.0.0.1:5434` | 支撑 pgvector 的测试数据库，供知识子系统集成套件使用。 | 由测试迁移、演练并反复升降。 |
 
-That is why the P3-A integration tests hardcode `127.0.0.1:5434` rather than
-honouring `COPILOT_DATABASE_URL`: a test that wrote to the operator's database
-would be a defect, not a convenience.
+这就是知识子系统集成测试硬编码 `127.0.0.1:5434`、而不遵从 `COPILOT_DATABASE_URL` 的原因：一个会写
+运维数据库的测试是缺陷，不是便利。
 
-Bringing `5433` up to P3-A is therefore a **multi-part** operator action, not one:
-switch that server to the pgvector image (§2.5), issue `CREATE SCHEMA` if §2.3
-applies, run the one-time `CREATE EXTENSION` above, then `alembic upgrade head`.
-Until then, `doctor` against `5433` reports `NOT_READY` with `vector_extension` and
-`knowledge_schema` FAIL — the correct, non-destructive answer, and the one it
-gives without touching anything. This is the **observed** output at the time of
-this closure:
+因此把 `5433` 提升到当前状态是一次**多步**运维动作，不是一步：把该服务器切到 pgvector 镜像
+（§2.5）、若 §2.3 适用则执行 `CREATE SCHEMA`、跑上面那一次性的 `CREATE EXTENSION`，然后
+`alembic upgrade head`。在那之前，对 `5433` 跑 `doctor` 会报 `NOT_READY`，`vector_extension` 与
+`knowledge_schema` 为 FAIL——这是正确的、非破坏性的答案，也是它在不触碰任何东西的前提下给出的答案。
+下面是本次闭合时**实测**的输出：
 
 ```
 knowledge doctor: NOT_READY
@@ -190,12 +169,11 @@ knowledge doctor: NOT_READY
   [WARN] embedding_provider: no embedding provider configured (EMBEDDING_PROVIDER=unconfigured): lexical retrieval only
 ```
 
-`attack_release_authority`, `attack_release_projection` and `legacy_chunk_table`
-are absent from that listing rather than reported as failures: they query tables
-the missing schema would not have, and the report says why a check did not run
-instead of repeating the cause.
+`attack_release_authority`、`attack_release_projection` 与 `legacy_chunk_table` 没有出现在那份清单
+里，而不是被报成失败：它们查询的表在缺失的 schema 下并不存在，而报告说明的是「某项检查为何没有
+跑」，而不是把同一个原因重复一遍。
 
-## 3. Migrating
+## 3. 迁移
 
 ```bash
 .venv/Scripts/python.exe -m alembic heads
@@ -203,21 +181,17 @@ instead of repeating the cause.
 .venv/Scripts/python.exe -m alembic check
 ```
 
-The P3-A chain is `979070495d4f` (the P2 response lifecycle migration) →
-`ed6af82d9b13` (the original P3-A schema) → `c41f7b2e9d08` (the closure revision:
-immutable content chunks and the ATT&CK release model) → `a5e93c07fd21` (the release
-→ knowledge projection binding and fail-closed downgrade guard) → **`b6c2a4d19f30`**
-(head; the nullable outbox `traceparent` diagnostic-context column added by that revision).
+知识子系统的链条是 `979070495d4f`（P2 响应生命周期迁移）→ `ed6af82d9b13`（最初的知识子系统 schema）
+→ `c41f7b2e9d08`（闭合修订：不可变内容块与 ATT&CK 发布模型）→ `a5e93c07fd21`（发布 → 知识投影绑定
+与 fail-closed 降级守卫）→ **`b6c2a4d19f30`**（head；该修订新增的可空 outbox `traceparent`
+诊断上下文列）。
 
-`ed6af82d9b13` is released and **strictly unmodifiable**, so the closure's schema
-changes arrive as new revisions stacked on top of it. The upgrade is additive and
-safe on a database that already carries the original P3-A tables: it copies every
-existing chunk into the new immutable pair **preserving its `id`**, which is what
-lets a `kcit:` handle minted before the upgrade resolve to the row that now holds
-its content. The embedding rows get fresh surrogate ids, which is safe precisely
-because that table is the rebuildable projection.
+`ed6af82d9b13` 已发布且**严格不可修改**，所以闭合版的 schema 变更都以堆在它上面的新修订形式到来。
+这次升级是纯追加的，在一个已经带有原知识子系统表的数据库上是安全的：它把每个既有内容块复制进新的不可变
+对，并**保留它的 `id`**——这正是升级之前铸出的一个 `kcit:` 把手能解析到「现在持有其内容的那一行」
+的原因。embedding 行拿到新的代理 id，而这之所以安全，恰恰因为那张表是可重建投影。
 
-### Verifying a migration cycle
+### 验证一次迁移循环
 
 ```bash
 .venv/Scripts/python.exe -m alembic downgrade -1
@@ -225,56 +199,44 @@ because that table is the rebuildable projection.
 .venv/Scripts/python.exe -m alembic check
 ```
 
-At that revision's head, `downgrade -1` removes only the nullable outbox `traceparent`
-column. `downgrade -2` steps back through `a5e93c07fd21` and undoes **only what it
-created** — the `attack_release_projection` table — after running the downgrade
-guard (see **Downgrade safety** below). The next step, `downgrade -3` (or an explicit
-target of `ed6af82d9b13`), is the one that undoes what `c41f7b2e9d08` created:
-`knowledge_content_chunk`,
-`knowledge_chunk_embedding`, `attack_release`, and the foreign key it added to
-`attack_technique`. Every pre-P3-A object —
-`investigation`, `domain_event`, `outbox_message`, `command_receipt`,
-`orchestration_binding`, `tool_invocation`, `response_proposal`, and the LangGraph
-checkpoint schema — is untouched, and so is `knowledge_chunk`, which
-`ed6af82d9b13` created and therefore owns. Keeping it standing is what makes
-`downgrade -1` followed by `upgrade head` converge instead of losing the rows the
-upgrade would have to backfill from. The `vector` extension is deliberately
-**not** dropped: it may predate P3-A and other schemas may depend on it, so
-removing it would be a destructive change far outside the migration's scope.
+在该修订的 head 上，`downgrade -1` 只移除那可空的 outbox `traceparent` 列。`downgrade -2` 退回
+穿过 `a5e93c07fd21`，在跑完降级守卫之后**只撤销它自己创建的东西**——`attack_release_projection`
+表（见下文**降级安全**）。下一步，`downgrade -3`（或显式指定 `ed6af82d9b13`），才是撤销
+`c41f7b2e9d08` 所创建内容的那一步：`knowledge_content_chunk`、`knowledge_chunk_embedding`、
+`attack_release`，以及它加到 `attack_technique` 上的外键。每一个知识子系统之前的对象——
+`investigation`、`domain_event`、`outbox_message`、`command_receipt`、`orchestration_binding`、
+`tool_invocation`、`response_proposal` 以及 LangGraph checkpoint schema——都不受触动，
+`knowledge_chunk` 也不受触动，它由 `ed6af82d9b13` 创建、因而归它所有。让它继续站着的意义在于：
+`downgrade -1` 之后再 `upgrade head` 会收敛，而不是丢掉那些升级本须回填的行。`vector` 扩展被刻意
+**不**删除：它可能早于知识子系统存在，别的 schema 也可能依赖它，删掉它会是一次远远超出本迁移范围的破坏性
+变更。
 
-One value genuinely cannot be restored: a legacy `attack_technique.active` flag
-that contradicted its own release. The upgrade refused to treat such a framework's
-rows as authority, so there is no authority to put back — and re-deriving one from
-a flag the closure exists to retire would restore the ambiguity, not the
-information.
+有一个值确实无法还原：一个与它自己的发布相矛盾的遗留 `attack_technique.active` 标志。升级拒绝把
+这样一个 framework 的行当作权威，所以也就没有权威可以放回去——而从「闭合版本来就为退役它而存在的
+那个标志」重新推一个权威出来，恢复的是歧义，不是信息。
 
-`alembic check` must report no drift both after the upgrade and after the
-downgrade/upgrade cycle.
+`alembic check` 必须在升级之后、以及降级/升级循环之后都报告无漂移。
 
-### Downgrade safety
+### 降级安全
 
-`a5e93c07fd21` puts a **fail-closed guard** in front of `downgrade`. Its
-predecessor `c41f7b2e9d08` dropped `knowledge_content_chunk`,
-`knowledge_chunk_embedding` and `attack_release` unconditionally on the way down,
-and stopped updating the legacy `knowledge_chunk` table on the way up — so once
-this deployment had written through the new tables, downgrading past it destroyed
-that work silently. A migration must be lossless, or it must refuse.
+`a5e93c07fd21` 在 `downgrade` 前面放了一道 **fail-closed 守卫**。它的前驱 `c41f7b2e9d08` 在下行时
+无条件 drop 掉 `knowledge_content_chunk`、`knowledge_chunk_embedding` 与 `attack_release`，并在
+上行时不再更新遗留的 `knowledge_chunk` 表——所以一旦这套部署写穿过新表，降级越回它就会把那些工作
+静默毁掉。一条迁移要么无损，要么必须拒绝。
 
-The guard runs **before the first `op.drop_*`**, so a refusal means nothing was
-changed by that run. It raises `P3A_DOWNGRADE_UNSAFE` and names each category with
-its row count — never any content:
+守卫在**第一个 `op.drop_*` 之前**运行，所以一次拒绝意味着那一轮什么都没改。它抛
+`P3A_DOWNGRADE_UNSAFE`，逐类别点名其行数——永不涉及任何内容：
 
-| Category | What it counts |
+| 类别 | 统计什么 |
 |---|---|
-| `NEW_CONTENT_CHUNKS` | Content chunks with no pre-closure `knowledge_chunk` row; the old schema has nowhere to put them |
-| `MULTIPLE_CHUNK_GENERATIONS` | Chunks in a generation the old schema has no column for, so its stale generation-1 rows would be re-presented as current |
-| `PROJECTION_CHANGED` | Embedding rows the old single-vector row cannot represent; restoring the stale vector as current would be wrong, not merely lossy |
-| `MUTATED_CONTENT` | Pre-closure chunks whose stored content no longer matches; the old schema would serve stale bytes as current |
-| `PINNED_ATTACK_RELEASE` | A release carrying a content fingerprint, for which the old schema has no column |
-| `ATTACK_PROJECTION_BINDING` | Any release → projection binding at all; the old schema cannot express which version a release staged |
+| `NEW_CONTENT_CHUNKS` | 没有闭合前 `knowledge_chunk` 行的内容块；旧 schema 无处安放它们 |
+| `MULTIPLE_CHUNK_GENERATIONS` | 位于旧 schema 没有对应列的那一代的内容块，于是它陈旧的 generation-1 行会被当作当前行重新呈现 |
+| `PROJECTION_CHANGED` | 旧单向量行无法表示的 embedding 行；把陈旧向量当作当前向量还原会是错的，而不只是有损 |
+| `MUTATED_CONTENT` | 存储内容已不再匹配的闭合前内容块；旧 schema 会把陈旧字节当作当前内容服务 |
+| `PINNED_ATTACK_RELEASE` | 携带内容指纹的发布，而旧 schema 没有这一列 |
+| `ATTACK_PROJECTION_BINDING` | 任何发布 → 投影绑定；旧 schema 无法表达某个发布暂存了哪个版本 |
 
-Every predicate is chosen to be **zero** on a database that was upgraded and then
-not written to, so the immediate round trip still passes:
+每个判定都被选成在「升级过但此后未被写入」的数据库上为**零**，所以紧邻的往返仍然通过：
 
 ```bash
 # from a pre-closure database: upgrade, then one step back
@@ -282,156 +244,134 @@ not written to, so the immediate round trip still passes:
 .venv/Scripts/python.exe -m alembic downgrade -1
 ```
 
-A guard that blocked *that* would be the bug, not the guard.
+一道连*这个*都挡住的守卫才是 bug，而不是守卫。
 
-**The residual, stated plainly.** The guard has to live in the new revision,
-because `c41f7b2e9d08` is frozen and must not be edited. It therefore intercepts
-any downgrade that **starts at this head** — `downgrade -1` and
-`downgrade <older-revision>` both run it first — but a database left sitting at
-`c41f7b2e9d08` from before this revision existed is **not** covered by it, because
-no function of this revision runs at all. If `alembic current` reports
-`c41f7b2e9d08`, run `alembic upgrade head` first (free — the upgrade is additive)
-and only then downgrade.
+**那位残留，直说。** 守卫必须住在新修订里，因为 `c41f7b2e9d08` 是冻结的、不得编辑。因此它会拦下任何
+**从这个 head 开始**的降级——`downgrade -1` 与 `downgrade <更早修订>` 都会先跑它——但一个在本修订
+存在之前就停在 `c41f7b2e9d08` 的数据库**不**在它覆盖范围内，因为这个修订的函数根本不会运行。如果
+`alembic current` 报的是 `c41f7b2e9d08`，先跑 `alembic upgrade head`（免费——升级是纯追加的），
+然后才能降级。
 
-## 4. Schema created
+## 4. 建出的 schema
 
-| Table | Purpose |
+| 表 | 用途 |
 |---|---|
-| `knowledge_document` | Externally-identified document. Immutable identity; ACTIVE → RETIRED lifecycle. |
-| `knowledge_document_version` | Immutable content. A change appends a version. |
-| `knowledge_content_chunk` | **Immutable content identity** — the citation target. Written once, never rewritten, with the generated FTS column. |
-| `knowledge_chunk_embedding` | The **rebuildable** vector projection of a content chunk. Carries no content and no hash. |
-| `embedding_profile` | The vector space the chunks were indexed in. At most one ACTIVE. |
-| `attack_release` | The pinned ATT&CK release and its authority. At most one ACTIVE per framework. |
-| `attack_technique` | The pinned technique snapshot belonging to a release. |
-| `attack_release_projection` | The binding of one release's technique to the immutable document version that release **staged**. Provenance, not authority. |
-| `knowledge_chunk` | **Superseded, retained.** `ed6af82d9b13`'s table. P3-A never reads or writes it; it is kept only so `downgrade` can restore it byte for byte. `doctor` reports it rather than dropping it. |
+| `knowledge_document` | 外部可标识的文档。身份不可变；ACTIVE → RETIRED 生命周期。 |
+| `knowledge_document_version` | 不可变内容。变更会追加一个版本。 |
+| `knowledge_content_chunk` | **不可变内容身份**——引用目标。写一次、永不重写，并带生成的 FTS 列。 |
+| `knowledge_chunk_embedding` | 内容块**可重建的**向量投影。不带内容，也不带哈希。 |
+| `embedding_profile` | 内容块被索引进去的向量空间。至多一个 ACTIVE。 |
+| `attack_release` | 钉住的 ATT&CK 发布及其权威。每个 framework 至多一个 ACTIVE。 |
+| `attack_technique` | 归属于某个发布的钉住技术快照。 |
+| `attack_release_projection` | 某个发布的技术到该发布**所暂存**的那个不可变文档版本的绑定。来源，不是权威。 |
+| `knowledge_chunk` | **已被取代，予以保留。** `ed6af82d9b13` 的表。知识子系统从不读写它；留着它只是为了让 `downgrade` 能逐字节还原它。`doctor` 报告它，而不是 drop 它。 |
 
-Properties worth checking after a migration:
+迁移之后值得核对的属性：
 
-- **No HNSW, no IVFFlat.** P3-A ranks exactly.
-- The `embedding` column is the **untyped** `vector` type — no dimension is baked
-  into the schema.
-- `lexical_document` is a `GENERATED` `tsvector` column with a **GIN** index, so
-  it can never drift from the content it describes.
-- `uq_embedding_profile_single_active` is a **partial unique index** on `status`
-  `WHERE status = 'ACTIVE'` — the one-ACTIVE rule is a database fact, not
-  application code.
-- `uq_knowledge_document_global_key` and `uq_knowledge_document_tenant_key` are
-  **partial** unique indexes. Two of them, not one: `NULL` never conflicts in a
-  plain unique index, so a single index would silently allow duplicate global
-  documents.
-- `uq_knowledge_content_chunk_generation_ordinal` is unique on
-  `(document_version_id, generation, ordinal)`. That is what makes the stable
-  ranking key a **total** order, and it means a rechunk writes a new generation
-  rather than rewriting the old one.
-- `uq_knowledge_chunk_embedding_content_profile` is unique on
-  `(content_chunk_id, embedding_profile_id)` — one vector per chunk per space, so
-  a rebuild is an upsert rather than a duplicate.
-- `uq_attack_release_single_active` is a **per-framework partial unique index**
-  (`WHERE status = 'ACTIVE'`). "At most one authoritative ATT&CK release per
-  framework" is therefore a database fact, not a convention: two concurrent
-  activations cannot both commit. `uq_attack_release_framework_source_release`
-  makes a release name registrable once.
-- `uq_attack_release_projection_release_technique` is unique on
-  `(framework, source_release, technique_id)` — the conflict target that makes a
-  retried stage converge instead of duplicating — and
-  `uq_attack_release_projection_release_document` is unique on
-  `(framework, source_release, document_id)`, so a release cannot claim two
-  different projections of one document. A crash between staging and the cutover
-  therefore re-runs into the same rows rather than into a duplicate or a false
-  conflict.
+- **没有 HNSW，没有 IVFFlat。** 本仓精确排序。
+- `embedding` 列是**无类型**的 `vector` 类型——schema 里没有烧进任何维度。
+- `lexical_document` 是一个 `GENERATED` `tsvector` 列，带 **GIN** 索引，所以它永远不会和它所描述的
+  内容漂移。
+- `uq_embedding_profile_single_active` 是 `status` 上的**部分唯一索引**
+  （`WHERE status = 'ACTIVE'`）——「只有一个 ACTIVE」是数据库事实，不是应用代码。
+- `uq_knowledge_document_global_key` 与 `uq_knowledge_document_tenant_key` 是**部分**唯一索引。
+  两个，不是一个：`NULL` 在朴素唯一索引里永不冲突，所以单个索引会静默允许重复的全局文档。
+- `uq_knowledge_content_chunk_generation_ordinal` 在
+  `(document_version_id, generation, ordinal)` 上唯一。正是它让稳定排序键成为**全序**，也意味着
+  一次重新分块写的是新的一代，而不是重写旧的一代。
+- `uq_knowledge_chunk_embedding_content_profile` 在
+  `(content_chunk_id, embedding_profile_id)` 上唯一——一个空间里每个内容块一个向量，所以重建是
+  upsert 而不是重复插入。
+- `uq_attack_release_single_active` 是一条**按 framework 的部分唯一索引**
+  （`WHERE status = 'ACTIVE'`）。因此「每个 framework 至多一个权威 ATT&CK 发布」是数据库事实，不是
+  约定：两次并发激活不可能都提交。`uq_attack_release_framework_source_release` 让一个发布名只能
+  注册一次。
+- `uq_attack_release_projection_release_technique` 在
+  `(framework, source_release, technique_id)` 上唯一——那个让被重试的暂存收敛而不是重复的冲突目标
+  ——而 `uq_attack_release_projection_release_document` 在
+  `(framework, source_release, document_id)` 上唯一，所以一个发布不能声称同一份文档的两个不同投影。
+  因此「暂存与切换之间发生崩溃」会重新落进同样的行，而不是落进一次重复或一次假冲突。
 
-## 5. Embedding configuration
+## 5. embedding 配置
 
-The embedding provider is configured **independently of the chat LLM**. They are
-different services with different contracts, and assuming the chat endpoint can
-embed is exactly the mistake the separation prevents.
+embedding provider 的配置**独立于对话 LLM**。它们是两个不同的服务、有不同的契约，而「假定对话
+endpoint 也能做 embedding」正是这种分离要防的那个错误。
 
-| Variable | Meaning |
+| 变量 | 含义 |
 |---|---|
-| `EMBEDDING_PROVIDER` | `unconfigured` (default) or `openai_compatible` |
-| `EMBEDDING_BASE_URL` | e.g. `https://api.example.com/v1` |
-| `EMBEDDING_MODEL` | The embedding model id |
-| `EMBEDDING_DIMENSION` | The vector dimension the model produces |
-| `EMBEDDING_API_KEY` | The secret. **Name is configurable via `EMBEDDING_API_KEY_ENV`** |
-| `EMBEDDING_NORMALIZATION` | `NONE` (default) or `L2` |
-| `EMBEDDING_DISTANCE_METRIC` | `COSINE` (the only value in P3-A) |
-| `EMBEDDING_TIMEOUT_SECONDS`, `EMBEDDING_MAX_RETRIES` | Bounded retry over transient faults only |
+| `EMBEDDING_PROVIDER` | `unconfigured`（默认）或 `openai_compatible` |
+| `EMBEDDING_BASE_URL` | 例如 `https://api.example.com/v1` |
+| `EMBEDDING_MODEL` | embedding 模型 id |
+| `EMBEDDING_DIMENSION` | 该模型产出的向量维度 |
+| `EMBEDDING_API_KEY` | 密钥。**名字可通过 `EMBEDDING_API_KEY_ENV` 配置** |
+| `EMBEDDING_NORMALIZATION` | `NONE`（默认）或 `L2` |
+| `EMBEDDING_DISTANCE_METRIC` | `COSINE`（当前唯一取值） |
+| `EMBEDDING_TIMEOUT_SECONDS`、`EMBEDDING_MAX_RETRIES` | 只对瞬时故障做有界重试 |
 
-**Defaults to `unconfigured`.** That is the honest default: without a real
-provider there is no vector retrieval, and the system says so instead of
-substituting fake vectors. `LEXICAL_ONLY` retrieval keeps working.
+**默认 `unconfigured`。** 这是一个诚实的默认值：没有真 provider 就没有向量检索，系统如实说明这一
+点，而不是拿假向量顶替。`LEXICAL_ONLY` 检索照常工作。
 
-The API key is never a config default, never logged, never placed in an exception
-message, and never echoed by `doctor` — which reports only whether a
-configuration is *present*.
+API key 永不是配置默认值，永不被记录，永不出现在异常消息里，也永不被 `doctor` 回显——它只报告配置
+是否*存在*。
 
-### Switching the ACTIVE profile is not an ingest
+### 切换 ACTIVE profile 不是一次摄取
 
-When an `ACTIVE` profile exists and the configured provider's descriptor identity
-differs from it, **every** ordinary document ingest fails closed:
+当存在一个 `ACTIVE` profile、而所配置 provider 的描述符身份与它不同时，**每一次**普通文档摄取都
+fail closed：
 
 ```
 error: EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX: ...
 ```
 
-That includes an ingest that passes `--allow-embedding-profile-switch`. The flag is
-**legacy and always refused**: it is retained only so an existing caller receives
-that diagnosis instead of an unrecognised-argument error, and it does nothing else.
+这**包括**传了 `--allow-embedding-profile-switch` 的那次摄取。该 flag 是**遗留的、且一律拒绝**：
+保留它只是为了让既有调用方收到那条诊断，而不是一个「未知参数」错误，它不做别的事。
 
-This is deliberate, and the alternative is worse than it looks. Letting one
-document's ingest retire the old profile and create a new `ACTIVE` one would leave
-the corpus half-embedded in two incomparable spaces while retrieval went on
-comparing cosine distances across them — plausible numbers computed in no single
-space. Switching the embedding space is a **whole-corpus reindex**, not a document
-ingest.
+这是刻意的，而替代方案的后果比看上去更糟。让一份文档的摄取把旧 profile 退役并创建一个新的
+`ACTIVE` profile，会让语料一半嵌在一个空间、一半嵌在另一个不可比的空间，而检索还在跨它们比较余弦
+距离——算出一些看似合理的数字，却不存在于任何一个单一空间里。切换 embedding 空间是**全语料重建
+索引**，不是一次文档摄取。
 
-After a refusal, all of the following still hold:
+一次拒绝之后，下列全部依然成立：
 
-- the previous profile is **still** the `ACTIVE` profile;
-- the existing corpus is still vector-retrievable;
-- the one-ACTIVE-profile index is intact, because no second profile was created;
-- no embedding-projection row was rewritten.
+- 先前的 profile **仍然是** `ACTIVE` profile；
+- 既有语料仍然向量可检索；
+- 单 ACTIVE profile 索引完好，因为没有创建第二个 profile；
+- 没有任何 embedding 投影行被重写。
 
-The correct corpus-wide flow — stage a new profile, reindex the whole corpus,
-validate completeness, activate atomically, retire the old profile — is documented
-for a future phase and deliberately **not implemented** in P3-A. There is no
-partial cutover, and no `STAGING` status exists for production retrieval to
-accidentally use.
+那条正确的全语料流程——暂存一个新 profile、重建整个语料的索引、校验完整性、原子激活、退役旧
+profile——已为未来阶段记录在案，并在此刻意**不实现**。不存在部分切换，也不存在一个「生产检索可能
+误用」的 `STAGING` 状态。
 
-### The deterministic test fixture
+### 确定性测试夹具
 
-`--embedding-provider deterministic-test-only` selects a dev fixture whose vectors
-carry **no semantic meaning**. It exists to exercise the plumbing. It is never a
-production default, its module is imported only on that branch, and any artifact
-it produces is marked `PLUMBING_ONLY` in the filename and in the JSON.
+`--embedding-provider deterministic-test-only` 选择一个开发夹具，它的向量**不携带任何语义含义**。
+它存在的意义是演练接线。它永不是生产默认值，它的模块只在那条分支上被导入，它产出的任何产物都会在
+文件名和 JSON 里被标成 `PLUMBING_ONLY`。
 
-### Knowledge bounds
+### 知识上限
 
-| Variable | Default | Meaning |
+| 变量 | 默认值 | 含义 |
 |---|---|---|
-| `KNOWLEDGE_MAX_DOCUMENT_BYTES` | 2,000,000 | Rejection threshold |
-| `KNOWLEDGE_MAX_NORMALIZED_CHARS` | 2,000,000 | Rejection threshold |
-| `KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT` *(or `KNOWLEDGE_MAX_CHUNKS`)* | 512 | Max chunks per document |
-| `KNOWLEDGE_MAX_CHUNK_CHARS` | 8,000 | Max characters per chunk |
-| `KNOWLEDGE_CHUNK_TARGET_TOKENS` *(or `KNOWLEDGE_CHUNK_TARGET`)* | 600 | Chunker target tokens |
-| `KNOWLEDGE_CHUNK_MAX_TOKENS` *(or `KNOWLEDGE_CHUNK_MAX`)* | 800 | Chunker max tokens (ceiling 800) |
-| `KNOWLEDGE_CHUNK_OVERLAP_TOKENS` *(or `KNOWLEDGE_CHUNK_OVERLAP`)* | 80 | Chunker overlap, must be < target |
-| `KNOWLEDGE_LEXICAL_CANDIDATE_LIMIT` | 20 | Retrieval profile |
-| `KNOWLEDGE_VECTOR_CANDIDATE_LIMIT` | 20 | Retrieval profile |
-| `KNOWLEDGE_RRF_K` | 60 | Retrieval profile |
-| `KNOWLEDGE_MAX_HITS_PER_DOCUMENT` | 2 | Diversification cap |
-| `KNOWLEDGE_EVALUATION_OUTPUT_DIR` | `.eval-runs/knowledge` | Artifact directory |
+| `KNOWLEDGE_MAX_DOCUMENT_BYTES` | 2,000,000 | 拒绝阈值 |
+| `KNOWLEDGE_MAX_NORMALIZED_CHARS` | 2,000,000 | 拒绝阈值 |
+| `KNOWLEDGE_MAX_CHUNKS_PER_DOCUMENT` *（或 `KNOWLEDGE_MAX_CHUNKS`）* | 512 | 每文档最大内容块数 |
+| `KNOWLEDGE_MAX_CHUNK_CHARS` | 8,000 | 每内容块最大字符数 |
+| `KNOWLEDGE_CHUNK_TARGET_TOKENS` *（或 `KNOWLEDGE_CHUNK_TARGET`）* | 600 | 分块器目标 token 数 |
+| `KNOWLEDGE_CHUNK_MAX_TOKENS` *（或 `KNOWLEDGE_CHUNK_MAX`）* | 800 | 分块器最大 token 数（上限 800） |
+| `KNOWLEDGE_CHUNK_OVERLAP_TOKENS` *（或 `KNOWLEDGE_CHUNK_OVERLAP`）* | 80 | 分块器重叠，必须 < 目标 |
+| `KNOWLEDGE_LEXICAL_CANDIDATE_LIMIT` | 20 | 检索 profile |
+| `KNOWLEDGE_VECTOR_CANDIDATE_LIMIT` | 20 | 检索 profile |
+| `KNOWLEDGE_RRF_K` | 60 | 检索 profile |
+| `KNOWLEDGE_MAX_HITS_PER_DOCUMENT` | 2 | 多样化上限 |
+| `KNOWLEDGE_EVALUATION_OUTPUT_DIR` | `.eval-runs/knowledge` | 产物目录 |
 
-Both spellings are accepted for the chunker bounds; each is a full name, so
-either binds.
+分块器上限两种拼写都接受；各自都是完整名字，所以任一个都能绑定。
 
-All bounds are **rejections**, never truncations.
+所有上限都是**拒绝**，永远不是截断。
 
 ## 6. `doctor`
 
-The first thing to run when anything looks wrong.
+任何地方看着不对时，第一件要跑的东西。
 
 ```bash
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli doctor
@@ -451,59 +391,50 @@ knowledge doctor: DEGRADED
   [WARN] embedding_provider: no embedding provider configured (EMBEDDING_PROVIDER=unconfigured): lexical retrieval only
 ```
 
-Eight checks, all read-only:
+八项检查，全部只读：
 
-| Check | FAIL when | WARN when |
+| 检查 | 何时 FAIL | 何时 WARN |
 |---|---|---|
-| `database` | Unreachable | — |
-| `vector_extension` | Not installed, or installed but not visible on this connection's `search_path` | — |
-| `knowledge_schema` | Any of the **seven** `KNOWLEDGE_TABLES` is missing (the message tells you to run `alembic upgrade head`) | — |
-| `active_embedding_profile` | — | No ACTIVE profile |
-| `attack_release_authority` | More than one ACTIVE release for one framework — `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | No ACTIVE release at all |
-| `attack_release_projection` | An authoritative release has no staged projection for some technique, or its bound documents serve another version — `ATTACK_RELEASE_PROJECTION_DIVERGED` | No ACTIVE release to compare retrieval against |
-| `legacy_chunk_table` | Never | — (reports `absent`, or the retained row count) |
-| `embedding_provider` | — | Not configured |
+| `database` | 不可达 | — |
+| `vector_extension` | 未安装，或已安装但在本连接的 `search_path` 上不可见 | — |
+| `knowledge_schema` | `KNOWLEDGE_TABLES` 里那**七**张有任何一张缺失（消息会告诉你跑 `alembic upgrade head`） | — |
+| `active_embedding_profile` | — | 没有 ACTIVE profile |
+| `attack_release_authority` | 某个 framework 有多于一个 ACTIVE 发布——`ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | 完全没有 ACTIVE 发布 |
+| `attack_release_projection` | 某个权威发布对某项技术没有已暂存投影，或它绑定的文档服务的是别的版本——`ATTACK_RELEASE_PROJECTION_DIVERGED` | 没有 ACTIVE 发布可与检索对照 |
+| `legacy_chunk_table` | 永不 | —（报告 `absent`，或保留的行数） |
+| `embedding_provider` | — | 未配置 |
 
-`attack_release_authority` reads `attack_release` and nothing else, because
-authority lives at release granularity. The schema already enforces the
-single-ACTIVE rule with a partial unique index; the check exists because an
-operator who restores a dump, or applies a migration set out of order, can end up
-with the index missing — and then the rows are the only witness left. It is also
-where the ambiguity the upgrade deliberately refused to resolve becomes visible;
-see §8.
+`attack_release_authority` 只读 `attack_release`，别的都不读，因为权威住在发布粒度上。schema 本身
+已经用部分唯一索引强制了单 ACTIVE 规则；这项检查存在的理由是：一个还原了 dump、或乱序应用了迁移集
+的运维，可能最终拿到一个索引缺失的库——那时行是唯一剩下的证人。它也正是一处让「升级刻意拒绝解决的
+那种歧义」变得可见的地方；见 §8。
 
-`attack_release_projection` is its companion, and it is the one check that compares
-the two facts this closure made move together: the release's authority, and the
-version each of its bound documents actually serves. It is read-only and silent
-about content — technique ids and external keys only — and it is the only place
-`ATTACK_RELEASE_PROJECTION_DIVERGED` is ever reported, because the cutover refuses
-before it can create that state; a dump restore, or revisions applied out of order,
-is how a database reaches it. Re-importing the release cuts it back over (§8).
+`attack_release_projection` 是它的搭档，也是唯一一项把「本次闭合让它们一起移动」的两个事实放在一起
+比较的检查：该发布的权威，以及它每份已绑定文档实际服务的版本。它只读，且对内容保持沉默——只涉及
+技术 id 与 external key——而且它是 `ATTACK_RELEASE_PROJECTION_DIVERGED` 唯一会被报告的地方，因为
+切换在能造出那种状态之前就先拒绝了；一个 dump 还原、或乱序应用的修订，才是数据库抵达那种状态的
+途径。重新导入该发布会把它切回来（§8）。
 
-Verdict: `NOT_READY` on any failure, `DEGRADED` on any warning, else `READY`.
-Exit code is `1` for `NOT_READY`, `0` otherwise.
+判定：任何失败即 `NOT_READY`，任何警告即 `DEGRADED`，否则 `READY`。退出码在 `NOT_READY` 时为
+`1`，其他为 `0`。
 
-`DEGRADED` is the honest answer for "the corpus is reachable but the vector
-channel is not": lexical retrieval works. Collapsing that into either `READY` or
-`NOT_READY` would either overstate what works or hide a working path.
+`DEGRADED` 是对「语料可达但向量通道不可用」的诚实回答：词法检索是能用的。把它压成 `READY` 或
+`NOT_READY` 中的任何一个，要么夸大了能用的部分，要么藏起了一条可用的路径。
 
-When the database is unreachable, the six dependent checks are reported as
-`FAIL — not checked: the database is unreachable` rather than piling on with six
-echoes of the same cause. `embedding_provider` still runs: it reads configuration,
-not the database, so it has an answer even when nothing else does.
+当数据库不可达时，那六项依赖它的检查会报成 `FAIL — not checked: the database is unreachable`，
+而不是再堆上六个同一原因的复读。`embedding_provider` 仍然会跑：它读的是配置而不是数据库，所以即便
+别的都答不上来，它也有答案。
 
-When the schema is missing, only `active_embedding_profile` is appended as
-`not checked: the knowledge schema is missing (run: alembic upgrade head)`, and
-`attack_release_authority`, `attack_release_projection`, `legacy_chunk_table`, and
-the profile check are simply absent. That is the one case where the check count is
-short of eight, and it is deliberate: four more lines saying "no such table" would
-bury the one line that tells the operator what to do.
+当 schema 缺失时，只有 `active_embedding_profile` 会被追加成
+`not checked: the knowledge schema is missing (run: alembic upgrade head)`，而
+`attack_release_authority`、`attack_release_projection`、`legacy_chunk_table` 以及 profile 检查
+干脆不出现。这是检查数量不足八的唯一情形，而且它是刻意的：再多四行「没有这张表」会埋掉那唯一一行
+告诉运维该做什么的话。
 
-## 7. Ingesting a document
+## 7. 摄取一份文档
 
-Local `.txt` and `.md` files only. PDF, DOCX, and HTML are refused **before** any
-bytes are decoded — a parser we do not have would silently ingest whatever
-happened to decode.
+只支持本地 `.txt` 与 `.md` 文件。PDF、DOCX 与 HTML 在**任何字节被解码之前**就被拒绝——一个我们没有
+的解析器会静默摄取任何碰巧被解出来的东西。
 
 ```bash
 # GLOBAL curated guidance
@@ -525,186 +456,148 @@ happened to decode.
   --metadata owner=soc-engineering --metadata review=quarterly
 ```
 
-Output:
+输出：
 
 ```
 document <uuid> version 1 (a1b2c3d4e5f6) chunks=7 created_document=True
 created_version=True rebuilt_projection=True
 ```
 
-- `GLOBAL` **forbids** `--tenant`; `TENANT` **requires** it. Both are refused at
-  the CLI boundary, before anything is normalized, hashed, or embedded.
-- Re-running the same command with **identical content** reports
-  `created_version=False` and does not call the embedding provider again. This is
-  idempotency, not caching: `UNIQUE(document_id, content_hash)` makes "identical
-  bytes cannot create a second version" a database fact.
-- Changing the content appends version 2 and moves `active_version_id`. The old
-  version row is never modified. Nothing is overwritten silently.
-- `ingest-file --source-kind` accepts only `CURATED_GUIDANCE` and
-  `TENANT_RUNBOOK`. `MITRE_ATTACK` content enters through `import-attack` (§8)
-  alone: the ordinary handler refuses it with `SYSTEM_MANAGED_KNOWLEDGE_SOURCE`,
-  and the parser refuses the value before anything is read.
-- The same file ingested from a Windows checkout and a Linux checkout hashes
-  identically.
+- `GLOBAL` **禁止** `--tenant`；`TENANT` **要求**它。两者都在 CLI 边界处被拒绝，早于任何归一化、
+  哈希或 embedding。
+- 用**完全相同的内容**重跑同一条命令，会报 `created_version=False`，并且不会再调 embedding
+  provider。这是幂等，不是缓存：`UNIQUE(document_id, content_hash)` 把「相同字节不能创建第二个
+  版本」变成数据库事实。
+- 改内容会追加版本 2 并移动 `active_version_id`。旧版本行永不被修改。没有任何东西被静默覆盖。
+- `ingest-file --source-kind` 只接受 `CURATED_GUIDANCE` 与 `TENANT_RUNBOOK`。`MITRE_ATTACK`
+  内容只能通过 `import-attack` 进入（§8）：普通 handler 以 `SYSTEM_MANAGED_KNOWLEDGE_SOURCE`
+  拒绝它，而解析器在读任何东西之前就拒绝这个取值。
+- 同一个文件从 Windows 检出和从 Linux 检出摄取，哈希相同。
 
-### Retiring a document
+### 退役一份文档
 
 ```bash
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli retire \
   --tenant tenant-a --document-id <uuid> --reason "superseded by v2 guidance"
 ```
 
-Retirement is terminal and does not require an embedding provider — withdrawing a
-document is a lifecycle transition, not an embedding operation, and it must keep
-working during an embedding outage. A retired document leaves normal search.
-Citations captured before the retirement **still resolve**.
+退役是终态的，且不需要 embedding provider——撤回一份文档是生命周期变迁，不是 embedding 操作，它
+必须在 embedding 故障期间照样能用。已退役文档会离开普通检索。退役之前捕获的引用**仍然能解析**。
 
-Retiring a MITRE document through this command is refused with
-`SYSTEM_MANAGED_KNOWLEDGE_SOURCE`: the authoritative projection is withdrawn
-only by an ATT&CK-specific workflow, and withdrawing it underneath an ACTIVE
-release would orphan that release's authority.
+通过这条命令退役一份 MITRE 文档会被 `SYSTEM_MANAGED_KNOWLEDGE_SOURCE` 拒绝：权威投影只能由一个
+ATT&CK 专属工作流撤回，在某个 ACTIVE 发布底下把它撤掉会让那个发布的权威变成孤儿。
 
-## 8. Importing MITRE ATT&CK
+## 8. 导入 MITRE ATT&CK
 
-Local, operator-supplied STIX 2.1 JSON only. **No URLs, no runtime GitHub
-access.** Use the Enterprise bundle; tests use a small pinned fixture rather than
-the 100 MB+ upstream dataset.
+只支持本地的、由运维提供的 STIX 2.1 JSON。**没有 URL，没有运行时 GitHub 访问。** 用 Enterprise
+bundle；测试用的是一份小的钉住夹具，而不是上游那份 100 MB+ 的数据集。
 
 ```bash
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli import-attack \
   --file attack-enterprise.json --release v15.1 --activate
 ```
 
-Output:
+输出：
 
 ```
 release v15.1: parsed=214 techniques_created=214 documents_created=214
 versions_ingested=214 unchanged=0 skipped=0
 ```
 
-- Enterprise only. An unsupported framework is refused.
-- `--activate` is the **explicit authority switch**, and it is now the only thing
-  that can change what retrieval serves. Registration and staging happen either
-  way: the release's canonical rows are written, and every technique is ingested as
-  an immutable version with its chunks and embeddings. `--activate` adds the
-  **cutover** on top — one transaction that validates the staged projection, flips
-  this release's authority, sets every other release *of the same framework*
-  inactive, and moves each bound document's pointer to the version **this release
-  staged**. Without `--activate` the release is registered and **fully staged but
-  INACTIVE**: its versions, chunks and embeddings all exist, and ordinary retrieval
-  keeps serving exactly what it served before. A **new release adds new rows**;
-  old releases are never deleted and stay readable by their own `source_release`.
-- Re-importing a release that is **already** authoritative cuts over again even
-  without `--activate`, because the import has authority intent whenever the stored
-  release is ACTIVE. That is the repair path for a projection that has drifted: it
-  re-validates and re-points, or refuses with nothing written.
-- A release is registered in `attack_release` with a **content fingerprint** — a
-  SHA-256 over its canonical technique collection, sorted by
-  `(technique_id, source_stix_id)`, with `tactics`/`platforms` sorted and deduped.
-  It is independent of input JSON object order and of STIX bundle order, and it is
-  re-derivable from the database alone.
-- Each technique becomes a GLOBAL `MITRE_ATTACK` document with
-  `external_key = mitre-attack:<technique_id>` and `source_version = <release>`,
-  ingested through the **same** versioning/chunking/embedding path as an
-  operator's runbook. There is no second ingestion pipeline.
-- A technique that is `revoked` or `deprecated` is **skipped and reported**, never
-  silently dropped. The `skipped ids:` line lists them.
-- Re-importing the same release with the same bundle is idempotent:
-  `techniques_created=0`, `versions_ingested=0`, `unchanged=<technique count>`.
-- A malformed bundle is rejected **before** anything is written; a bad import is
-  never partial. A bundle over the size bound is refused without being parsed.
+- 只支持 Enterprise。不支持的 framework 会被拒绝。
+- `--activate` 是**显式的权威开关**，而且现在是唯一能改变检索所服务内容的东西。注册与暂存无论如何
+  都会发生：该发布的规范行被写入，每项技术都以不可变版本连同它的内容块与 embedding 被摄取。
+  `--activate` 在此之上加上**切换**——一个事务，校验暂存投影、翻转本发布的权威、把**同一
+  framework** 的其他每个发布置为非 active，并把每份已绑定文档的指针移到**本发布所暂存**的那个版本。
+  不带 `--activate` 时，发布被注册并**完整暂存但 INACTIVE**：它的版本、内容块与 embedding 全都
+  存在，而普通检索继续服务它此前服务的那些内容。**新发布只是加新行**；旧发布永不被删除，并且能被
+  自己的 `source_release` 继续读到。
+- 重新导入一个**已经**权威的发布，即便不带 `--activate` 也会再次切换，因为只要存储的发布是 ACTIVE，
+  这次导入就具有权威意图。这是一条针对已漂移投影的修复路径：它重新校验并重新指向，否则就在什么都
+  不写的情况下拒绝。
+- 发布以**内容指纹**注册进 `attack_release`——对它的规范技术集合求 SHA-256，按
+  `(technique_id, source_stix_id)` 排序，`tactics`/`platforms` 排序并去重。它与输入 JSON 的对象
+  顺序、以及 STIX bundle 顺序无关，并且可以仅凭数据库重新推导。
+- 每项技术成为一份 GLOBAL 的 `MITRE_ATTACK` 文档，`external_key = mitre-attack:<technique_id>`、
+  `source_version = <release>`，经与运维 runbook **同一条**版本化/分块/embedding 路径摄取。不存在
+  第二条摄取管线。
+- 被 `revoked` 或 `deprecated` 的技术会被**跳过并报告**，永不静默丢弃。`skipped ids:` 那一行列
+  出它们。
+- 用同一个 bundle 重新导入同一个发布是幂等的：`techniques_created=0`、`versions_ingested=0`、
+  `unchanged=<技术数>`。
+- 畸形的 bundle 在写入任何东西**之前**被拒绝；一次坏导入永远不会是部分的。超出大小上限的 bundle
+  不会被解析就被拒绝。
 
-The canonical `attack_technique` row and the knowledge document are **related but
-not the same authority**: the row is the canonical projection, the document is a
-**retrieval projection** of it, and the canonical row hash and the document
-version's content hash come from the same canonical function, so a projected
-document cannot describe content its canonical row does not.
+规范 `attack_technique` 行与知识文档是**相关但不同**的权威：行是规范投影，文档是它的**检索投影**，
+而规范行哈希与文档版本的内容哈希来自同一个规范函数，所以一个投影文档不可能描述它的规范行不描述的
+内容。
 
-What that does **not** say is that retrieval is automatically serving the
-authoritative release. A document carries one `active_version_id`, and "the
-projection is of the same content" is not the same claim as "this is the version
-retrieval returns". `attack_release_projection` is what closes that gap: it records
-the exact version a release staged, and the cutover moves the pointers to it.
+这**不**等于说检索自动就在服务权威发布。一份文档只携带一个 `active_version_id`，而「投影是同一内容
+的投影」与「这就是检索返回的版本」不是同一个断言。`attack_release_projection` 就是补上这个缺口的
+东西：它记录某个发布暂存的确切版本，而切换把指针移到它上面。
 
-### Registration, staging, cutover
+### 注册、暂存、切换
 
-An import is three acts, and only the third can change what anyone can read.
+一次导入是三个动作，只有第三个能改变任何人能读到的东西。
 
-1. **Registration.** The bundle is parsed, fingerprinted, and verified against the
-   pinned release; the `attack_release` row and its `attack_technique` rows are
-   then written **INACTIVE**, in one short transaction. A bundle that conflicts
-   with the pinned fingerprint is refused here, before anything is written.
-2. **Staging.** Every technique is ingested through the ordinary
-   version/chunk/embedding path with `activate_version=False`: the immutable
-   version, its chunks and its embeddings are all created, and **no document
-   pointer moves**. One `attack_release_projection` binding is recorded per
-   technique, all of them in a single short transaction of their own (one per
-   release, not one per technique), so a retry after a crash converges instead of
-   duplicating.
-3. **Cutover**, only when the import has authority intent. One transaction takes
-   the framework's advisory lock, validates the projection **before mutating
-   anything**, flips the release's authority and the `attack_technique.active`
-   mirror, then points every bound document at the version this release staged.
-   Because it is one transaction, a refusal — whether it is caught before the
-   first write or while resolving a binding — leaves the release's authority and
-   every document pointer exactly where they were.
+1. **注册。** bundle 被解析、取指纹，并按钉住的发布校验；随后 `attack_release` 行及其
+   `attack_technique` 行在**一个短事务**里写成 **INACTIVE**。与钉住指纹冲突的 bundle 会在这里被
+   拒绝，早于写入任何东西。
+2. **暂存。** 每项技术都经普通版本/内容块/embedding 路径摄取，带 `activate_version=False`：不可变
+   版本、它的内容块与 embedding 都被创建，而**没有任何文档指针移动**。每项技术记录一条
+   `attack_release_projection` 绑定，全部在一个属于它们自己的短事务里完成（按发布一个，不是按技术
+   一个），所以崩溃后的重试会收敛而不是重复。
+3. **切换**，仅当这次导入具有权威意图。一个事务取该 framework 的 advisory lock、在**变更任何东西
+   之前**校验投影、翻转该发布的权威与 `attack_technique.active` 镜像，然后把每份已绑定文档指到本
+   发布所暂存的那个版本。因为它是一个事务，一次拒绝——无论是在第一次写之前被抓到，还是在解析某条
+   绑定时被抓到——都会让该发布的权威和每一个文档指针原封不动。
 
-The consequence to hold on to: a release that is registered and staged but never
-cut over is **fully projected and completely invisible to retrieval**. Before this
-closure, staging went through the generic ingest path, which activated each new
-version unconditionally — so importing a release for backfill silently changed what
-normal retrieval returned.
+要记住的后果是：一个已注册、已暂存但从未切换的发布**已完整投影，且对检索完全不可见**。在这次闭合
+之前，暂存走的是通用摄取路径，而那条路径会无条件激活每个新版本——所以为了回填而导入一个发布，会
+静默改变普通检索返回的东西。
 
-### A pinned release is immutable
+### 钉住的发布不可变
 
-"v15.1" is an immutability claim, and the fingerprint is what makes it checkable:
+「v15.1」是一句不可变声明，而指纹是让它可核查的东西：
 
-| Situation | Behaviour |
+| 情形 | 行为 |
 |---|---|
-| First import of a release | The fingerprint is persisted on `attack_release` |
-| Same release, same fingerprint | Idempotent — the import converges, nothing is rewritten |
-| Same release, **different** fingerprint | Refused with `ATTACK_RELEASE_CONTENT_CONFLICT`, detected **before any mutation** |
-| A release adopted from pre-fingerprint rows | `content_fingerprint IS NULL`; the first import that pins it compares against the rows actually stored |
+| 某发布的首次导入 | 指纹持久化到 `attack_release` |
+| 同一发布、同一指纹 | 幂等——导入收敛，不重写任何东西 |
+| 同一发布、**不同**指纹 | 以 `ATTACK_RELEASE_CONTENT_CONFLICT` 拒绝，且在**任何变更之前**检出 |
+| 从早于指纹机制的既有行收养的发布 | `content_fingerprint IS NULL`；第一次把它钉住的导入会与数据库里实际存的行比较 |
 
 ```
 error: ATTACK_RELEASE_CONTENT_CONFLICT: release v15.1 is already pinned to a
 different technique collection; re-import the pinned bundle or use a new release name
 ```
 
-A refused import leaves **no** canonical `attack_technique` row, no
-`KnowledgeDocument`, no `KnowledgeDocumentVersion`, no change to the authoritative
-release, and no embedding-projection row behind. Because the check runs first,
-"nothing was changed" is a fact rather than a reconstruction.
+一次被拒的导入不留下**任何**规范 `attack_technique` 行、不留 `KnowledgeDocument`、不留
+`KnowledgeDocumentVersion`、不改变权威发布、也不留下 embedding 投影行。因为检查跑在最前面，「什么
+都没被改」是一个事实，而不是事后重建出来的说法。
 
-Reordered STIX objects, or a semantically identical bundle serialized differently,
-produce the **same** fingerprint and therefore converge. Only changed technique
-content conflicts — which is the point: the check must not fire on re-serialization
-and must not stay silent on a genuine content change.
+STIX 对象顺序被打乱、或一份语义相同但序列化方式不同的 bundle，产出**同一个**指纹，因而收敛。只有
+技术内容变了才会冲突——这正是要点：这项检查不得在重新序列化时误报，也不得在真正的内容变更上保持
+沉默。
 
-### Crash and retry
+### 崩溃与重试
 
-A run interrupted after the canonical rows committed but before the documents
-finished leaves the fingerprints persisted. Re-running the **same** release with
-the **same** fingerprint continues and completes the documents: no duplicate
-canonical rows, no false conflict. Re-running with a **different** fingerprint
-still conflicts, even though the document projection is incomplete — there is no
-half-new-release backfill.
+一次在规范行已提交、但文档尚未完成时被中断的运行，会让指纹留在库里。用**同一**发布、**同一**指纹
+重跑会继续并完成文档：不会有重复的规范行，不会有假冲突。用**不同**指纹重跑依然冲突，即便文档投影
+还不完整——不存在「半新版本的回填」。
 
 ### `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS`
 
-If the pre-existing rows already claimed more than one release of a framework, the
-upgrade **refuses to guess** and reports:
+如果既有行已经让某个 framework 有多于一个发布在声称权威，升级会**拒绝去猜**并报告：
 
 ```
 ATTACK_RELEASE_AUTHORITY_AMBIGUOUS - ...
 ```
 
-`doctor`'s `attack_release_authority` check reports the same thing at runtime. The
-operator resolves it explicitly by importing the intended release with
-`--activate`; choosing which canonical knowledge is authoritative is an operator's
-decision, not a migration's.
+`doctor` 的 `attack_release_authority` 检查在运行时报告同样的事情。运维通过用 `--activate` 导入
+那个意图中的发布来显式解决它；选择哪份规范知识算权威是运维的决定，不是迁移的。
 
-## 9. Searching
+## 9. 检索
 
 ```bash
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli search \
@@ -720,20 +613,16 @@ profile=hybrid-v1 hits=2 truncated=False
    Adversaries may use brute force techniques to gain access…
 ```
 
-`--mode` is `hybrid` (default), `lexical`, or `vector`. A vector or hybrid search
-needs an ACTIVE embedding profile and a configured provider; without either, the
-command reports the reason and exits `3` rather than crashing.
+`--mode` 取 `hybrid`（默认）、`lexical` 或 `vector`。向量或混合检索需要一个 ACTIVE embedding
+profile 和一个已配置的 provider；两者缺任一，命令会报告原因并以 `3` 退出，而不是崩掉。
 
-`--json` emits a documented key set: `profile_id`, `truncated`,
-`retrieval_profile`, and per hit `citation_id`, `document_id`,
-`document_version_id`, `chunk_id`, `source_kind`, `title`, `language`,
-`source_version`, `excerpt`. **Never a vector, never a raw row, never a
-credential.**
+`--json` 输出一组有文档的键：`profile_id`、`truncated`、`retrieval_profile`，以及每条命中的
+`citation_id`、`document_id`、`document_version_id`、`chunk_id`、`source_kind`、`title`、
+`language`、`source_version`、`excerpt`。**永远没有向量，永远没有原始行，永远没有凭据。**
 
-Retired documents do not appear. A GLOBAL document is visible to every tenant; a
-tenant's own documents to that tenant only.
+已退役文档不出现。GLOBAL 文档对每个租户可见；某租户自己的文档只对该租户可见。
 
-## 10. Resolving a citation
+## 10. 解析引用
 
 ```bash
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli resolve-citation \
@@ -744,38 +633,31 @@ tenant's own documents to that tenant only.
 kcit:9c1d…:a1b2c3d4e5f6: resolved
 ```
 
-Exit `0` when resolved, `1` when not. `--json` adds the `reason`:
+解析成功退出 `0`，不成功退出 `1`。`--json` 额外给出 `reason`：
 
-| Reason | Meaning |
+| 原因 | 含义 |
 |---|---|
-| `MALFORMED_CITATION` | The string does not parse. Never repaired, never trusted. |
-| `CHUNK_NOT_FOUND` | No such chunk, or not readable by this tenant. |
-| `SCOPE_MISMATCH` | The chunk belongs to another tenant. |
-| `CONTENT_INTEGRITY_MISMATCH` | The stored hash is not the hash of the content actually read, **or** the stored hash does not carry the prefix in the string. |
+| `MALFORMED_CITATION` | 字符串解析不了。永不修补，永不信任。 |
+| `CHUNK_NOT_FOUND` | 没有这个内容块，或对本租户不可读。 |
+| `SCOPE_MISMATCH` | 该内容块属于另一个租户。 |
+| `CONTENT_INTEGRITY_MISMATCH` | 存储的哈希不是实际读到内容的哈希，**或**存储的哈希不携带串里的那个前缀。 |
 
-Both integrity checks are needed, and they catch different tampering. A stored hash
-is not evidence; it is a *claim written beside the content*. The resolver
-recomputes `SHA-256` over the content it actually read and requires the recomputed
-value to equal the stored full hash **and** the stored hash to start with the
-citation's prefix. Editing the text out-of-band breaks the first; editing the
-stored hash to match a forged prefix breaks the second. Either way the answer is
-`unresolved` with that reason, and no exception escapes.
+两项完整性检查都需要，它们抓的是不同的篡改。存储的哈希不是证据；它是*写在内容旁边的一句声明*。
+解析器对**实际读到的**内容重算 `SHA-256`，要求重算值等于存储的完整哈希，**并且**存储哈希以该引用的
+前缀开头。带外改文本会破坏前者；把存储哈希改成与伪造前缀匹配会破坏后者。无论哪一种，答案都是带该
+原因的 `unresolved`，且没有异常逃出去。
 
-Resolution deliberately works for **retired documents, historical versions, and
-superseded chunk generations**. A citation captured in a past investigation must
-remain explainable after the document it points at has been superseded, withdrawn,
-or rechunked. The citation names an **immutable content chunk**, never an embedding
-row, so it also survives re-embedding, an embedding-profile rebuild, a
-retrieval-projection rebuild, and a process restart.
+解析**刻意对退役文档、历史版本以及已被取代的分块代仍然有效**。一次过去调查里捕获的引用，必须在它
+指向的文档被取代、撤回或重新分块之后仍然可解释。引用命名的是**不可变内容块**，永远不是 embedding
+行，所以它还能在重新嵌入、embedding profile 重建、检索投影重建以及进程重启之后存活。
 
-Normal `search` excludes retired documents and older generations; `resolve`
-excludes neither. P3-A offers **no destructive delete**, so the only way to make a
-historical citation unresolvable is an operator deleting rows by hand — which is
-exactly why the integrity checks above are recomputed rather than read.
+普通 `search` 排除已退役文档与更早的代；`resolve` 两者都不排除。本仓**不提供破坏性删除**，所以让
+一条历史引用无法解析的唯一途径是运维手工删行——这正是上面那两项完整性检查是重算、而不是读取的
+原因。
 
-Resolution proves **provenance**. It proves nothing about correctness.
+解析证明**来源**。它不证明正确性。
 
-## 11. Running the baseline
+## 11. 跑基线
 
 ```bash
 # Full KB-GOLDEN-V1 suite over the deployment's embedding provider
@@ -794,8 +676,8 @@ Resolution proves **provenance**. It proves nothing about correctness.
 .venv/Scripts/python.exe -m hisiem_soc_copilot.knowledge.cli evaluate --allow-ambient-corpus
 ```
 
-A run against a configured provider prints the provider line; a plumbing run
-prints the warning line instead, so the two can never be confused on screen:
+针对已配置 provider 的一次运行会打印 provider 行；一次 plumbing 运行会改为打印警告行，所以两者在
+屏幕上永远不可能被混淆：
 
 ```
 KB-GOLDEN-V1 (corpus 1) cases=22 k=5
@@ -808,14 +690,12 @@ hybrid gate: PASS -- ...
 artifact: .eval-runs/knowledge/kb-golden-v1-k5.json
 ```
 
-`cases=22` counts the fixture; `scored=21` counts the cases a mode actually
-ranked. The difference is the fixture's `unanswerable` cases, which are
-excluded from the mean metrics by design and reported as `cases_excluded`.
+`cases=22` 数的是夹具；`scored=21` 数的是某个模式实际排过序的用例。差值是夹具里的 `unanswerable`
+用例，它们按设计被排除在均值指标之外，并作为 `cases_excluded` 报告。
 
-**A plumbing run, in full** — this is the shape of the output when no embedding
-provider is configured and `--embedding-provider deterministic-test-only` is
-passed explicitly. It is the only run this repository has ever produced, and it
-is a pipeline check, not a quality measurement:
+**一次完整的 plumbing 运行**——当未配置 embedding provider、且显式传入
+`--embedding-provider deterministic-test-only` 时，输出就是这个形状。它是本仓至今产出过的唯一一次
+运行，而它是一次管线检查，不是质量测量：
 
 ```
 KB-GOLDEN-V1 (corpus 1) cases=22 k=5
@@ -828,84 +708,66 @@ hybrid gate: PASS -- hybrid mean recall@5 0.976 against the better single-channe
 artifact: .eval-runs/knowledge/kb-golden-v1-k5-plumbing-only.json
 ```
 
-`documents=17` and not 18: the fixture itself retires one document, and eligible
-means tenant-visible **and** ACTIVE.
+`documents=17` 而不是 18：夹具自己退役了一份文档，而「合格」意味着租户可见**且** ACTIVE。
 
-Those are the numbers the current code produces on the test database. `HYBRID`
-`mrr`/`ndcg` sit slightly below the pre-closure figures (`0.782`/`0.828`) because
-ties are now broken on semantic identity instead of a random UUID — the same
-change that makes the baseline reproducible across databases rather than merely
-repeatable on one. `LEXICAL_ONLY` and `VECTOR_ONLY` are unchanged.
+这些就是当前代码在测试数据库上产出的数字。`HYBRID` 的 `mrr`/`ndcg` 略低于闭合前的数字
+（`0.782`/`0.828`），因为并列现在按语义身份打破，而不是按一个随机 UUID——正是同一个改动让这条基线
+能跨数据库复现，而不只是在一个库上可重复。`LEXICAL_ONLY` 与 `VECTOR_ONLY` 未变。
 
-### The corpus precondition
+### 语料前置条件
 
-Before a single retrieval runs, the run derives the tenant-visible ACTIVE eligible
-corpus from the database and compares it against the sealed fixture. An unexpected
-document, a missing expected one, or a changed content hash / version / chunk
-projection fails the run with `CORPUS_PRECONDITION_FAILED` instead of producing a
-score:
+在第一次检索跑起来之前，这次运行会从数据库推导出租户可见、ACTIVE、合格的语料，并与封存的夹具比对。
+一个意外的文档、一个缺失的预期文档、或一个变过的内容哈希/版本/内容块投影，都会让这次运行以
+`CORPUS_PRECONDITION_FAILED` 失败，而不是产出一个分数：
 
 ```
 error: CORPUS_PRECONDITION_FAILED: expected corpus fingerprint ... does not match ...
 ```
 
-A ranking measured over the wrong corpus is not merely useless; it is a number
-someone would quote. The default is **sealed**, and ambient documents in a
-competing scope are a precondition failure rather than a tolerant warning.
+在错误的语料上量出来的排序不只是没用；它是一个会被人引用的数字。默认是**封存**的，而处在竞争作用域
+里的环境文档属于前置条件失败，不是一条宽容的警告。
 
-`--allow-ambient-corpus` is a **different measurement**, not a lesser sealed run.
-It skips the precondition entirely, marks the artifact `corpus_mode: "OPEN_CORPUS"`
-/ `sealed: false`, names the file `...-open-corpus.json`, prints
-`NOT A SEALED BASELINE`, and produces **no hybrid gate verdict** — so an
-open-corpus run can never report a `KB-GOLDEN-V1 baseline PASS`. It can say what the
-database currently returns; it can never say that is the fixture.
+`--allow-ambient-corpus` 是一次**不同的测量**，不是一次降低了标准的封存运行。它完全跳过前置条件，
+把产物标成 `corpus_mode: "OPEN_CORPUS"` / `sealed: false`，把文件命名为 `...-open-corpus.json`，
+打印 `NOT A SEALED BASELINE`，并**不产出任何 hybrid 闸门判定**——所以一次开放语料运行永远不可能报
+出 `KB-GOLDEN-V1 baseline PASS`。它可以说数据库当前返回了什么；它永远不能说那就是夹具。
 
-### The corpus fingerprint
+### 语料指纹
 
-Every sealed artifact records a `corpus_fingerprint`: a SHA-256 over the deduped,
-sorted set of `(visibility, tenant_id, source_kind, external_key,
-document_version_number, document_content_hash, chunk_generation, ordinal,
-chunk_content_hash)` facts, serialized canonically. It contains **no** row UUIDs,
-timestamps, database host, or embedding vectors — each of which would make two
-identical corpora look different — and never a credential.
+每份封存产物都记录一个 `corpus_fingerprint`：对一组去重、排序后的
+`(visibility, tenant_id, source_kind, external_key, document_version_number,
+document_content_hash, chunk_generation, ordinal, chunk_content_hash)` 事实求 SHA-256，规范序列化。
+它**不**含任何行 UUID、时间戳、数据库主机或 embedding 向量——其中任何一个都会让两份相同的语料看起来
+不同——也永不含凭据。
 
-Its purpose is checkability: two independent databases that ingested the same
-fixture produce the same fingerprint, which is what makes "the same baseline" a
-falsifiable claim rather than an assurance.
+它的用途是可核查：两个独立数据库摄入同一份夹具，产出同一个指纹，这才让「同一条基线」成为一句可
+证伪的主张，而不是一句保证。
 
-Read those numbers for what they are. `VECTOR_ONLY` failing to retrieve is the
-**expected** result of random vectors — it is evidence that the vector channel is
-genuinely wired to the embedding provider rather than accidentally falling back
-to lexical matching. A plumbing `HYBRID` gate PASS therefore says the fusion,
-ranking, citation and scoring machinery works end to end; it says nothing about
-semantic retrieval quality. **Do not present a plumbing run as a semantic
-baseline.**
+按它们实际是什么来读这些数字。`VECTOR_ONLY` 检索不到，是随机向量的**预期**结果——它是「向量通道
+确实接在 embedding provider 上、而不是意外回退到了词法匹配」的证据。因此一次 plumbing 的 `HYBRID`
+闸门 PASS 只说明融合、排序、引用与评分这套机械端到端能用；它对面语义检索质量什么都没说。**不要把
+一次 plumbing 运行当成语义基线来呈现。**
 
-The driver ingests the sealed corpus through the ordinary ingestion use case,
-retires the fixture's retired document, runs each requested mode, and writes the
-artifact. Exit code is `1` only on a `FAIL` hybrid gate; `NOT_RUN` exits `0`.
+驱动通过普通摄取用例摄入封存语料、退役夹具里那份按设计要退役的文档、运行每个被请求的模式，并写出
+产物。退出码只在 hybrid 闸门 `FAIL` 时为 `1`；`NOT_RUN` 退出 `0`。
 
-### A second run is safe
+### 第二次运行是安全的
 
-`evaluate` is re-runnable against a corpus that is already in the database. The
-one corpus document the fixture retires by design is carried forward under its
-existing id rather than re-ingested, because `RETIRED` is terminal in the domain
-by design and re-ingesting it is refused — correctly. The skip is narrow: it
-applies only to the keys the sealed fixture itself retires, so an unrelated
-document found in a `RETIRED` state still fails the run loudly. On a re-run
-expect this line among the corpus progress lines:
+`evaluate` 可以对一个已经在库里的语料重复运行。夹具按设计退役的那一份语料文档会以它既有的 id 向前
+携带，而不是被重新摄取，因为 `RETIRED` 在领域里按设计是终态的，重新摄取它会被正确地拒绝。这个跳过
+很窄：它只适用于封存夹具自己退役的那些键，所以一份处于 `RETIRED` 状态的不相干文档依然会让这次运行
+响亮地失败。重复运行时，预期在语料进度行里看到这一行：
 
 ```
   [9/18] guidance-legacy-ssh-hardening: skipped (already retired by a previous run)
 ```
 
-`--skip-ingest` is the stronger form: it reuses the corpus already in the
-database and ingests nothing at all.
+`--skip-ingest` 是更强的形式：它复用库里已有的语料，完全不摄入任何东西。
 
-See [evaluation-contract.md](../evaluation/knowledge-evaluation-contract.md) for the metrics, the gate
-rule, and the artifact schema.
+指标、闸门规则与产物 schema 见
+[knowledge-evaluation-contract.md](../evaluation/knowledge-evaluation-contract.md)。
 
-## 12. Verifying the deployment
+## 12. 验证部署
 
 ```bash
 .venv/Scripts/python.exe -m ruff check .
@@ -916,44 +778,41 @@ rule, and the artifact schema.
 .venv/Scripts/python.exe -m alembic heads
 ```
 
-The real-PostgreSQL knowledge suite targets the pgvector-capable test database
-(`127.0.0.1:5434` by default) and **skips** when it is unreachable:
+真实 PostgreSQL 的知识套件针对支撑 pgvector 的测试数据库（默认 `127.0.0.1:5434`），不可达时会
+**跳过**：
 
 ```bash
 .venv/Scripts/python.exe -m pytest tests/integration/persistence/test_knowledge_persistence.py -q
 ```
 
-It verifies tenant isolation, the scope CHECK constraints, the partial unique
-indexes, the one-ACTIVE-profile rule, the single-authoritative-release rule, the
-stable ranking key across two independently-ingested databases, and citation
-resolution against a real database.
+它核验租户隔离、作用域 CHECK 约束、部分唯一索引、单 ACTIVE profile 规则、单一权威发布规则、跨两个
+独立摄入数据库的稳定排序键，以及针对真实数据库的引用解析。
 
-Regression checks that must stay green: GP-01 closure tests, P1 workspace tests,
-P2 response/durability tests, and the ToolRegistry selectable-name set
-(`hisiem.search_events`, `hisiem.get_detection_rule` — unchanged).
+必须保持绿的回归检查：GP-01 闭合测试、P1 工作区测试、P2 响应/持久性测试，以及 ToolRegistry 的可选
+名字集（`hisiem.search_events`、`hisiem.get_detection_rule`——未变）。
 
-## 13. Troubleshooting
+## 13. 故障排查
 
-| Symptom | Cause | Fix |
+| 症状 | 原因 | 处置 |
 |---|---|---|
-| `type "vector" does not exist` | pgvector installed in a schema not on the pinned `search_path` | `ALTER EXTENSION vector SET SCHEMA copilot;` |
-| Migration refuses with the pgvector message | Extension absent and the role may not create it | `CREATE EXTENSION IF NOT EXISTS vector SCHEMA copilot;` as an admin |
-| `doctor` → `NOT_READY`, `knowledge_schema` FAIL | P3-A tables missing | `alembic upgrade head` |
-| `InvalidSchemaName: no schema has been selected to create in` on the first migration | Existing volume: `docker-entrypoint-initdb.d` never ran | `CREATE SCHEMA IF NOT EXISTS copilot;` (§2.3) |
-| `doctor` → `NOT_READY`, `attack_release_authority` FAIL, `ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | More than one ACTIVE release for one framework | Import the intended release with `--activate`; leave the others inactive (§8) |
-| `import-attack` → `ATTACK_RELEASE_CONTENT_CONFLICT` | The same release name was imported with a different technique collection | Re-import the pinned bundle, or use a new release name (§8) |
-| `import-attack` → `ATTACK_RELEASE_PROJECTION_INCOMPLETE` | The staged projection is not complete: a crash mid-staging, or a bound document was retired underneath the release | Re-run the same import to finish staging; the message names the missing techniques. Nothing was changed (§8) |
-| `import-attack` → `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` | A binding does not resolve, or its content hash no longer matches its canonical row | The staged projection is not of this release's content. Re-run the import; if it persists, the database was restored out of band (§8) |
-| `import-attack` → `ATTACK_RELEASE_PROJECTION_INVALID_BINDING` | The binding exists but its relationship is invalid: version belongs to another document, non-MITRE/non-GLOBAL/retired target, wrong external key, or broken canonical == binding == version hash chain | The staged binding is not this release's projection. Re-stage the release; if it persists, the database was edited out of band (§8) |
-| `ingest-file --source-kind MITRE_ATTACK` | Rejected by the parser | MITRE content enters through `import-attack` (§8); the ordinary path is not its writer |
-| `ingest-file`/`retire` → `SYSTEM_MANAGED_KNOWLEDGE_SOURCE` | An ordinary write or retirement targeted a MITRE document | Use `import-attack` for MITRE content; MITRE lifecycle belongs to an ATT&CK-specific workflow |
-| `doctor` → `NOT_READY`, `attack_release_projection` FAIL, `ATTACK_RELEASE_PROJECTION_DIVERGED` | The authoritative release and what normal retrieval serves disagree | Re-import that release. It is already ACTIVE, so the import cuts over even without `--activate` (§8) |
-| `alembic downgrade` → `P3A_DOWNGRADE_UNSAFE` | The database holds rows the pre-closure schema cannot represent | Nothing was changed. Take a physical backup and remove the listed rows deliberately, or stay at head. If `alembic current` is `c41f7b2e9d08`, run `alembic upgrade head` first (§3, **Downgrade safety**) |
-| `ingest-file` → `EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX` | The configured provider differs from the ACTIVE profile | Switching the embedding space is a whole-corpus reindex, not an ingest; restore the original provider configuration, or reindex the corpus (§5) |
-| `evaluate` → `CORPUS_PRECONDITION_FAILED` | The database does not hold exactly the sealed fixture in the expected scopes | Use a dedicated database, or run with `--allow-ambient-corpus` and read the result as `OPEN_CORPUS`, not as the baseline (§11) |
-| `doctor` → `DEGRADED`, `active_embedding_profile` WARN | No document ingested yet | Ingest one; or configure the embedding provider and re-ingest |
-| `doctor` → `attack_release_authority` WARN | No ACTIVE ATT&CK release | Import the intended release with `--activate` (§8) |
-| `search --mode vector` exits `3` | No ACTIVE profile or no provider configured | Configure `EMBEDDING_*`, restart, ingest |
-| `ingest-file` refuses the file | Not `.txt`/`.md` | Convert to Markdown; PDF/DOCX/HTML are out of scope |
-| `import-attack` reports `skipped` | Revoked/deprecated techniques in the bundle | Expected. The ids are listed; nothing was silently dropped |
-| Artifact write refused | A baseline already exists at that path | Pass `--overwrite`, or point `--out` at another **directory** (`--out` names a directory; the filename is derived from the suite, `k`, and the evidence quality) |
+| `type "vector" does not exist` | pgvector 装在一个不在钉住 `search_path` 上的 schema 里 | `ALTER EXTENSION vector SET SCHEMA copilot;` |
+| 迁移以 pgvector 消息拒绝 | 扩展缺失且该角色无权创建它 | 以管理员执行 `CREATE EXTENSION IF NOT EXISTS vector SCHEMA copilot;` |
+| `doctor` → `NOT_READY`，`knowledge_schema` FAIL | 知识子系统表缺失 | `alembic upgrade head` |
+| 第一支迁移上 `InvalidSchemaName: no schema has been selected to create in` | 既有数据卷：`docker-entrypoint-initdb.d` 从未运行 | `CREATE SCHEMA IF NOT EXISTS copilot;`（§2.3） |
+| `doctor` → `NOT_READY`、`attack_release_authority` FAIL、`ATTACK_RELEASE_AUTHORITY_AMBIGUOUS` | 某个 framework 有多于一个 ACTIVE 发布 | 用 `--activate` 导入意图中的发布；让其他的保持非 active（§8） |
+| `import-attack` → `ATTACK_RELEASE_CONTENT_CONFLICT` | 同名发布被用不同的技术集合导入过 | 重新导入钉住的 bundle，或用一个新发布名（§8） |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_INCOMPLETE` | 暂存投影不完整：暂存中途崩溃，或某份已绑定文档在该发布底下被退役 | 重跑同一次导入以完成暂存；消息会点名缺失的技术。什么都没被改（§8） |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_MISSING_VERSION` | 某条绑定解析不了，或它的内容哈希不再匹配其规范行 | 暂存投影不是这个发布的内容。重跑导入；若持续存在，说明数据库被带外还原过（§8） |
+| `import-attack` → `ATTACK_RELEASE_PROJECTION_INVALID_BINDING` | 绑定存在但关系无效：版本属于另一份文档、目标非 MITRE/非 GLOBAL/已退役、external key 不对，或 规范行 == 绑定 == 版本 哈希链断裂 | 暂存绑定不是这个发布的投影。重新暂存该发布；若持续存在，说明数据库被带外编辑过（§8） |
+| `ingest-file --source-kind MITRE_ATTACK` | 被解析器拒绝 | MITRE 内容经 `import-attack` 进入（§8）；普通路径不是它的写者 |
+| `ingest-file`/`retire` → `SYSTEM_MANAGED_KNOWLEDGE_SOURCE` | 一次普通写入或退役指向了 MITRE 文档 | MITRE 内容用 `import-attack`；MITRE 生命周期属于一个 ATT&CK 专属工作流 |
+| `doctor` → `NOT_READY`、`attack_release_projection` FAIL、`ATTACK_RELEASE_PROJECTION_DIVERGED` | 权威发布与普通检索服务的内容不一致 | 重新导入那个发布。它已经是 ACTIVE，所以即便不带 `--activate` 这次导入也会切换（§8） |
+| `alembic downgrade` → `P3A_DOWNGRADE_UNSAFE` | 库里存有闭合前 schema 无法表示的行 | 什么都没被改。做一次物理备份并有意删除列出的行，或留在 head。若 `alembic current` 是 `c41f7b2e9d08`，先跑 `alembic upgrade head`（§3，**降级安全**） |
+| `ingest-file` → `EMBEDDING_PROFILE_SWITCH_REQUIRES_CORPUS_REINDEX` | 所配置 provider 与 ACTIVE profile 不同 | 切换 embedding 空间是全语料重建索引，不是一次摄取；恢复原来的 provider 配置，或重建语料索引（§5） |
+| `evaluate` → `CORPUS_PRECONDITION_FAILED` | 库里没有在预期作用域上恰好持有那份封存夹具 | 用专用数据库，或带 `--allow-ambient-corpus` 运行并把结果读作 `OPEN_CORPUS`，不要当作基线（§11） |
+| `doctor` → `DEGRADED`，`active_embedding_profile` WARN | 还没有摄取任何文档 | 摄取一份；或配置 embedding provider 后重新摄取 |
+| `doctor` → `attack_release_authority` WARN | 没有 ACTIVE 的 ATT&CK 发布 | 用 `--activate` 导入意图中的发布（§8） |
+| `search --mode vector` 退出 `3` | 没有 ACTIVE profile，或未配置 provider | 配置 `EMBEDDING_*`，重启，摄取 |
+| `ingest-file` 拒绝该文件 | 不是 `.txt`/`.md` | 转成 Markdown；PDF/DOCX/HTML 不在范围内 |
+| `import-attack` 报告 `skipped` | bundle 里有已撤销/已弃用的技术 | 预期行为。id 会被列出；没有任何东西被静默丢弃 |
+| 产物写入被拒绝 | 该路径上已存在一份基线 | 传 `--overwrite`，或把 `--out` 指向另一个**目录**（`--out` 命名的是目录；文件名由套件、`k` 与证据质量派生） |
