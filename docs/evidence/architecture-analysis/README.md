@@ -5,12 +5,12 @@
 > 本集独有的是 **`file:line` 锚点与反直觉的真实形态**。`docs/README.md` 规定「Architecture and persistence documents are authority」——**冲突时以权威契约为准**；而**代码是最终事实**。
 > 完整阅读地图见 [`../guide/04-想深入读哪一篇.md`](../../guide/04-想深入读哪一篇.md)。
 >
-> 取证锚点：分支 `capability-mcp` @ `1e567be`。此后全部提交均为文档改动（`git diff --stat 1e567be..HEAD -- '*.py' '*.sql'` 为空），**代码未变**，故本集结论仍然现行。
+> **取证基线 ≠ 当前 HEAD ≠ 当前代码语义** —— 本集基于分支 `capability-mcp` @ `1e567be` 建立，那是本组 `file:line` 取证的**原始代码基线**，此后**未重新扫描**。仓库继续演进；已检查到的后续 `*.py`/`*.sql` 改动只涉及注释、docstring 与人类可读消息文本（例如文档路径引用），未改变本集记录的源码语义。因此三件事要分开看：`1e567be` = **取证快照的代码基线**；当前 `HEAD` = **现行仓库状态**；**核验某条证据是否仍成立时，以当前代码为最终事实**。
 
 > **分析对象**：`D:\Project\HISIEM-SOC-Copilot`（Hatchling `src/` layout，包根 `src/hisiem_soc_copilot/`；Python 3.12+ · FastAPI · LangGraph + langgraph-checkpoint-postgres · SQLAlchemy 2 async + psycopg 3 + pgvector · Alembic · OpenTelemetry · MCP SDK）
 > **分析方式**：按子系统边界拆分，对**实际源码**取证——关键结论均附 `file:line` 相对路径证据。
 > **取证工具链**：本仓**无 `.codegraph/` 索引**，采用**源码直读 + AST 边界测试直读 + grep 统计**；每个 `file:line` 都对应真实代码，不凭空编造行号。**部分论断在项目 venv 中实跑验证**（见 §2）。
-> **代码基线**：分支 `capability-mcp` @ `1e567be`
+> **取证代码基线**：分支 `capability-mcp` @ `1e567be`（本集快照；当前仓库状态见上）
 > **生成日期**：2026-09-22
 > **文档集**：00–08 共 9 篇。**各篇的行数与图数不在本表维护**——它们随每次编辑漂移，也不是读者需要的信息（现算：`wc -l <篇>` 与 `grep -c mermaid <篇>`）
 
