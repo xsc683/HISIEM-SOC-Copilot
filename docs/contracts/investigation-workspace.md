@@ -212,7 +212,7 @@ BFF 以服务端派生的 `X-Tenant-ID` / `X-Actor-Subject` 转发，**绝不**�
 
 ```text
 POST / GET / cancel  /api/v1/investigations
-评测命令（评估闭环；契约见 [`evaluation/evaluation-closure-contract.md`](../evaluation/evaluation-closure-contract.md)）
+评测命令（评估闭环；契约见 [`../evaluation/evaluation-closure-contract.md`](../evaluation/evaluation-closure-contract.md)）
 GP-01 scorer
 工具/证据 lineage
 provider 行为
