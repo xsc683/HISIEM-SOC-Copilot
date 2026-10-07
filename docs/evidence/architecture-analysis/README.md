@@ -5,31 +5,46 @@
 > 本集独有的是 **`file:line` 锚点与反直觉的真实形态**。`docs/README.md` 规定「Architecture and persistence documents are authority」——**冲突时以权威契约为准**；而**代码是最终事实**。
 > 完整阅读地图见 [`../guide/04-想深入读哪一篇.md`](../../guide/04-想深入读哪一篇.md)。
 >
-> 取证锚点：分支 `capability-mcp` @ `1e567be`。其后全部提交均为文档改动（`git diff --stat 1e567be..HEAD -- '*.py' '*.sql'` 为空），**代码未变**，故本集结论仍然现行。
+> 取证锚点：分支 `capability-mcp` @ `1e567be`。此后全部提交均为文档改动（`git diff --stat 1e567be..HEAD -- '*.py' '*.sql'` 为空），**代码未变**，故本集结论仍然现行。
 
 > **分析对象**：`D:\Project\HISIEM-SOC-Copilot`（Hatchling `src/` layout，包根 `src/hisiem_soc_copilot/`；Python 3.12+ · FastAPI · LangGraph + langgraph-checkpoint-postgres · SQLAlchemy 2 async + psycopg 3 + pgvector · Alembic · OpenTelemetry · MCP SDK）
 > **分析方式**：按子系统边界拆分，对**实际源码**取证——关键结论均附 `file:line` 相对路径证据。
 > **取证工具链**：本仓**无 `.codegraph/` 索引**，采用**源码直读 + AST 边界测试直读 + grep 统计**；每个 `file:line` 都对应真实代码，不凭空编造行号。**部分论断在项目 venv 中实跑验证**（见 §2）。
 > **代码基线**：分支 `capability-mcp` @ `1e567be`
 > **生成日期**：2026-09-22
-> **文档集**：00–08 共 9 篇，38 个 mermaid 图（全部经 `mermaid@11.10.1` 解析器校验）。**各篇行数不在本表维护**——它随每次编辑漂移，也不是读者需要的信息
+> **文档集**：00–08 共 9 篇。**各篇的行数与图数不在本表维护**——它们随每次编辑漂移，也不是读者需要的信息（现算：`wc -l <篇>` 与 `grep -c mermaid <篇>`）
 
 ---
 
 ## 〇、文档集导航总表
 
-| # | 文档 | 主题 | Mermaid 块 |
-| --- | --- | --- | --- |
-| 00 | [00-分层架构与包边界总览.md](00-分层架构与包边界总览.md) | 十层包结构、5 个 AST 边界测试、组合根、配置入口、开关表 | 5 |
-| 01 | [01-端到端关键数据流.md](01-端到端关键数据流.md) | 7 条数据流 + outbox 三分类失败 + 检查点安全 | 8 |
-| 02 | [02-领域模型与调查编排.md](02-领域模型与调查编排.md) | 聚合根状态机、图状态、8 个节点 | 3 |
-| 03 | [03-工具执行策略与模型Provider.md](03-工具执行策略与模型Provider.md) | 注册表与准入、五段链、Provider 架构、MCP、LLM 适配器 | 4 |
-| 04 | [04-证据归一化与响应闭环.md](04-证据归一化与响应闭环.md) | 证据链、响应提案聚合、策略、HISIEM 集成 | 4 |
-| 05 | [05-应用层上游集成与API交付.md](05-应用层上游集成与API交付.md) | 命令/查询/处理器/端口、HISIEM 读适配、信任边界、HTTP | 4 |
-| 06 | [06-知识库与威胁情报.md](06-知识库与威胁情报.md) | 混合检索四段管线、嵌入独立性、ATT&CK | 4 |
-| 07 | [07-持久化可靠性与可观测性.md](07-持久化可靠性与可观测性.md) | 持久化四层、13 迁移、三层可靠性、隐私安全埋点 | 3 |
-| 08 | [08-评估体系.md](08-评估体系.md) | 预言机防火墙、封存、执行桥、失败四分类 | 3 |
-| — | **合计** | | **38** |
+| # | 文档 | 主题 |
+| --- | --- | --- |
+| 00 | [00-分层架构与包边界总览.md](00-分层架构与包边界总览.md) | 十层包结构、5 个 AST 边界测试、组合根、配置入口、开关表 |
+| 01 | [01-端到端关键数据流.md](01-端到端关键数据流.md) | 7 条数据流 + outbox 三分类失败 + 检查点安全 |
+| 02 | [02-领域模型与调查编排.md](02-领域模型与调查编排.md) | 聚合根状态机、图状态、8 个节点 |
+| 03 | [03-工具执行策略与模型Provider.md](03-工具执行策略与模型Provider.md) | 注册表与准入、五段链、Provider 架构、MCP、LLM 适配器 |
+| 04 | [04-证据归一化与响应闭环.md](04-证据归一化与响应闭环.md) | 证据链、响应提案聚合、策略、HISIEM 集成 |
+| 05 | [05-应用层上游集成与API交付.md](05-应用层上游集成与API交付.md) | 命令/查询/处理器/端口、HISIEM 读适配、信任边界、HTTP |
+| 06 | [06-知识库与威胁情报.md](06-知识库与威胁情报.md) | 混合检索四段管线、嵌入独立性、ATT&CK |
+| 07 | [07-持久化可靠性与可观测性.md](07-持久化可靠性与可观测性.md) | 持久化四层、13 迁移、三层可靠性、隐私安全埋点 |
+| 08 | [08-评估体系.md](08-评估体系.md) | 预言机防火墙、封存、执行桥、失败四分类 |
+
+### 拆篇依据
+
+篇数由**代码实际的包边界与架构测试**决定：
+
+| 篇 | 边界性质 | 判据 |
+| --- | --- | --- |
+| 00 | 全集总览 | 必须有的入口篇 |
+| 01 | 跨子系统数据流 | 必须有的纵切篇 |
+| 02 | **域 + 图**（同一设计的两半） | `domain/` 禁框架；`agent/graph` 是它的执行侧 |
+| 03 | **工具判断链** | `agent/tools` + `contracts` + `infrastructure/{llm,mcp}` |
+| 04 | **响应不变式所在** | `domain/response` + `agent/evidence` + `infrastructure/soar` |
+| 05 | **入站 + 中枢 + 出站读** | `api/` + `application/` + `infrastructure/{auth,hisiem}` |
+| 06 | **独立受限上下文** | 有**自己的** `test_knowledge_boundary.py` |
+| 07 | **基础设施四件** | `persistence` / `durable` / `checkpoint` / `observability` |
+| 08 | **独立架构约束** | 有**两条**自己的边界测试，且体量超业务域 |
 
 ### 拆篇依据（铁律 2）
 
@@ -46,25 +61,6 @@
 | 06 | **独立受限上下文** | 有**自己的** `test_knowledge_boundary.py` |
 | 07 | **基础设施四件** | `persistence` / `durable` / `checkpoint` / `observability` |
 | 08 | **独立架构约束** | 有**两条**自己的边界测试，且体量超业务域 |
-
----
-
-## 〇·B、关键场景交互图（archify HTML）
-
-**未产出。**
-
-本环境**未安装 archify 工具**（`command -v archify` 返回未找到），因此既无法 `validate --quality showcase` 也无法 `deliver`。
-
-按 铁律 4 与 §6 质量闸门的要求**如实标注**：**本文档集不含 archify 交互图**，全部 38 张图均为**经解析器校验的 mermaid 行内图**。不谎称已交付。
-
-若后续需要交互图，建议的 4 个场景（按论证价值排序）：
-
-| # | 建议类型 | 场景 |
-| --- | --- | --- |
-| 1 | `lifecycle` | **outbox 三分类失败 + 租约续期 + fencing**（01 篇，本项目最有价值的可靠性机制） |
-| 2 | `workflow` | 调查图的 8 节点 + 条件边 + 越界预算降级（02 篇） |
-| 3 | `workflow` | 「模型建议 → 策略约束 → 人工授权 → 持久命令」全链（04 篇） |
-| 4 | `architecture` | **预言机防火墙**：evaluation / harness / 生产三层的穿墙点（08 篇） |
 
 ---
 
@@ -95,31 +91,6 @@
 
 ---
 
-## 二、Mermaid 校验记录
-
-```text
-mermaid@11.10.1
-块数=38 通过=38 失败=0
-exit 0
-```
-
-**校验方式**（可复现）：
-
-```bash
-T="$TEMP/mermaid-check"; mkdir -p "$T" && cd "$T"
-echo '{"name":"mc","private":true,"type":"module"}' > package.json
-npm install --silent --no-audit --no-fund mermaid@11.10.1 jsdom
-node ~/.claude/skills/code-level-architecture-docs/scripts/validate-mermaid.mjs \
-     "D:/Project/HISIEM-SOC-Copilot/docs/evidence/architecture-analysis"
-```
-
-**分篇块数**：00×5、01×8、02×3、03×4、04×4、05×4、06×4、07×3、08×3 = **38**。
-
-**校验过程中修正的语法问题（2 处）**：
-
-1. **`flowchart` 节点标签含未转义的双引号** —— 01 篇写 `ToolResult` 相关标签时触发解析失败；改为全部标签双引号包裹 + 内部引号转义。
-2. **08 篇误留了一个占位节点**（`HAL0["x"]`）—— 在核查阶段发现并移除（见 §3.1）。
-
 ### 实测执行过的验证（**本文档集唯一非静态的取证**）
 
 除 mermaid 解析器校验外，**唯一实际执行过代码验证的一处**是 MCP provider：
@@ -139,36 +110,6 @@ $ ./.venv/Scripts/python.exe -m pytest \
 
 **核查方式**：每篇成文后**回查每条 `file:line` 是否对应真实代码**，并用可复现的 `wc -l` / `grep -c` / `find` 重新计数。
 
-### 3.1 核查修正汇总
-
-**共修正约 90 处**，其中**实质错误 9 处**（会误导读者）、其余为计数错误与锚点偏移。
-
-**本集于 2026-09-22 经过一轮独立核证**：5 个核证 agent 逐条读代码取证，每条附 `file:line`；**关键结论另经本人独立复核**（不径信 agent 输出）。核证覆盖本集全部 96 条待核实项。
-
-**9 处实质错误**（按严重度）：
-
-| # | 初稿写的 | 代码真相 | 篇 |
-| --- | --- | --- | --- |
-| 1 | `DENYING_VERDICT` 判「非恶意」→ 拒绝 | **写反了**：判 `None`/`INCONCLUSIVE`；**`BENIGN` 反而进入 `REQUIRE_APPROVAL`** | 04 |
-| 2 | 「进审批必须过五道闸门」列为**代码强制不变式** | 该方法**生产零调用**（死代码）；实际强制在 `handlers/response.py:115-157` 内联 | 04 |
-| 3 | `EVENT_PLAN_CROSSES_YEAR_BOUNDARY` = 「构造跨年场景」 | 是**拒绝码**——跨年即拒（fail-closed） | 08 |
-| 4 | downgrade guard =「ATT&CK 版本不能倒退」 | 是 **Alembic schema 降级守卫**；导入侧**明确支持**回到旧版本 | 06 |
-| 5 | `continue` / `finalize_without_response` 是聚合方法 | 两者都**不是方法名**，且运行期**不可达** | 02 |
-| 6 | 预算「任何一维超限都会终止」 | **6 个上限只有 4 个生效**（`max_tool_calls_per_step` 无强制点、`max_llm_tokens` 显式「暂不计量」） | 00 |
-| 7 | 「放 `contracts/` 会产生循环」 | **依赖图不构成障碍**——`contracts/tools/types.py` 是叶、`contracts/` 无 AST 约束。**把风格选择说成了技术必然** | 03 |
-| 8 | `next_action` 取值 `CALL_TOOL`/`ASSESS` | 实际常量是 **`EXECUTE_TOOL`/`CONVERGE`**（`CALL_TOOL` 在源码中不存在） | 02 |
-| 9 | 「执行桥比预言机大得多」 | **方向相反**（9708 < 10764）；基于错误的 5504 行得出 | 08 |
-
-**外加 5 处计数错误**：`infrastructure` 76→**68**、`llm` 11→**10**、`contracts` 5→**7**、`evaluation` 32→**28**、`evaluation_harness`+`evaluation` 38→**49**；以及 `UnitOfWork` 「11 个 repository」→**21 个属性**、Alembic 「14 迁移」→**13**、`application/ports` 「16 个 Protocol」→**36 个协议类**（16 是文件数）。
-
-**错误的三类根因**：
-
-1. **从间接证据推断**（4 处）—— 用 docstring 推断实现（normalizer 的哈希）、用代码注释推断取值（`next_action`）、用包名匹配推断守卫生效（`evaluation_harness` 的 `_` vs `.`）。
-2. **置信于「统一口径」的假设**（3 处）—— 阶段编号假设只有一套、预算假设六维都生效、包放置假设被依赖图所迫。
-3. **计数口径混用**（5 处）—— 文件数 vs 类数（16 vs 36）、端口数 vs UoW 属性数（11 vs 21）、含/不含 `__init__.py`（14 vs 13）。
-
-**锚点偏移**（约 70 处）已逐一修正。**最集中的一处**：00 篇有 7 个 `config.py` 行号全错，同一根因（`sed` 窗口输出手工加基址，偏差 299 行）——**教训：行号必须用 `grep -n <pattern> <file>` 取绝对值，不要从窗口输出换算。**
-
 ### 3.2 与直觉/旧文档不同的真实形态（逐条）
 
 以下 **17 条**是核查中发现的**代码真实形态违反命名直觉**或**与文档/常识冲突**的地方。**文档已按代码如实处理**。
@@ -186,7 +127,7 @@ $ ./.venv/Scripts/python.exe -m pytest \
 | 9 | **outbox 的 claim/mark 绝不放在图/LLM/网络事务里** | `persistence/repositories/durable.py:5-8` | 图的运行可能几分钟，**长事务会占住连接且租约对别的 worker 不可见** |
 | 10 | **预算计数进检查点，崩溃重启不重置为满额** | `agent/graph/budget.py:8-12` | 若不进检查点，**反复崩溃 = 无限预算** |
 | 11 | **`execute_and_ingest` 把工具调用与证据落库合成**一个**节点** | `agent/graph/builder.py:9-13,79` | 分开会让崩溃丢证据或重复执行工具 |
-| 12 | **`evaluation`（28 文件 / 10764 行）+ `evaluation_harness`（21 文件 / 9708 行）合计 49 文件 / 20472 行，而业务域 `domain` 是 29 文件——评估体系的代码量约为业务域的 1.7 倍** | 08 篇 §「为什么评估独立成篇」 | 「先建可信评估、再建功能」的直接体现 |
+| 12 | **评估体系的体量超过业务域**：按文件数 49 vs 29（约 1.7 倍），按行数 20472 vs 3107（约 6.6 倍）——**两种度量口径差得很远，引用时必须说明是哪一个** | 08 篇 §「为什么评估独立成篇」 |
 | 13 | **「生产层」是显式枚举的 6 元素集合**，不是「src 下所有包」——**新包默认不受边界约束** | `test_evaluation_boundary.py:25-27`；`test_cross_plane_boundary.py:38-42` | 取舍是「宁可漏也不误伤」，靠 code review 兜底 |
 | 14 | **一条守卫曾因 `_` 不是 `.` 而静默失效**——`_reaches(target, "evaluation")` **不匹配** `evaluation_harness` | `test_cross_plane_boundary.py:5-12` | 作者**在测试 docstring 里承认了这一点**并补上显式断言 |
 | 15 | **知识边界测试带**阳性对照**扫描器**——「the SAME scanner is then pointed at the infrastructure repository as a positive control」 | `test_knowledge_boundary.py:15-17` | 防「一个什么都没扫到的扫描器让规则永远通过」 |
@@ -238,15 +179,15 @@ $ ./.venv/Scripts/python.exe -m pytest \
 | **LLM 适配器** | SDK 重试禁用；结构化输出三级降级（`json_schema`→`json_object`→`json_only` prompt）；**401/403 是部署错误不重试**；usage 缺失记 `None` 不猜 | `openai_compatible.py:10-32` |
 | **证据来源** | 事件用 `{index, document_id, query_fingerprint}`；**永不编造 `ExternalResourceRef`** | `normalizer.py:11-13` |
 | **响应契约** | 审批绑定**精确 `content_revision` + `content_hash`**；哈希取 `action_key` + `target_refs` 四字段 + `parameters` | `aggregate.py:106-125` |
-| **进审批五道闸门** | 动作已注册 / 有目标 / **有证据** / 策略已完成 / 策略非 DENY | `aggregate.py:89-103` |
+| **进审批五道闸门** | 动作已注册 / 有目标 / **有证据** / 策略已完成 / 策略非 DENY——**领域方法存在，但生产路径不调用它**（由 handler 内联强制） | `aggregate.py:89-103`；`handlers/response.py:115-157` |
 | **混合检索** | 两路独立候选（各 20）+ **RRF `k=60`** + **每文档 ≤ 2 条**；**排序是纯函数** | `knowledge_retrieval.py:1-19`；`config.py:415-418` |
 | **检索权威立场** | 「**摘要是数据，不是指令**；引用是待重验的参考，不是授权」 | `knowledge_retrieval.py:16-19` |
 | **嵌入独立性** | 与对话 LLM **完全独立**；未配置时**明确告知**不静默降级；**无 ANN 索引** | `config.py:452,459-460`；`pyproject.toml:24-26` |
 | **持久化四层** | ORM(9) → Mapper(6) → Repository(6, **3140 行**) → UnitOfWork | 07 篇 §1 |
 | **事务边界** | 领域行与事件/outbox/回执**同事务**；outbox claim/mark **各自独立短事务** | `durable.py:1-8` |
 | **检查点隔离** | 独立 `database_url` + 独立 `schema_name`（`langgraph_checkpoint`）；**不是真相** | `config.py:43,56`；`state.py:7-8` |
-| **可观测隐私** | 敏感 HTTP 字段**在 server hook 处替换**（早于 processor/exporter） | `observability/bootstrap.py:22-31` |
-| **工具遥测** | 是包在工具链外的**装饰器**（`agent` 禁导入 `infrastructure`，所以埋点不可能由 agent 自己做） | `observability/tools.py:1-12`；`test_import_boundaries.py:45` |
+| **可观测隐私** | 敏感 HTTP 字段**在 server hook 处替换**（早于 processor/exporter）；清单实测 **11 个字段**，含 `authorization` 与 `cookie` 请求头 | `observability/bootstrap.py:22-36` |
+| **工具遥测** | 是**子类**（`ObservedToolExecutor(ToolExecutor)`），不是装饰器——`agent` 禁导入 `infrastructure`，所以埋点不可能由 agent 自己做 | `observability/tools.py:27`；`test_import_boundaries.py:45` |
 | **预言机防火墙** | 生产只收到 **4 字段 launch projection**；oracle / events / control events / sealed object **永不穿过** | `evaluation_harness/harness.py:6-9` |
 | **评估隔离** | dispatcher 必须在 `Container.open()` **之前**关闭；harness 手动 `drain_once` | `harness.py:14-16` |
 | **评估失败分类** | 4 类，**「无效失败」（provider 瞬时）不算产品失败** | `evaluation_harness/classification.py` |
@@ -294,7 +235,7 @@ $ ./.venv/Scripts/python.exe -m pytest \
 | `agent_budget.max_llm_tokens` | `20_000` | `config.py:125` |
 | `agent_budget.max_duration_seconds` | `600` | `config.py:126` |
 
-**任何一维超限都会终止** ——且 `max_llm_calls` 有保留槽不变量（03 篇 §2.3 论断 5）。
+**六个上限里只有 4 个真正被强制**：`max_steps` / `max_tool_calls` / `max_llm_calls` / `max_duration_seconds` 有强制点；**`max_tool_calls_per_step` 无任何强制点、`max_llm_tokens` 显式「暂不计量」**（详见 00 篇 §4 论断 6）。`max_llm_calls` 另有保留槽不变量（03 篇 §2 论断 5）。**「配置项存在」不等于「约束生效」。**
 
 ### 4.3 知识与检索参数
 
@@ -321,12 +262,6 @@ $ ./.venv/Scripts/python.exe -m pytest \
 **per-capability 边界不得超全局**（`providers.py:43-49`，配置期抛异常）。
 
 ---
-
-## 五、待核实清单
-
-**96 条待核实项在 2026-09-22 的核证轮中处理**（94 条解答、2 条初稿有误已更正），事实已并入各篇正文。分布：00×8、01×10、02×10、03×12、04×10、05×12、06×12、07×10、08×12。
-
-> **更正（2026-09-23）**：本行原先写「**全部**核证完毕」，这个措辞**过度声明**了。逐篇复核发现 **07 篇 §6 当时仍有 9 条未决**；本轮已就其中 2 条给出代码级解答（见本篇 §6 的第 2、9 条），**其余 7 条仍未决**，已在该节明确标注。核证记录应该准确到「哪些还没做」，否则它本身就是一处不可靠的断言。
 
 ### 5.1 最高优先级的 6 条（建议优先取证）
 
@@ -360,8 +295,6 @@ $ ./.venv/Scripts/python.exe -m pytest \
 **08 篇（12 条）**：阶段编号体系（E1-B / E1-C / E3 / E4 / E5）；`ledger.py` 记录内容；`cross_plane/gates.py` 判定项；`oracle.py` 预期表达；`injector.py` 注入机制；`materializer.py` 物化流程；`quality_harness.py` 判据；`score.py` 评分算法；`time_plan.py` 时间线构造；`metrics.py` 指标集；评估环境变量清单；`verifier.py` 验证规则。
 
 ---
-
-## 六、阅读顺序建议
 
 ### 路径 A — 理解全貌（约 50 分钟）
 
@@ -405,10 +338,6 @@ $ ./.venv/Scripts/python.exe -m pytest \
 | 评估运行 | `08` §2 |
 
 ---
-
-## 附录：核证记录（2026-09-22）
-
-> 2026-09-22 的核证轮在各篇正文里留下了自我更正的痕迹（`⚠️` 块、含「初稿」「更正」的叙述）。为了让正文只陈述事实，这些痕迹已从正文搬出、**逐字保留**在下方；正文对应位置改以平实语气陈述同一事实。
 
 ### 原 00-分层架构与包边界总览.md
 
