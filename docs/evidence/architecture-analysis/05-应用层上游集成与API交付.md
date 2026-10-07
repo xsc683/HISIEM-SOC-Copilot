@@ -31,65 +31,29 @@
 
 ### 1.1 关键论断
 
-**论断 1：`application/` 的四个子包有清晰的语义分工。**
+**论断 1：`application/` 的四个子包有清晰的语义分工，且重量极不均匀。**
 
-| 子包 | 文件 | 行数 | 语义 |
-| --- | --- | --- | --- |
-| `commands/` | 3 | 438 | **意图的**声明****（数据类） |
-| `queries/` | 2 | 395 | **读取的**声明**** |
-| `handlers/` | 6 | **3321** | **命令的执行者**（含事务、幂等、事件发布） |
-| `services/` | 5 | 1946 | **跨用例的服务**（工作区投影、知识检索） |
-| `ports/` | 16 | — | **对外依赖的接口** |
+| 子包 | 文件 | 语义 |
+| --- | --- | --- |
+| `commands/` | 3 | **意图的声明**（数据类） |
+| `queries/` | 2 | **读取的声明** |
+| `handlers/` | 6 | **命令的执行者**（含事务、幂等、事件发布） |
+| `services/` | 5 | **跨用例的服务**（工作区投影、知识检索） |
+| `ports/` | 16 | **对外依赖的接口** |
 
-实测 `wc -l`：
+**重量集中在 `handlers/` 与 `services/`**（`handlers` 3321 行 + `services` 1946 行，占应用层 6104 行的 86%），而声明层很薄。最重的三个文件是 `services/workspace_service.py`（964 行）、`handlers/knowledge.py`（790 行）、`handlers/workflow.py`（755 行）。
 
-| 文件 | 行数 |
-| --- | --- |
-| `handlers/knowledge.py` | **790** |
-| `handlers/workflow.py` | **755** |
-| `handlers/attack_import.py` | **743** |
-| `handlers/investigation.py` | 451 |
-| `handlers/response.py` | 432 |
-| `handlers/durable_support.py` | 150 |
-| `services/workspace_service.py` | **964** |
-| `services/knowledge_retrieval.py` | **672** |
-| `services/attack_release_fingerprint.py` | 167 |
-| `services/investigation_service.py` | 74 |
-| `services/attack_projection.py` | 69 |
+**论断 2：`commands/` 与 `queries/` 是薄声明，不是逻辑所在。**
 
-**`handlers/` 与 `services/` 是应用层的全部重量所在（5267 行 / 6104 = 86%）** ——命令与查询的声明层很薄（833 行）。
-
-**论断 2：`commands/` 与 `queries/` 是**薄声明**，不是逻辑所在。**
-
-```python
-# application/commands/response.py 只有 63 行
-```
-
-**最薄的命令模块只有 63 行** ——因为它只声明「要做什么」，执行在 `handlers/response.py`（432 行）。
+最薄的命令模块只有 63 行（`application/commands/response.py`），执行在 `handlers/response.py`（432 行）。
 
 **CQRS 式的读写分离在包结构上成立**：`commands` + `queries` 分开，但**两者共用同一套端口与聚合**——不是完整的 CQRS（没有独立读库）。
 
-**论断 3：工作区投影服务是**纯读**，且四条禁止写进 docstring。**
+**这解释了 `queries/workspace.py` 与 `services/workspace_service.py` 的分工**：前者是**纯数据层**（查询端口的调用），后者是**执行层**（在 `UnitOfWork` 里编排、投影成只读模型）。**名字相近，层次不同。**
 
-```python
-# application/services/workspace_service.py:1-14
-"""Workspace read service — composes the Analyst Workspace projection.
+**论断 3：工作区投影服务是纯读，四条禁止写进 docstring。**
 
-This service performs a PURE READ: it loads the Investigation aggregate and its
-child rows through tenant-scoped repository/query ports inside ONE UnitOfWork,
-then projects them into an immutable :class:`InvestigationWorkspaceReadModel`.
-
-It MUST NOT (docs/investigation-workspace.md §7):
-- mutate any domain state,
-- run the Agent / LangGraph / a model / a tool,
-- touch ORM or SQL directly (it depends on the ``UnitOfWork`` port only).
-
-The composed timeline is derived deterministically from persisted facts; no entry
-is fabricated and no debug/telemetry fact is exposed.
-"""
-```
-
-**四条禁止**：
+`application/services/workspace_service.py:1-14`：*「This service performs a PURE READ: it loads the Investigation aggregate and its child rows through tenant-scoped repository/query ports inside ONE UnitOfWork, then projects them into an immutable `InvestigationWorkspaceReadModel`. It MUST NOT (docs/investigation-workspace.md §7): - mutate any domain state, - run the Agent / LangGraph / a model / a tool, - touch ORM or SQL directly (it depends on the `UnitOfWork` port only). The composed timeline is derived deterministically from persisted facts; no entry is fabricated and no debug/telemetry fact is exposed.」*
 
 | # | 禁止 | 理由 |
 | --- | --- | --- |
@@ -98,15 +62,15 @@ is fabricated and no debug/telemetry fact is exposed.
 | 3 | **直接碰 ORM 或 SQL** | **只依赖 `UnitOfWork` 端口** |
 | 4 | 编造时间线条目 / 暴露 debug 事实 | 投影必须来自持久事实 |
 
-**第 2 条是最值得注意的**：**打开工作区不会触发任何模型调用。** 这与「图只在 outbox 派发时推进」（01 篇 §1.1 论断 1）是同一件事的两面——**读是读，推是推**。
+**第 2 条是最值得注意的**：**打开工作区不会触发任何模型调用。** 这与「图只在 outbox 派发时推进」（01 篇 §1 论断 1）是同一件事的两面——**读是读，推是推**。
 
 **第 3 条在 AST 层面有强制**：`test_knowledge_boundary.py` 的规则 3 用同一个扫描器检查「`application/` 下没有文件出现 `AsyncSession`、`select(...)`、`session.execute(...)`、`<=>`」。
 
-**论断 4：`workspace_service.py` 是应用层最大的文件（964 行）。**
+**论断 4：964 行的工作区投影，是为了在一个 `UnitOfWork` 里读完整个聚合树。**
 
-**为什么工作区投影这么大**：它要把 **`Investigation` 聚合 + 全部子行**（证据、发现、假设、假设评估、结果、计划修订、响应提案、审批、提交、执行）**在一个 `UnitOfWork` 里读出来并投影成一个只读模型**。
+它要把 **`Investigation` 聚合 + 全部子行**（证据、发现、假设、假设评估、结果、计划修订、响应提案、审批、提交、执行）读出来并投影成一个只读模型。
 
-**「inside ONE UnitOfWork」是一条一致性要求** ——工作区看到的所有东西来自**同一个快照**，不会出现「证据读了但发现还没读」的撕裂。
+**「inside ONE UnitOfWork」是一条一致性要求**——工作区看到的所有东西来自**同一个快照**，不会出现「证据读了但发现还没读」的撕裂。
 
 ### 1.2 应用层结构
 
@@ -166,98 +130,41 @@ flowchart TB
 
 ### 2.1 关键论断
 
-**论断 1：适配器是**纯传输**，且端点「已对参考 SIEM 仓库验证」。**
+**论断 1：适配器是纯传输，且端点「已对参考 SIEM 仓库验证」。**
 
-```python
-# infrastructure/hisiem/adapter.py:1-8
-"""HISIEM HTTP adapter implementing the HisiemPort.
-
-Transport-only over HISIEM's control API. Endpoints follow the real HISIEM
-contract (verified against the reference SIEM repo):
-``GET /api/alerts/{id}``, ``POST /api/log-search``, ``GET /api/detection-rules/{id}``
-and the X-Tenant-ID convention. Errors map to ExternalServiceError; upstream
-bodies never leak.
-"""
-```
-
-**三处关键信息**：
+`infrastructure/hisiem/adapter.py:1-8`：*「Transport-only over HISIEM's control API. Endpoints follow the real HISIEM contract (verified against the reference SIEM repo): `GET /api/alerts/{id}`, `POST /api/log-search`, `GET /api/detection-rules/{id}` and the X-Tenant-ID convention. Errors map to ExternalServiceError; upstream bodies never leak.」*
 
 | 信息 | 含义 |
 | --- | --- |
 | **"Transport-only"** | 不含业务判断——映射在 `mapper.py` |
-| **"verified against the reference SIEM repo"** | **端点是**实证过的**，不是猜的** |
+| **"verified against the reference SIEM repo"** | **端点是实证过的，不是猜的** |
 | **"upstream bodies never leak"** | 上游响应体不外泄 |
 
-**三个真实端点**（与 SIEM 侧逐一对上）：
-
-| Copilot 调 | HISIEM 端点 | SIEM 侧锚点 |
-| --- | --- | --- |
-| `GET /api/alerts/{id}` | `AlertController` | `alert/AlertController.java` |
-| `POST /api/log-search` | `LogSearchController` | `logsearch/LogSearchController.java` |
-| `GET /api/detection-rules/{id}` | `RuleController` | `rules/RuleController.java` |
+**三个真实端点**与 SIEM 侧逐一对上：`GET /api/alerts/{id}` ↔ `AlertController`、`POST /api/log-search` ↔ `LogSearchController`、`GET /api/detection-rules/{id}` ↔ `RuleController`（SIEM 03 篇 §5 论断 1 的控制器表）。
 
 **论断 2：「upstream bodies never leak」是错误处理的一条硬约束。**
 
-```python
-# adapter.py:6-7
-Errors map to ExternalServiceError; upstream bodies never leak.
-```
+`adapter.py:6-7`——**所有错误归一为 `ExternalServiceError`**（`application/errors.py`），**HISIEM 的响应体不进 Copilot 的错误路径**。
 
-**所有错误归一为 `ExternalServiceError`**（`application/errors.py`）——**HISIEM 的响应体不进 Copilot 的错误路径**。
-
-**这与 SIEM 侧的一条形成对照**：SIEM 的 `ElasticsearchGateway.java:72` **把 `e.getMessage()` 放进响应体**（SIEM 03 篇 §10 待核实 3）。**Copilot 侧更严格**。
+**这与 SIEM 侧形成对照**：SIEM 的 `ElasticsearchGateway.java:72` **把 `e.getMessage()` 放进响应体**（SIEM 03 篇 §6 论断 2）。**Copilot 侧更严格。**
 
 **论断 3：映射被抽成独立的 `mapper.py`，有三个具名函数。**
 
-```python
-# adapter.py:24-28
-from .mapper import (
-    map_alert_detail,
-    map_detection_rule,
-    map_log_search_response,
-)
-```
-
-**三个映射函数对应三个端点** ——**适配器只管「发请求、收响应、报错」，形状转换在 mapper**。
-
-**这让 mapper 可以被纯单元测试**（喂一个 HISIEM 响应 JSON，断言产出的 `HisiemAlertData`）。
+`adapter.py:24-28` 从 `.mapper` 导入 `map_alert_detail` / `map_detection_rule` / `map_log_search_response`——**三个映射函数对应三个端点**。**适配器只管「发请求、收响应、报错」，形状转换在 mapper**，**这让 mapper 可以被纯单元测试**（喂一个 HISIEM 响应 JSON，断言产出的 `HisiemAlertData`）。
 
 **论断 4：`HisiemPort` 定义了四个数据契约 + 一个端口。**
 
-```python
-# application/ports/hisiem.py
-HisiemAlertData, LogEventHit, EventSearchResult, DetectionRuleContext, HisiemPort
-```
+`application/ports/hisiem.py` 导出 `HisiemAlertData`（告警详情，`hydrate_alert` 节点用）/ `LogEventHit`（单条日志命中）/ `EventSearchResult`（日志检索结果集）/ `DetectionRuleContext`（检测规则上下文）+ `HisiemPort`。
 
-| 契约 | 用途 |
-| --- | --- |
-| `HisiemAlertData` | 告警详情（`hydrate_alert` 节点用） |
-| `LogEventHit` | 单条日志命中 |
-| `EventSearchResult` | 日志检索结果集 |
-| `DetectionRuleContext` | 检测规则上下文 |
+**端口不是「一个万能 HTTP 客户端」，而是四个有语义的读操作。**
 
-**四个契约对应四类「从上游读什么」** ——**端口不是「一个万能 HTTP 客户端」，而是四个有语义的读操作**。
+**论断 5：读凭据与处置凭据是两组独立配置，字段几乎相同。**
 
-**论断 5：读凭据与处置凭据是两组独立配置，但字段几乎相同。**
+`config.py:61-75` 的 `HisiemSettings`（读）与 `config.py:285-303` 的 `SoarSettings`（写）字段几乎一致（`base_url` = `http://127.0.0.1:8080`、`bearer_token` = 空、`timeout_seconds` = `10.0`）。
 
-```python
-# config.py:61-75（读）
-class HisiemSettings(BaseSettings):
-    base_url: str = Field(default="http://127.0.0.1:8080")
-    bearer_token: str = Field(default="")
-    timeout_seconds: float = Field(default=10.0)
-    tenant_header: str = Field(default="X-Tenant-ID")
+**分开是有意的**：**读告警的凭据与执行处置的凭据应当不同**——这是权限分离在配置层的体现。
 
-# config.py:285-303（写）
-class SoarSettings(BaseSettings):
-    base_url: str = Field(default="http://127.0.0.1:8080")
-    bearer_token: str = Field(default="")
-    timeout_seconds: float = Field(default=10.0)
-```
-
-**唯一差异是 `HisiemSettings` 多一个 `tenant_header`**（只有查询侧需要租户头；处置走内部服务端点，租户由服务令牌那条路径表达）。
-
-**这是权限分离在配置层的体现**：**读告警的凭据与执行处置的凭据应当不同**。
+> **唯一差异 `tenant_header` 是死配置**：`config.py:75` 是全仓唯一出现处，**没有任何消费点**（04 篇 §4 论断 2 记的是同一条事实）。
 
 ### 2.2 出入站全景
 
@@ -307,10 +214,7 @@ flowchart LR
 
 **论断 1：信任来源有三档，默认 `none`（不信任任何来源）。**
 
-```python
-# config.py:321
-trusted_context_provider: Literal["none", "header", "hisiem_bearer"] = "none"
-```
+`config.py:321`：`trusted_context_provider: Literal["none", "header", "hisiem_bearer"] = "none"`。
 
 | 取值 | 实现 | 语义 |
 | --- | --- | --- |
@@ -318,44 +222,32 @@ trusted_context_provider: Literal["none", "header", "hisiem_bearer"] = "none"
 | `header` | `infrastructure/auth/header_provider.py` | 从请求头取可信上下文 |
 | `hisiem_bearer` | `infrastructure/auth/hisiem_service_provider.py` | 从 HISIEM 服务令牌派生 |
 
-**默认 `none` 是 fail-closed 的** ——新部署的实例**不会凭请求头就相信调用方是谁**。
+**默认 `none` 是 fail-closed 的**——新部署的实例**不会凭请求头就相信调用方是谁**。
+
+> **`header` 这一档是 dev/test 专用，且它自己把这件事写在了文件头**（`header_provider.py:1-13`）：*「Header-based TrustedContextProvider (development/test adapter). … This is NOT a production authenticator: an ordinary client can forge these headers. It exists so local development and integration tests can exercise the API/application paths without standing up a real IdP. The Composition Root must not select this adapter for a production deployment — see `TrustProviderSettings` in the container and the "no default trusted provider in production" invariant.」*
+>
+> **实现也确实没有任何签名或令牌校验**：它只要求 `x-tenant-id` 非空（否则抛 `UntrustedRequestError("missing tenant identity")`），`x-actor-subject` 缺失时**默认成 `"system"`**。**所以「默认 `none`」不是保守，而是唯一安全的默认**——把这一档打开就等于让调用方自报身份。
 
 **论断 2：`TrustedContext` 与错误类型同在一个端口模块里。**
 
-```python
-# application/ports/trust.py
-TrustedContext, UntrustedRequestError, ServiceAuthenticationError, TrustedContextProvider
-```
-
-**四个成员**：上下文值对象 + **两个不同的错误** + 端口。
+`application/ports/trust.py` 导出 `TrustedContext`、`UntrustedRequestError`、`ServiceAuthenticationError`、`TrustedContextProvider`。
 
 | 错误 | 语义 |
 | --- | --- |
-| `UntrustedRequestError` | 请求本身不可信 |
-| `ServiceAuthenticationError` | **服务认证失败**（与「请求不可信」不同） |
+| `UntrustedRequestError` | 请求本身不可信（**客户端问题**：该带的东西没带对） |
+| `ServiceAuthenticationError` | **服务认证失败**（**部署问题**：服务令牌配错了） |
 
-**区分这两者是有意义的**：前者是**客户端问题**（该带的东西没带对），后者是**部署问题**（服务令牌配错了）。
+**区分这两者是有意义的**——它让「为什么被拒」在日志与指标上是两类不同的事实。
 
-**论断 3：`container.py` 里有一个请求级的信任上下文提供者。**
+**论断 3：`container.py` 里有一个请求级的信任上下文提供者，返回类型是可空的。**
 
-```python
-# bootstrap/container.py:437
-def trusted_context_provider(self, request: Request) -> TrustedContextProvider | None:
-```
+`bootstrap/container.py:437`：`def trusted_context_provider(self, request: Request) -> TrustedContextProvider | None`。
 
-**注意返回 `| None`** ——**当 `trusted_context_provider = none` 时返回 `None`**，调用方必须显式处理「没有信任来源」的情形。
+**返回 `| None`**——**当 `trusted_context_provider = none` 时返回 `None`**，调用方必须显式处理「没有信任来源」的情形，不能默认它一定存在。
 
-**论断 4：`bootstrap` 是唯一 import `HeaderTrustedContextProvider` 的地方。**
+**论断 4：`bootstrap` 是唯一 import 两个具体实现的地方。**
 
-```python
-# bootstrap/container.py:50-53
-from ..infrastructure.auth.header_provider import HeaderTrustedContextProvider
-from ..infrastructure.auth.hisiem_service_provider import (
-    HisiemServiceTrustedContextProvider,
-)
-```
-
-**两个实现都被装配在组合根** ——**`application` 只看到 `TrustedContextProvider` 协议**（`container.py:35-38` 从 ports 导入）。
+`bootstrap/container.py:50-53` 导入 `HeaderTrustedContextProvider` 与 `HisiemServiceTrustedContextProvider`——**两个实现都只在组合根被装配**；`application` 只看到 `TrustedContextProvider` 协议（`container.py:35-38` 从 ports 导入）。
 
 ### 3.2 信任判定
 
@@ -396,73 +288,40 @@ flowchart TB
 
 ### 4.1 关键论断
 
-**论断 1：只有一个路由模块，且前缀是 `/api/v1/investigations`。**
+**论断 1：只有一个路由模块，前缀 `/api/v1/investigations`，共 8 个端点。**
 
-```python
-# api/routers/investigations.py:50
-router = APIRouter(prefix="/api/v1/investigations", tags=["investigations"])
-```
+`api/routers/investigations.py:50` 定义 `APIRouter(prefix="/api/v1/investigations", tags=["investigations"])`。
 
-**实测 8 个端点**：
-
-| 行 | 方法 | 路径 | 说明 |
+| 行 | 方法 | 路径（相对前缀） | 说明 |
 | --- | --- | --- | --- |
 | `:53` | `POST` | `""` | **创建调查（201）** |
 | `:89` | `GET` | `/lookup` | **按告警查已有调查** |
 | `:113` | `GET` | `/{investigation_id}` | 读调查 |
-| `:126` | `GET` | （多行装饰器） | — |
+| `:126` | `GET` | `/{investigation_id}/workspace` | 读工作区投影 |
 | `:146` | `POST` | `/{investigation_id}/cancel` | 取消 |
-| `:166` | `POST` | （多行装饰器） | — |
-| `:200` | `POST` | （多行装饰器） | — |
-| `:216` | `POST` | （多行装饰器） | — |
+| `:166` | `POST` | `/{investigation_id}/response-proposals` | **派生响应提案（201）** |
+| `:200` | `POST` | `/response-approvals/{approval_request_id}/approve` | **批准** |
+| `:216` | `POST` | `/response-approvals/{approval_request_id}/reject` | **拒绝** |
 
-> **`/lookup` 是一条值得注意的端点**：它按**告警**查已有调查，而不是按调查 id。**这让「这条告警是否已经查过」成为一次查询** ——避免重复调查同一条告警。
+> **`/lookup` 是一条值得注意的端点**：它按**告警**查已有调查，而不是按调查 id——**三个必填 Query 参数**（`provider` / `resource_type` / `address_id`，各 `min_length=1`）。它的 docstring（`:97-100`）写明*「Returns the at-most-one ACTIVE Investigation for the source alert plus the most recent Investigation of any status, so HISIEM can render the correct Alert action (start / continue / view). Tenant is derived from the trusted context — never declared by the caller — so a foreign alert can never be resolved.」* **两个要点**：「这条告警是否已经查过」是一次查询（避免重复调查）；**租户由可信上下文派生，不由调用方声明**——所以别家的告警根本查不到。
+>
+> **审批端点的位置也值得注意**：`approve` / `reject` 挂在 `/response-approvals/{id}/...` 下，**不带 `investigation_id` 路径段**——审批的身份是审批请求本身，不是它属于哪个调查。
 
-**论断 2：`api` 层的禁导入是**四条**，含一条同层横向的。**
+**论断 2：`api` 层的禁导入是四条，含一条同层横向的。**
 
-```python
-# tests/architecture/test_import_boundaries.py:46-51
-"api": (
-    "infrastructure.persistence", "infrastructure.hisiem",
-    "langgraph", "agent",
-),
-```
+`tests/architecture/test_import_boundaries.py:46-51`：`"infrastructure.persistence"` / `"infrastructure.hisiem"` / `"langgraph"` / **`"agent"`**。
 
-| 禁导入 | 含义 |
-| --- | --- |
-| `infrastructure.persistence` | **API 不碰 ORM** |
-| `infrastructure.hisiem` | **API 不直连上游** |
-| `langgraph` | **API 不碰图引擎** |
-| **`agent`** | **API 不碰 agent** |
+**注意禁的是两个具体子包，不是整个 `infrastructure`**——所以 `api` **可以**导入 `infrastructure` 的其它部分。**这是精细的粒度**：不是「api 不许碰 infrastructure」，而是「**api 不许碰持久化与上游**」。
 
-**注意禁的是 `infrastructure.persistence` 与 `infrastructure.hisiem` 两个**具体子包**，不是整个 `infrastructure`** ——所以 `api` **可以**导入 `infrastructure` 的其它部分（例如可观测性）。
+**论断 3：schema 与领域模型是两套类型，转换发生在 `api` 层。**
 
-**这是精细的粒度**：不是「api 不许碰 infrastructure」，而是「**api 不许碰持久化与上游**」。
+`api/schemas/` 下是 `common.py` / `response.py` / `workspace.py`，**都是 Pydantic 模型**——而 `domain` 是 dataclass 且禁 pydantic（00 篇 §2.1 论断 2）。**所以 API 边界上必然有一次转换**：领域 dataclass → Pydantic schema，**而 `domain` 完全不知道 HTTP 的存在**。
 
-**论断 3：schema 分三个模块，且与领域模型分离。**
+**论断 4：应用由工厂函数创建，只 include 一个 router。**
 
-```
-api/schemas/common.py
-api/schemas/response.py
-api/schemas/workspace.py
-```
+`api/app.py:41,48`：`FastAPI(title="HISIEM SOC Copilot", version="0.1.0", lifespan=lifespan)` + `include_router(investigations_router)`。**这一版的 HTTP 面很窄**（8 个端点），而内部能力（知识摄取、ATT&CK 导入）走 CLI（见 06 / 08 篇）。
 
-**`api/schemas/` 是 Pydantic 模型** ——**它们与 `domain` 的 dataclass 是两套类型**（因为 `domain` 禁 pydantic，00 篇 §2.1 论断 2）。
-
-**所以 API 边界上必然有一次转换**：领域 dataclass → Pydantic schema。**这次转换发生在 `api` 层**，而 `domain` 完全不知道 HTTP 的存在。
-
-**论断 4：应用由工厂函数创建，且只 include 一个 router。**
-
-```python
-# api/app.py:41,48
-app = FastAPI(title="HISIEM SOC Copilot", version="0.1.0", lifespan=lifespan)
-...
-app.include_router(investigations_router)
-```
-
-**只有一个 router** ——**这一版的 HTTP 面很窄**（8 个端点），而内部能力（知识摄取、ATT&CK 导入）走 CLI（见 06 / 08 篇）。
-
-**论断 5：错误处理在 `api/errors.py`，与 `application/errors.py` 分层。**
+**论断 5：错误处理分四层，逐层向上翻译。**
 
 ```
 api/errors.py                  ← HTTP 层错误映射
@@ -471,59 +330,11 @@ domain/shared/errors.py        ← 域错误（DomainError / StateTransitionErro
 contracts/llm/errors.py        ← 模型错误 taxonomy
 ```
 
-**四层错误类型，逐层向上翻译** ——**域不知道 HTTP 状态码，HTTP 不知道领域语义**。
+**域不知道 HTTP 状态码，HTTP 不知道领域语义。**
 
 **论断 6：健康探针是唯一不认证的端点。**
 
-```python
-# api/app.py:44
-@app.get("/healthz", tags=["ops"])
-```
-
-**`/healthz` 在 `/api/v1/**` 之外** ——所以它不经过任何租户/信任路径。**这是标准做法**：探针必须能被编排系统无凭据调用。
-
-### 4.2 入站处理链
-
-```mermaid
----
-config:
-  theme: base
-  themeVariables:
-    fontFamily: YaHei
----
-sequenceDiagram
-    autonumber
-    participant C as 调用方
-    participant APP as api/app.py
-    participant RT as routers/investigations
-    participant TCP as TrustedContextProvider
-    participant H as application handler
-    participant U as UnitOfWork
-    participant DOM as domain
-
-    C->>APP: 请求
-    alt /healthz
-        APP-->>C: 200（无认证）
-    else /api/v1/**
-        APP->>RT: 路由
-        RT->>TCP: 解析可信上下文
-        alt 不可信
-            TCP-->>RT: UntrustedRequestError
-            RT-->>C: 4xx（api/errors.py 映射）
-        else 可信
-            TCP-->>RT: TrustedContext
-            RT->>H: 命令/查询（带可信上下文）
-            H->>U: 事务
-            U->>DOM: 聚合方法
-            DOM-->>U: 状态 + 领域事件
-            U-->>H: 提交
-            H-->>RT: 结果
-            RT-->>C: 200/201 + Pydantic schema
-        end
-    end
-```
-
----
+`api/app.py:44` 的 `@app.get("/healthz", tags=["ops"])` 挂在 `/api/v1/**` **之外**——所以它不经过任何租户/信任路径。**这是标准做法**：探针必须能被编排系统无凭据调用。
 
 ## 5. 关键不变式（代码强制）
 
@@ -568,11 +379,5 @@ sequenceDiagram
 `attack` / `chunking` / `clock` / `durable` / `embedding` / `event_publisher` / `hisiem` / `investigation_runtime` / `knowledge` / `model_provider` / `repositories` / `soar` / `threat_intel` / `trust` / `unit_of_work`
 
 > **`clock` 端口值得单独指出**：`application/ports/clock.py` 里有 `ClockPort` + `SystemClock` ——**时间是可注入的**。这让「超时 / 截止时间」相关逻辑**可以被确定性测试**（不需要真的等）。
-
----
-
-## 待核实
-
-> **本节 12 条待核实项均已解答**：8 个端点的完整路径表；`/lookup` 的 3 个必填 Query 参数 + DB 局部唯一索引保证至多一条 active；`durable_support.py` 提供 exactly-once 命令；`queries/workspace.py` 是纯数据层而 `services/workspace_service.py` 是执行层；`api/errors.py` 5 个 handler + 完整映射表；`HeaderTrustedContextProvider` **无签名或令牌校验**（dev/test only）；`ClockPort` 只有 3 个生产消费点。
 
 ---
