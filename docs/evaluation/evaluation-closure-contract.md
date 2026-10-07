@@ -1,17 +1,13 @@
-# Evaluation Closure Contract
+# 评估闭合契约
 
-> **Provenance.** This closure was delivered as three working steps, recorded in the
-> stage reports as **E1-C4** (deterministic scorer), **E1-C5** (repeatability collector)
-> and **E1-C6** (suite aggregation). Those codes are engineering-history labels; this
-> document names each piece by what it does, and shows a code only where it is the
-> provenance of a concrete artifact. For the numbering systems themselves see
-> [`../evidence/architecture-analysis/08-评估体系.md`](../evidence/architecture-analysis/08-评估体系.md).
+> **来源。** 这次闭合是作为三个工作步骤交付的，在阶段报告里记为 **E1-C4**（确定性评分器）、
+> **E1-C5**（可重复性收集器）与 **E1-C6**（套件聚合）。那些代号是工程史标签；本文档按「它做什么」
+> 来命名每一件，只在某段代码是某个具体产物的来源时才写出它。编号体系本身见
+> [`../evidence/architecture-analysis/08-评估体系.md`](../evidence/architecture-analysis/08-评估体系.md)。
 
-## 1. Scope
+## 1. 范围
 
-This document freezes the GP-01 evaluation closure: the deterministic correctness
-scorer, the bounded repeatability collector and its attempt classifier, and the
-evaluation-suite aggregation.
+本文档冻结 GP-01 评估闭合：确定性正确性评分器、有界可重复性收集器及其尝试分类器，以及评估套件聚合。
 
 ```text
 SealedManifest (GP-01)
@@ -27,15 +23,14 @@ bounded multi-run collector    attempt classifier    [E1-C5]
 suite-summary.json             suite aggregation     [E1-C6]
 ```
 
-The closure reuses the existing execution / telemetry / quality paths unchanged. It
-does not reimplement `StartAlertInvestigation`, the outbox dispatcher, the runner,
-LangGraph, the real `ModelProvider`, the real-model telemetry gate (`E1-C2`), or the
-tool-evidence quality evaluator (`E1-C3`). Production code never imports `evaluation_harness`; the harness is the only
-sanctioned `SealedManifest → Container` bridge.
+闭合原样复用既有的执行 / 遥测 / 质量路径。它不重新实现 `StartAlertInvestigation`、outbox 派发器、
+runner、LangGraph、真的 `ModelProvider`、真实模型遥测闸门（`E1-C2`）或工具-证据质量评估器
+（`E1-C3`）。生产代码永不导入 `evaluation_harness`；harness 是唯一被认可的
+`SealedManifest → Container` 桥。
 
 ---
 
-## 2. Frozen principles
+## 2. 冻结的原则
 
 ```text
 No LLM-as-a-Judge. Scoring is deterministic from persisted, machine-authoritative facts.
@@ -49,11 +44,11 @@ production artifacts, model input, prompts, tools, or production state.
 
 ---
 
-## 3. Deterministic correctness scorer
+## 3. 确定性正确性评分器
 
-### 3.1 Inputs (all read-only)
+### 3.1 输入（全部只读）
 
-The scorer consumes only persisted, machine-authoritative facts:
+评分器只消费持久化的、机器权威的事实：
 
 ```text
 sealed oracle    manifest.oracle.expected_verdict + required_evidence_roles   (manifest)
@@ -65,13 +60,12 @@ execution fact   execution.json (status, investigation_id, counts, duration)
 ```
 
 `score_gp01(oracle, result, quality, findings, telemetry, execution) -> EvaluationScore`
-is pure. IO (reads, artifact writes, orchestration) is separate from the calculation.
+是纯的。IO（读取、产物写出、编排）与计算本身是分开的。
 
-The scorer MUST NOT: call a model, call a tool, run the Agent/Graph, parse verdict
-prose, score NL similarity, use embeddings/fuzzy matching, or send anything to another
-model.
+评分器不得：调用模型、调用工具、跑 Agent/Graph、解析判定散文、给自然语言相似度打分、使用
+embedding/模糊匹配，或把任何东西发给另一个模型。
 
-### 3.2 Correctness gate (PASS iff ALL hold)
+### 3.2 正确性闸门（当且仅当下列全部成立时 PASS）
 
 ```text
 execution_status              == COMPLETED
@@ -89,25 +83,21 @@ oracle firewall               PASS
 every result finding_id       resolves to a persisted Finding of the SAME Investigation
 ```
 
-A correct Finding that merely exists in the database is NOT sufficient: it must
-participate in the final `InvestigationResult.finding_ids`. Confidence is informational
-only — there is no confidence threshold.
+一个仅仅是「存在于数据库里」的正确 Finding **不**够：它必须参与最终的
+`InvestigationResult.finding_ids`。置信度只作信息用途——不存在置信度阈值。
 
-### 3.3 Evidence-coverage model
+### 3.3 证据覆盖模型
 
-`required_evidence_roles` is resolved evaluation-side from
-`manifest.oracle.required_evidence_roles`. A role is `matched` only when the tool-evidence quality
-exact provenance match for that role succeeded (`E1-C3`). GP-01 has one required role (`S1`), so
-`evidence_coverage = 1.0` on match and `< 1` (FAIL) when a required role is unmatched.
-The role→evidence mapping is data-driven so later scenarios can supply multiple role
-matches without rewriting the engine.
+`required_evidence_roles` 在评估侧从 `manifest.oracle.required_evidence_roles` 解析。一个 role 只有在
+该 role 的工具-证据质量精确来源匹配成功时才算 `matched`（`E1-C3`）。GP-01 有一个必需 role
+（`S1`），所以匹配时 `evidence_coverage = 1.0`，有不匹配的必需 role 时 `< 1`（FAIL）。role→证据的
+映射是数据驱动的，好让后续场景能提供多个 role 匹配而不必重写引擎。
 
-### 3.4 Score artifact
+### 3.4 评分产物
 
-Path: `<execution-dir>/score.json`; schema `evaluation-score/v1`. Written atomically.
-Unknown or missing schema versions are rejected explicitly. Fields are bounded and on an
-explicit allowlist; no secret-bearing field may be written. Running the scorer twice on
-unchanged inputs yields semantically identical output.
+路径：`<execution-dir>/score.json`；schema `evaluation-score/v1`。原子写入。未知或缺失的 schema
+版本会被显式拒绝。字段有界且在白名单上；不得写入任何携带密钥的字段。对未变输入跑两次评分器，产出
+语义上完全相同的输出。
 
 ```text
 schema_version; execution_id; dataset_run_id; investigation_id
@@ -128,18 +118,16 @@ informational: confidence; model_calls; tool_calls; search_events_calls;
 python -m hisiem_soc_copilot.evaluation.cli score-execution <dataset_run_id> <execution_id>
 ```
 
-Read-only and offline: it MUST NOT run the Agent, call a model, call a tool, or mutate a
-production row. It may be re-run; the deterministic artifact replaces any prior score for
-that execution.
+只读且离线：它不得跑 Agent、调用模型、调用工具，或改动任何生产行。它可以重复运行；确定性产物会替换
+该执行此前的任何评分。
 
 ---
 
-## 4. Repeatability / robustness
+## 4. 可重复性 / 稳健性
 
-### 4.1 Classification (stable codes only)
+### 4.1 分类（只用稳定错误码）
 
-An attempt is classified from stable model error codes — never from HTTP status or
-exception prose:
+一次尝试由稳定的模型错误码分类——永不依据 HTTP 状态码或异常散文：
 
 ```text
 VALID_PASS                  full contract held, correctness_gate PASS  → counts
@@ -148,7 +136,7 @@ INVALID_PROVIDER_TRANSIENT  transport/limit outage only                → prese
 ABORT                       suite-aborting condition                   → stops the suite
 ```
 
-`INVALID_PROVIDER_TRANSIENT` holds ONLY when ALL of:
+`INVALID_PROVIDER_TRANSIENT` 当且仅当下列**全部**成立时才算：
 
 ```text
 the provider baseline / config is valid;
@@ -158,8 +146,7 @@ no MODEL_CONFIGURATION / MODEL_REFUSAL / MODEL_OUTPUT_VALIDATION / provider-cont
 the model gate failure (`E1-C2`) is explainable by those transient failures.
 ```
 
-Ambiguous cases (mixed transient + deterministic errors, or a gate failure not
-explainable by the outage) count as `VALID_FAIL` (fail conservative).
+有歧义的情形（瞬时错误与确定性错误混杂，或闸门失败无法由那次中断解释）算 `VALID_FAIL`（保守失败）。
 
 ```text
 MODEL_UNAVAILABLE / RATE_LIMITED / TIMEOUT   → INVALID_PROVIDER_TRANSIENT (may be replaced)
@@ -170,47 +157,45 @@ model gate PASS + quality gate FAIL                → VALID_FAIL (counts)
 model gate PASS + quality gate PASS + score FAIL   → VALID_FAIL (counts)
 ```
 
-A valid failure sample is NEVER discarded, replaced, or rerun-to-replace.
+一个有效的失败样本**永不**被丢弃、替换，或通过重跑到换来替换掉。
 
-### 4.2 Bounded collector
+### 4.2 有界收集器
 
 ```text
 python -m hisiem_soc_copilot.evaluation.cli evaluate-gp01 <dataset_run_id> \
     --valid-runs 3 --max-attempts 6
 ```
 
-Defaults `valid_runs=3`, `max_attempts=6`; both bounded by a hard cap and validated
-(`1 <= valid_runs <= max_attempts <= cap`). There is no unlimited loop. Every execution
-uses a NEW `execution_id`. Failed and invalid attempts are preserved, never deleted. The
-collector stops when `valid_runs` valid samples are collected, `max_attempts` is
-exhausted, or the suite aborts:
+默认 `valid_runs=3`、`max_attempts=6`；两者都有硬上限，并被校验
+（`1 <= valid_runs <= max_attempts <= cap`）。不存在无界循环。每次执行都用**新的**
+`execution_id`。失败与无效的尝试被保留，永不删除。收集器在以下情形停止：收满 `valid_runs` 个有效
+样本、`max_attempts` 用尽、或套件中止：
 
 ```text
 max_attempts exhausted before valid_runs  → INSUFFICIENT_VALID_RUNS
 config / baseline / preflight error       → immediate ABORT
 ```
 
-Transient attempts are reported separately and are not required to be zero for a
-semantic PASS.
+瞬时尝试单独汇报，而且一次语义 PASS 并不要求它为零。
 
-### 4.3 GP-01 pass policy
+### 4.3 GP-01 通过策略
 
 ```text
 required valid samples        = 3
 required correctness passes   = 3/3   (correctness_pass_rate == 1.0; 2/3 is FAIL)
 ```
 
-A valid failed sample is not rerun.
+一个有效的失败样本不会被重跑。
 
 ---
 
-## 5. Evaluation suite summary
+## 5. 评估套件汇总
 
-### 5.1 Artifact
+### 5.1 产物
 
-Path: `<executions_dir>/gp-01/<dataset_run_id>/suites/<suite_id>/suite-summary.json`;
-schema `evaluation-suite-summary/v1`. A unique `suite_id` per run — an earlier summary
-is never overwritten. Unknown or missing schema versions are rejected.
+路径：`<executions_dir>/gp-01/<dataset_run_id>/suites/<suite_id>/suite-summary.json`；schema
+`evaluation-suite-summary/v1`。每次运行一个唯一的 `suite_id`——更早的汇总永不被覆盖。未知或缺失的
+schema 版本会被拒绝。
 
 ```text
 schema_version; suite_id; scenario_id; dataset_run_id
@@ -227,10 +212,9 @@ informational efficiency per duration_ms / model_calls / tool_calls /
 suite_gate; gate_failures
 ```
 
-`p95` is not computed from three samples. Efficiency aggregates are informational and
-never gate.
+`p95` 不由三个样本计算。效率聚合只作信息用途，永不设闸。
 
-### 5.2 Suite PASS (iff ALL hold)
+### 5.2 套件 PASS（当且仅当下列全部成立）
 
 ```text
 preflight PASS; sealed manifest unchanged; 3 valid samples collected
@@ -243,7 +227,7 @@ no suite-aborting error; final worktree CLEAN
 
 ---
 
-## 6. Artifact trust boundaries
+## 6. 产物信任边界
 
 ```text
 production artifacts (oracle-free):  execution.json, model-telemetry.json
@@ -251,14 +235,12 @@ evaluation artifacts (bounded oracle ok):  tool-evidence-quality.json, score.jso
                                            suite-summary.json
 ```
 
-None may contain `CMD_API_KEY` / `Authorization` / `Bearer` / password / credential-
-bearing DSN / raw prompts / raw completions / raw HTTP responses / environment dumps /
-chain-of-thought. Every field is allowlisted and bounded.
+它们都不得含有 `CMD_API_KEY` / `Authorization` / `Bearer` / 密码 / 带凭据的 DSN / 原始 prompt /
+原始 completion / 原始 HTTP 响应 / 环境转储 / 思维链。每个字段都在白名单上、且是有界的。
 
 ---
 
-## 7. Out of scope
+## 7. 不在范围内
 
-No change to Agent prompts, tools, or graph; no change to the real model provider
-configuration; no new production domain/schema migration; no raw SQL in production
-evaluation code. GP-01 is not rematerialized or resealed.
+不改 Agent prompt、工具或图；不改真实模型 provider 配置；不新增生产领域/schema 迁移；生产评估代码
+里不写原始 SQL。GP-01 不重新物化、不重新封存。
